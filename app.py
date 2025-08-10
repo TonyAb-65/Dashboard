@@ -13,7 +13,6 @@ REQUIRED_PRODUCT_COLS = [
     "sub_category_id", "sub_sub_category_id",
 ]
 
-# Category Mapping: we’ll detect via UI (no fixed headers required)
 # Optional glossary CSV columns
 GLOSSARY_COLS = ["Arabic", "English"]
 
@@ -54,10 +53,10 @@ def guess_col(cols, patterns):
 def build_mapping_struct(map_df: pd.DataFrame, cfg: dict):
     """
     Build 3-level cascade using selected columns.
-    cfg keys:
+    cfg keys (column names in map_df):
       main_id, main_name (opt), sub_id, sub_name (opt), ssub_id, ssub_name (opt)
     """
-    # Normalize to string to avoid 1 vs "1" issues
+    # Normalize key ID columns to string
     for k in ["main_id", "sub_id", "ssub_id"]:
         map_df[cfg[k]] = map_df[cfg[k]].astype(str).str.strip()
 
@@ -78,8 +77,11 @@ def build_mapping_struct(map_df: pd.DataFrame, cfg: dict):
 
     # Labels (fallback to IDs if name cols not provided)
     def build_labels(id_col, name_col):
-        if name_col:
+        if name_col and name_col in map_df.columns:
             tmp = map_df[[id_col, name_col]].drop_duplicates()
+            # Cast to str to keep consistency
+            tmp[id_col] = tmp[id_col].astype(str)
+            tmp[name_col] = tmp[name_col].astype(str)
             return dict(tmp.itertuples(index=False, name=None))
         else:
             return {v: v for v in map_df[id_col].astype(str).unique()}
@@ -120,9 +122,9 @@ def to_excel_download(df, sheet_name="Products"):
 st.title("🛒 Product List Translator & Category Mapper")
 
 st.markdown("""
-1) Upload your **Product List** and **Category Mapping** files  
-2) Map the **ID** and optional **Name** columns from the Category Mapping (Main → Sub → Sub-Sub)  
-3) Search products, pick **IDs** (names shown), **Apply to all filtered rows**, and download
+1) Upload **Product List** and **Category Mapping** files  
+2) Map the **ID** and optional **Name** columns (Main → Sub → Sub-Sub)  
+3) Search products, choose categories, **Apply to filtered rows**, then download the full file
 """)
 
 col1, col2, col3 = st.columns(3)
@@ -183,7 +185,7 @@ cfg = {
     "ssub_name": None if ssub_name_col == "(none)" else ssub_name_col,
 }
 
-# Build lookups
+# Build lookups & labels
 lookups = build_mapping_struct(map_df, cfg)
 labels = lookups["labels"]
 
@@ -217,10 +219,10 @@ else:
 filtered = work[mask].copy()
 st.caption(f"Matched rows: {filtered.shape[0]}")
 
-# Cascading pickers (show names if provided, but options are IDs)
+# Cascading pickers (IDs for options; show names via format_func if provided)
 main_opts = [""] + lookups["main_ids"]
 sel_main = st.selectbox(
-    "Main (ID shown as label if no name)",
+    "Main",
     options=main_opts,
     format_func=lambda v: labels["main"].get(v, v)
 )
@@ -239,27 +241,35 @@ sel_subsub = st.selectbox(
     format_func=lambda v: labels["ssub"].get(v, v)
 )
 
-# ---- FORCE WRITING IDS (never names) ----
-rev_main = {v: k for k, v in labels["main"].items()}
-rev_sub  = {v: k for k, v in labels["sub"].items()}
-rev_ssub = {v: k for k, v in labels["ssub"].items()}
-
-def as_id(value, level):
-    """Ensure we always write the ID; convert labels -> IDs if needed."""
+# ---- Robust ID resolution: handle if widget returns IDs OR Names ----
+def resolve_to_id(value, id_col, name_col):
+    """
+    Return the ID string for a selected value.
+    If value equals an ID -> return as-is.
+    Else if a name column exists -> map name -> ID using map_df.
+    Else return value.
+    """
     if not value:
         return ""
-    if level == "main":
-        return value if value in labels["main"] else rev_main.get(value, value)
-    if level == "sub":
-        return value if value in labels["sub"] else rev_sub.get(value, value)
-    if level == "ssub":
-        return value if value in labels["ssub"] else rev_ssub.get(value, value)
-    return value
+    val = str(value)
+    # If value already exists in the ID column, return it
+    if val in set(map_df[id_col].astype(str)):
+        return val
+    # Otherwise, try to resolve via name column (if provided)
+    if name_col and name_col in map_df.columns:
+        tmp = map_df[[id_col, name_col]].drop_duplicates()
+        tmp[id_col] = tmp[id_col].astype(str)
+        tmp[name_col] = tmp[name_col].astype(str)
+        match = tmp.loc[tmp[name_col] == val, id_col]
+        if not match.empty:
+            return str(match.iloc[0])
+    return val  # fallback
 
+# Apply to all filtered rows (ALWAYS write IDs)
 if st.button("Apply IDs to all filtered rows"):
-    main_id = as_id(sel_main, "main")
-    sub_id  = as_id(sel_sub, "sub")
-    ssub_id = as_id(sel_subsub, "ssub")
+    main_id = resolve_to_id(sel_main,  cfg["main_id"],  cfg.get("main_name"))
+    sub_id  = resolve_to_id(sel_sub,   cfg["sub_id"],   cfg.get("sub_name"))
+    ssub_id = resolve_to_id(sel_subsub,cfg["ssub_id"],  cfg.get("ssub_name"))
 
     if main_id:
         work.loc[mask, "category_id"] = main_id
@@ -288,4 +298,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Dropdowns display names (when provided), but the table always stores **IDs**.")
+st.caption("Dropdowns may show names, but the table always stores **IDs** based on your mapping selections.")
