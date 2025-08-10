@@ -6,7 +6,7 @@ import streamlit as st
 st.set_page_config(page_title="Product List Translator & Category Mapper", layout="wide")
 
 # ---------- Expected Product List columns ----------
-# (Main stays as name; Sub & Sub-Sub columns store numbers after Apply)
+# (Main stays as name; Sub & Sub-Sub store numbers after Apply)
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
@@ -158,8 +158,12 @@ if not ok:
 # Build lookups
 lookups = build_mapping_struct_fixed(map_df)
 
-# Prepare working frame
-work = prod_df.copy()
+# ---------- Working dataframe persisted across searches ----------
+if "work" not in st.session_state:
+    st.session_state.work = prod_df.copy()
+work = st.session_state.work
+
+# Ensure all expected columns exist
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
@@ -224,6 +228,10 @@ if st.button("Apply to all filtered rows"):
     if ssub_no:
         work.loc[mask, "sub_sub_category_id"] = ssub_no  # write NUMBER
 
+    # Persist updates so next searches keep previous changes
+    st.session_state.work = work
+
+    # Refresh filtered view
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
@@ -233,6 +241,12 @@ st.dataframe(
               "category_id", "sub_category_id", "sub_sub_category_id"]],
     use_container_width=True, height=340
 )
+
+# Optional reset (handy for testing)
+with st.expander("Reset working data"):
+    if st.button("🔄 Reset working data (start over)"):
+        st.session_state.pop("work", None)
+        st.experimental_rerun()
 
 # ---------- Download ----------
 st.subheader("Download")
@@ -244,4 +258,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS from your mapping.")
+st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS from your mapping. Edits persist across searches.")
