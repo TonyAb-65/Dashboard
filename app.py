@@ -1,25 +1,25 @@
 import io
-import re
 import pandas as pd
 import streamlit as st
 
-# ---------- Config ----------
+# ---------- Page setup ----------
 st.set_page_config(page_title="Product List Translator & Category Mapper", layout="wide")
 
-# Product List columns (your format)
+# ---------- Expected Product List columns ----------
+# (Main stays as name; Sub & Sub-Sub columns store numbers after Apply)
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
 ]
 
-# Optional glossary CSV columns
+# Optional glossary CSV columns for name_ar -> English helper (exact match)
 GLOSSARY_COLS = ["Arabic", "English"]
 
 
 # ---------- Helpers ----------
 def read_any_table(uploaded_file):
-    """Read xlsx/xls/csv safely (explicit engine for Streamlit Cloud)."""
+    """Read xlsx/xls/csv safely (explicit engine for cloud)."""
     if uploaded_file is None:
         return None
     name = uploaded_file.name.lower()
@@ -39,68 +39,8 @@ def validate_columns(df, required_cols, label):
     return True
 
 
-def guess_col(cols, patterns):
-    """Pick the first column whose name matches any of the regex patterns (case-insensitive)."""
-    for p in patterns:
-        rx = re.compile(p, re.I)
-        for c in cols:
-            if rx.fullmatch(c) or rx.search(c):
-                return c
-    return None
-
-
-@st.cache_data
-def build_mapping_struct(map_df: pd.DataFrame, cfg: dict):
-    """
-    Build 3-level cascade using selected columns.
-    cfg keys (column names in map_df):
-      main_id, main_name (opt), sub_id, sub_name (opt), ssub_id, ssub_name (opt)
-    """
-    # Normalize key ID columns to string
-    for k in ["main_id", "sub_id", "ssub_id"]:
-        map_df[cfg[k]] = map_df[cfg[k]].astype(str).str.strip()
-
-    # Unique mains (IDs)
-    main_ids = sorted(map_df[cfg["main_id"]].dropna().astype(str).unique().tolist())
-
-    # Main -> [Sub IDs]
-    main_to_subs = {}
-    for mc, g1 in map_df.groupby(cfg["main_id"], dropna=True):
-        subs = sorted(g1[cfg["sub_id"]].dropna().astype(str).str.strip().unique().tolist())
-        main_to_subs[str(mc)] = subs
-
-    # (Main, Sub) -> [Sub-Sub IDs]
-    pair_to_subsubs = {}
-    for (mc, sc), g2 in map_df.groupby([cfg["main_id"], cfg["sub_id"]], dropna=True):
-        ssubs = sorted(g2[cfg["ssub_id"]].dropna().astype(str).str.strip().unique().tolist())
-        pair_to_subsubs[(str(mc), str(sc))] = ssubs
-
-    # Labels (fallback to IDs if name cols not provided)
-    def build_labels(id_col, name_col):
-        if name_col and name_col in map_df.columns:
-            tmp = map_df[[id_col, name_col]].drop_duplicates()
-            # Cast to str to keep consistency
-            tmp[id_col] = tmp[id_col].astype(str)
-            tmp[name_col] = tmp[name_col].astype(str)
-            return dict(tmp.itertuples(index=False, name=None))
-        else:
-            return {v: v for v in map_df[id_col].astype(str).unique()}
-
-    main_labels = build_labels(cfg["main_id"], cfg.get("main_name"))
-    sub_labels  = build_labels(cfg["sub_id"],  cfg.get("sub_name"))
-    ssub_labels = build_labels(cfg["ssub_id"], cfg.get("ssub_name"))
-
-    return {
-        "main_ids": main_ids,
-        "main_to_subs": main_to_subs,
-        "pair_to_subsubs": pair_to_subsubs,
-        "labels": {"main": main_labels, "sub": sub_labels, "ssub": ssub_labels},
-        "cfg": cfg,
-    }
-
-
 def apply_glossary_translate(series_ar, glossary_df):
-    """Optional helper: glossary exact match; else return Arabic."""
+    """Optional helper: build an English helper column via exact-match glossary."""
     if glossary_df is None:
         return series_ar.astype(str)
     glossary_df["Arabic"] = glossary_df["Arabic"].astype(str)
@@ -118,13 +58,71 @@ def to_excel_download(df, sheet_name="Products"):
     return buffer
 
 
+# ---------- Build mapping structures for cascade & lookups ----------
+def build_mapping_struct_fixed(map_df: pd.DataFrame):
+    """
+    Assumes mapping columns EXACTLY as:
+      category_id                (Main NAME)
+      sub_category_id            (Sub NAME)
+      sub_category_id NO         (Sub NUMBER/ID)
+      sub_sub_category_id        (Sub-Sub NAME)
+      sub_sub_category_id NO     (Sub-Sub NUMBER/ID)
+    - Dropdowns show NAMES.
+    - On Apply, we write numbers for Sub & Sub-Sub using the NO columns.
+    """
+    # Normalize types/whitespace
+    for c in ["category_id", "sub_category_id", "sub_category_id NO",
+              "sub_sub_category_id", "sub_sub_category_id NO"]:
+        if c in map_df.columns:
+            map_df[c] = map_df[c].astype(str).str.strip()
+
+    # Unique mains (names)
+    main_names = sorted(map_df["category_id"].dropna().unique().tolist())
+
+    # Main -> list of Sub NAMES
+    main_to_subnames = {}
+    for mc, g1 in map_df.groupby("category_id", dropna=True):
+        subs = sorted(g1["sub_category_id"].dropna().unique().tolist())
+        main_to_subnames[str(mc)] = subs
+
+    # (Main, Sub NAME) -> list of Sub-Sub NAMES
+    pair_to_subsubnames = {}
+    for (mc, sc), g2 in map_df.groupby(["category_id", "sub_category_id"], dropna=True):
+        ssubs = sorted(g2["sub_sub_category_id"].dropna().unique().tolist())
+        pair_to_subsubnames[(str(mc), str(sc))] = ssubs
+
+    # --- Lookup dictionaries to resolve NAMES -> NUMBERS on Apply ---
+    # (Main NAME, Sub NAME) -> Sub NUMBER
+    sub_name_to_no_by_main = {}
+    # (Main NAME, Sub NAME, Sub-Sub NAME) -> Sub-Sub NUMBER
+    ssub_name_to_no_by_main_sub = {}
+
+    for _, r in map_df.iterrows():
+        mc = r["category_id"]
+        sc_name = r["sub_category_id"]
+        sc_no = r["sub_category_id NO"]
+        ssc_name = r["sub_sub_category_id"]
+        ssc_no = r["sub_sub_category_id NO"]
+
+        sub_name_to_no_by_main[(mc, sc_name)] = sc_no
+        ssub_name_to_no_by_main_sub[(mc, sc_name, ssc_name)] = ssc_no
+
+    return {
+        "main_names": main_names,
+        "main_to_subnames": main_to_subnames,
+        "pair_to_subsubnames": pair_to_subsubnames,
+        "sub_name_to_no_by_main": sub_name_to_no_by_main,
+        "ssub_name_to_no_by_main_sub": ssub_name_to_no_by_main_sub,
+    }
+
+
 # ---------- UI ----------
 st.title("🛒 Product List Translator & Category Mapper")
 
 st.markdown("""
-1) Upload **Product List** and **Category Mapping** files  
-2) Map the **ID** and optional **Name** columns (Main → Sub → Sub-Sub)  
-3) Search products, choose categories, **Apply to filtered rows**, then download the full file
+Upload your **Product List** and **Category Mapping** files.  
+Search products, choose **Main (name) → Sub (name) → Sub-Sub (name)**, then **Apply to filtered rows**.  
+The app writes **numbers** for Sub & Sub-Sub from your mapping’s **“… NO”** columns; Main stays as a **name**.
 """)
 
 col1, col2, col3 = st.columns(3)
@@ -135,61 +133,32 @@ with col2:
 with col3:
     glossary_file = st.file_uploader("(Optional) Translation Glossary (.csv)", type=["csv"], key="gloss")
 
+# Read files
 prod_df = read_any_table(product_file) if product_file else None
 map_df = read_any_table(mapping_file) if mapping_file else None
 glossary_df = read_any_table(glossary_file) if glossary_file else None
 
+# Validate availability
 ok = True
 if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
     ok = False
-if map_df is None:
+# Ensure mapping has the exact required columns
+MAPPING_REQUIRED = [
+    "category_id",
+    "sub_category_id", "sub_category_id NO",
+    "sub_sub_category_id", "sub_sub_category_id NO",
+]
+if map_df is None or not validate_columns(map_df, MAPPING_REQUIRED, "Category Mapping"):
     ok = False
 
 if not ok:
-    st.info("Upload both Product List and Category Mapping to continue.")
+    st.info("Upload both files with the required headers to continue.")
     st.stop()
 
-# --------- Category Mapping: let user select columns ---------
-st.subheader("Map Category Mapping columns")
+# Build lookups
+lookups = build_mapping_struct_fixed(map_df)
 
-cols = list(map_df.columns)
-
-# Smart defaults / guesses
-guess_main_id  = guess_col(cols, [r"^category_id$", r"^main_id$", r"category.*id"])
-guess_sub_id   = guess_col(cols, [r"^sub_category_id$", r"sub.*cat.*id"])
-guess_ssub_id  = guess_col(cols, [r"^sub_sub_category_id$", r"sub.*sub.*cat.*id"])
-
-guess_main_name = guess_col(cols, [r"^category_name$", r"category.*(name|en|ar)$", r"^category$"])
-guess_sub_name  = guess_col(cols, [r"^sub_category_name$", r"sub.*cat.*(name|en|ar)$", r"^sub_category$"])
-guess_ssub_name = guess_col(cols, [r"^sub_sub_category_name$", r"sub.*sub.*cat.*(name|en|ar)$", r"^sub_sub_category$"])
-
-c1, c2 = st.columns(2)
-with c1:
-    main_id_col = st.selectbox("Main ID column (required)", options=cols, index=cols.index(guess_main_id) if guess_main_id in cols else 0)
-    sub_id_col  = st.selectbox("Sub ID column (required)",  options=cols, index=cols.index(guess_sub_id)  if guess_sub_id  in cols else 0)
-    ssub_id_col = st.selectbox("Sub-Sub ID column (required)", options=cols, index=cols.index(guess_ssub_id) if guess_ssub_id in cols else 0)
-with c2:
-    main_name_col = st.selectbox("Main NAME column (optional)", options=["(none)"] + cols,
-                                 index=(["(none)"] + cols).index(guess_main_name) if guess_main_name in cols else 0)
-    sub_name_col  = st.selectbox("Sub NAME column (optional)",  options=["(none)"] + cols,
-                                 index=(["(none)"] + cols).index(guess_sub_name)  if guess_sub_name  in cols else 0)
-    ssub_name_col = st.selectbox("Sub-Sub NAME column (optional)", options=["(none)"] + cols,
-                                 index=(["(none)"] + cols).index(guess_ssub_name) if guess_ssub_name in cols else 0)
-
-cfg = {
-    "main_id": main_id_col,
-    "sub_id": sub_id_col,
-    "ssub_id": ssub_id_col,
-    "main_name": None if main_name_col == "(none)" else main_name_col,
-    "sub_name":  None if sub_name_col  == "(none)" else sub_name_col,
-    "ssub_name": None if ssub_name_col == "(none)" else ssub_name_col,
-}
-
-# Build lookups & labels
-lookups = build_mapping_struct(map_df, cfg)
-labels = lookups["labels"]
-
-# ---------- Product working frame ----------
+# Prepare working frame
 work = prod_df.copy()
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
@@ -199,6 +168,7 @@ for col in REQUIRED_PRODUCT_COLS:
 if "ProductNameEn" not in work.columns:
     work["ProductNameEn"] = apply_glossary_translate(work["name_ar"], glossary_df)
 
+# --- Previews ---
 with st.expander("🔎 Product List (first rows)"):
     st.dataframe(work.head(30), use_container_width=True)
 with st.expander("🗂️ Category Mapping (first rows)"):
@@ -219,69 +189,45 @@ else:
 filtered = work[mask].copy()
 st.caption(f"Matched rows: {filtered.shape[0]}")
 
-# Cascading pickers (IDs for options; show names via format_func if provided)
-main_opts = [""] + lookups["main_ids"]
-sel_main = st.selectbox(
-    "Main",
-    options=main_opts,
-    format_func=lambda v: labels["main"].get(v, v)
-)
+# Cascading pickers (NAMES only)
+main_opts = [""] + lookups["main_names"]
+sel_main = st.selectbox("Main (category_id — NAME)", options=main_opts)
 
-sub_opts = [""] + (lookups["main_to_subs"].get(sel_main, []) if sel_main else [])
-sel_sub = st.selectbox(
-    "Sub (filtered by Main)",
-    options=sub_opts,
-    format_func=lambda v: labels["sub"].get(v, v)
-)
+sub_opts = [""] + (lookups["main_to_subnames"].get(sel_main, []) if sel_main else [])
+sel_sub = st.selectbox("Sub (sub_category_id — NAME, filtered by Main)", options=sub_opts)
 
-subsub_opts = [""] + (lookups["pair_to_subsubs"].get((sel_main, sel_sub), []) if sel_main and sel_sub else [])
-sel_subsub = st.selectbox(
-    "Sub-Sub (filtered by Sub)",
-    options=subsub_opts,
-    format_func=lambda v: labels["ssub"].get(v, v)
-)
+subsub_opts = [""] + (lookups["pair_to_subsubnames"].get((sel_main, sel_sub), []) if sel_main and sel_sub else [])
+sel_subsub = st.selectbox("Sub-Sub (sub_sub_category_id — NAME, filtered by Sub)", options=subsub_opts)
 
-# ---- Robust ID resolution: handle if widget returns IDs OR Names ----
-def resolve_to_id(value, id_col, name_col):
-    """
-    Return the ID string for a selected value.
-    If value equals an ID -> return as-is.
-    Else if a name column exists -> map name -> ID using map_df.
-    Else return value.
-    """
-    if not value:
+# ---- Apply: write Main as NAME; Sub & Sub-Sub as NUMBERS from mapping ----
+def get_sub_no(main_name, sub_name) -> str:
+    if not main_name or not sub_name:
         return ""
-    val = str(value)
-    # If value already exists in the ID column, return it
-    if val in set(map_df[id_col].astype(str)):
-        return val
-    # Otherwise, try to resolve via name column (if provided)
-    if name_col and name_col in map_df.columns:
-        tmp = map_df[[id_col, name_col]].drop_duplicates()
-        tmp[id_col] = tmp[id_col].astype(str)
-        tmp[name_col] = tmp[name_col].astype(str)
-        match = tmp.loc[tmp[name_col] == val, id_col]
-        if not match.empty:
-            return str(match.iloc[0])
-    return val  # fallback
+    return lookups["sub_name_to_no_by_main"].get((main_name, sub_name), "")
 
-# Apply to all filtered rows (ALWAYS write IDs)
-if st.button("Apply IDs to all filtered rows"):
-    main_id = resolve_to_id(sel_main,  cfg["main_id"],  cfg.get("main_name"))
-    sub_id  = resolve_to_id(sel_sub,   cfg["sub_id"],   cfg.get("sub_name"))
-    ssub_id = resolve_to_id(sel_subsub,cfg["ssub_id"],  cfg.get("ssub_name"))
+def get_ssub_no(main_name, sub_name, ssub_name) -> str:
+    if not main_name or not sub_name or not ssub_name:
+        return ""
+    return lookups["ssub_name_to_no_by_main_sub"].get((main_name, sub_name, ssub_name), "")
 
-    if main_id:
-        work.loc[mask, "category_id"] = main_id
-    if sub_id:
-        work.loc[mask, "sub_category_id"] = sub_id
-    if ssub_id:
-        work.loc[mask, "sub_sub_category_id"] = ssub_id
+if st.button("Apply to all filtered rows"):
+    # Main stays as name
+    if sel_main:
+        work.loc[mask, "category_id"] = sel_main
+
+    # Resolve numbers via mapping
+    sub_no = get_sub_no(sel_main, sel_sub)
+    ssub_no = get_ssub_no(sel_main, sel_sub, sel_subsub)
+
+    if sub_no:
+        work.loc[mask, "sub_category_id"] = sub_no  # write NUMBER
+    if ssub_no:
+        work.loc[mask, "sub_sub_category_id"] = ssub_no  # write NUMBER
 
     filtered = work[mask].copy()
-    st.success("Applied your selection to all filtered rows (IDs only).")
+    st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# Show filtered preview
+# Show filtered preview (you should see numbers in sub/sub-sub columns)
 st.dataframe(
     filtered[["merchant_sku", "name", "name_ar",
               "category_id", "sub_category_id", "sub_sub_category_id"]],
@@ -298,4 +244,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Dropdowns may show names, but the table always stores **IDs** based on your mapping selections.")
+st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS from your mapping.")
