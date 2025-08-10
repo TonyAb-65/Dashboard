@@ -43,14 +43,7 @@ def validate_columns(df, required_cols, label):
 
 @st.cache_data
 def build_mapping_struct(map_df: pd.DataFrame):
-    """
-    Build 3-level cascade (IDs) + optional ID->label maps if name columns exist.
-    Required: category_id, sub_category_id, sub_sub_category_id
-    Optional label columns we auto-detect if present:
-      category_name/category_en/category_ar/category
-      sub_category_name/sub_category_en/sub_category_ar/sub_category
-      sub_sub_category_name/sub_sub_category_en/sub_sub_category_ar/sub_sub_category
-    """
+    """Build 3-level cascade (IDs) + optional ID->label maps if name columns exist."""
     for c in ["category_id", "sub_category_id", "sub_sub_category_id"]:
         map_df[c] = map_df[c].astype(str).str.strip()
 
@@ -64,22 +57,18 @@ def build_mapping_struct(map_df: pd.DataFrame):
     sub_label_col  = pick_col(["sub_category_name","sub_category_en","sub_category_ar","sub_category"])
     ssub_label_col = pick_col(["sub_sub_category_name","sub_sub_category_en","sub_sub_category_ar","sub_sub_category"])
 
-    # Unique mains (IDs)
-    main_ids = sorted(map_df["category_id"].dropna().astype(str).str.strip().unique().tolist())
+    main_ids = sorted(map_df["category_id"].dropna().astype(str).unique().tolist())
 
-    # Main -> [Sub IDs]
     main_to_subs = {}
     for mc, g1 in map_df.groupby("category_id", dropna=True):
-        subs = sorted(g1["sub_category_id"].dropna().astype(str).str.strip().unique().tolist())
+        subs = sorted(g1["sub_category_id"].dropna().astype(str).unique().tolist())
         main_to_subs[str(mc)] = subs
 
-    # (Main, Sub) -> [SubSub IDs]
     pair_to_subsubs = {}
     for (mc, sc), g2 in map_df.groupby(["category_id", "sub_category_id"], dropna=True):
-        ssubs = sorted(g2["sub_sub_category_id"].dropna().astype(str).str.strip().unique().tolist())
+        ssubs = sorted(g2["sub_sub_category_id"].dropna().astype(str).unique().tolist())
         pair_to_subsubs[(str(mc), str(sc))] = ssubs
 
-    # ID -> label dicts (fallback to the ID itself if no label col)
     if cat_label_col:
         main_id_to_label = dict(map_df[["category_id", cat_label_col]].drop_duplicates().itertuples(index=False, name=None))
     else:
@@ -127,8 +116,8 @@ st.title("🛒 Product List Translator & Category Mapper")
 
 st.markdown("""
 Upload your **Product List** and **Category Mapping** files.  
-Search products (e.g., “Dishwashing”, “liquid detergent”), choose **category_id → sub_category_id → sub_sub_category_id**,  
-click **Apply IDs to all filtered rows**, then download the enriched Excel.
+Search products, choose **category_id → sub_category_id → sub_sub_category_id**,  
+click **Apply IDs to all filtered rows**, then download the updated Excel.
 """)
 
 col1, col2, col3 = st.columns(3)
@@ -139,12 +128,10 @@ with col2:
 with col3:
     glossary_file = st.file_uploader("(Optional) Translation Glossary (.csv)", type=["csv"], key="gloss")
 
-# Read files
 prod_df = read_any_table(product_file) if product_file else None
 map_df = read_any_table(mapping_file) if mapping_file else None
 glossary_df = read_any_table(glossary_file) if glossary_file else None
 
-# Validate
 ok = True
 if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
     ok = False
@@ -157,30 +144,25 @@ if not ok:
     st.info("Upload the required files to continue.")
     st.stop()
 
-# Build lookups
 lookups = build_mapping_struct(map_df)
 labels = lookups["labels"]
 
-# Prepare working frame; ensure columns exist
 work = prod_df.copy()
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
 
-# Optional English helper column for searching
 if "ProductNameEn" not in work.columns:
     work["ProductNameEn"] = apply_glossary_translate(work["name_ar"], glossary_df)
 
-# --- Previews ---
 with st.expander("🔎 Product List (first rows)"):
     st.dataframe(work.head(30), use_container_width=True)
 with st.expander("🗂️ Category Mapping (first rows)"):
     st.dataframe(map_df.head(30), use_container_width=True)
 
-# ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
-q = st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", "")
+q = st.text_input("Search by 'name' or 'name_ar':", "")
 if q.strip():
     qlower = q.strip().lower()
     mask = work["name"].astype(str).str.lower().str.contains(qlower, na=False) | \
@@ -192,7 +174,6 @@ else:
 filtered = work[mask].copy()
 st.caption(f"Matched rows: {filtered.shape[0]}")
 
-# --- Cascading pickers (IDs only, labels shown via format_func) ---
 main_opts = [""] + lookups["main_ids"]
 sel_main = st.selectbox(
     "Main category_id",
@@ -214,25 +195,44 @@ sel_subsub = st.selectbox(
     format_func=lambda v: labels["ssub"].get(v, v)
 )
 
-# Apply to all filtered rows (WRITE IDs)
-if st.button("Apply IDs to all filtered rows"):
-    if sel_main:
-        work.loc[mask, "category_id"] = sel_main
-    if sel_sub:
-        work.loc[mask, "sub_category_id"] = sel_sub
-    if sel_subsub:
-        work.loc[mask, "sub_sub_category_id"] = sel_subsub
-    filtered = work[mask].copy()
-    st.success("Applied your selection to all filtered rows.")
+# ---- FORCE WRITING IDS (not labels) ----
+rev_main = {v: k for k, v in labels["main"].items()}
+rev_sub  = {v: k for k, v in labels["sub"].items()}
+rev_ssub = {v: k for k, v in labels["ssub"].items()}
 
-# Show filtered preview
+def as_id(value, level):
+    """Ensure we always write the ID; convert labels -> IDs if needed."""
+    if not value:
+        return ""
+    if level == "main":
+        return value if value in labels["main"] else rev_main.get(value, value)
+    if level == "sub":
+        return value if value in labels["sub"] else rev_sub.get(value, value)
+    if level == "ssub":
+        return value if value in labels["ssub"] else rev_ssub.get(value, value)
+    return value
+
+if st.button("Apply IDs to all filtered rows"):
+    main_id = as_id(sel_main, "main")
+    sub_id  = as_id(sel_sub, "sub")
+    ssub_id = as_id(sel_subsub, "ssub")
+
+    if main_id:
+        work.loc[mask, "category_id"] = main_id
+    if sub_id:
+        work.loc[mask, "sub_category_id"] = sub_id
+    if ssub_id:
+        work.loc[mask, "sub_sub_category_id"] = ssub_id
+
+    filtered = work[mask].copy()
+    st.success("Applied your selection to all filtered rows (IDs only).")
+
 st.dataframe(
     filtered[["merchant_sku", "name", "name_ar",
               "category_id", "sub_category_id", "sub_sub_category_id"]],
     use_container_width=True, height=340
 )
 
-# ---------- Download ----------
 st.subheader("Download")
 excel_bytes = to_excel_download(work, sheet_name="Products")
 st.download_button(
