@@ -70,7 +70,7 @@ def translate_deepl_ar_to_en(texts):
     """
     Translate Arabic -> English with DeepL in safe batches.
     - Limits by number of items AND total characters.
-    - On error (quota/limit), it stops gracefully and reports.
+    - On error (quota/limit), stops gracefully and reports.
     - Returns full-length list aligned with inputs.
     """
     if not translator:
@@ -204,11 +204,13 @@ prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
 # --- Detect a NEW upload and clear previous working data ---
+new_upload = False
 if product_file is not None:
     upload_sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
     if st.session_state.get("upload_sig") != upload_sig:
         st.session_state.upload_sig = upload_sig
-        st.session_state.pop("work", None)
+        st.session_state.pop("work", None)   # discard old edits ONLY on new upload
+        new_upload = True
 
 # Validate availability
 ok = True
@@ -254,8 +256,10 @@ prod_df["ProductNameEn"] = prod_df["name_en"]
 with st.expander("Translation preview (first 10)"):
     st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
 
-# IMPORTANT: after translation, ALWAYS use the processed DF as the working copy
-st.session_state.work = prod_df.copy()
+# ---------- Create/keep the working dataframe ----------
+# Only replace the working df on first load OR new upload; keep it otherwise (so edits persist).
+if ("work" not in st.session_state) or new_upload:
+    st.session_state.work = prod_df.copy()
 
 # Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
@@ -263,15 +267,17 @@ lookups = build_mapping_struct_fixed(map_df)
 # ---------- Working dataframe (persisted) ----------
 work = st.session_state.work
 
-# Ensure all expected columns exist in working df
+# Ensure columns exist and are string-typed (avoid NaN when writing numeric IDs as text)
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
+    else:
+        work[col] = work[col].fillna("").astype(str)
 
 # ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
-# Ensure search state key exists BEFORE rendering widget
+# Ensure search key exists BEFORE rendering widget
 if "search_q" not in st.session_state:
     st.session_state["search_q"] = ""
 
@@ -322,18 +328,20 @@ def get_ssub_no(main_name, sub_name, ssub_name) -> str:
     return lookups["ssub_name_to_no_by_main_sub"].get((main_name, sub_name, ssub_name), "")
 
 if st.button("Apply to all filtered rows"):
+    # Main stays as a NAME
     if sel_main:
         work.loc[mask, "category_id"] = sel_main
 
+    # Resolve numbers via mapping
     sub_no = get_sub_no(sel_main, sel_sub)
     ssub_no = get_ssub_no(sel_main, sel_sub, sel_subsub)
 
     if sub_no:
-        work.loc[mask, "sub_category_id"] = sub_no  # write NUMBER
+        work.loc[mask, "sub_category_id"] = str(sub_no)
     if ssub_no:
-        work.loc[mask, "sub_sub_category_id"] = ssub_no  # write NUMBER
+        work.loc[mask, "sub_sub_category_id"] = str(ssub_no)
 
-    # Persist updates
+    # Persist updates so they survive future reruns/searches
     st.session_state.work = work
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
@@ -346,10 +354,10 @@ st.dataframe(
         "category_id", "sub_category_id", "sub_sub_category_id"
     ]],
     use_container_width=True,
-    height=900,  # tall viewport so you can scroll through many rows
+    height=900,
 )
 
-# --- Quick previews for full DF and mapping (first rows only, separate) ---
+# --- Quick previews for full DF and mapping (first rows only) ---
 with st.expander("🔎 Product List (first rows)"):
     st.dataframe(work.head(30), use_container_width=True)
 with st.expander("🗂️ Category Mapping (first rows)"):
