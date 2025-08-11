@@ -1,4 +1,5 @@
 import io
+import re
 import pandas as pd
 import streamlit as st
 
@@ -15,6 +16,14 @@ REQUIRED_PRODUCT_COLS = [
 
 # Optional glossary CSV columns for name_ar -> English helper (exact match)
 GLOSSARY_COLS = ["Arabic", "English"]
+
+# ---------- DeepL (optional) ----------
+try:
+    import deepl
+    DEEPL_API_KEY = st.secrets.get("DEEPL_API_KEY")
+    translator = deepl.Translator(DEEPL_API_KEY) if DEEPL_API_KEY else None
+except Exception:
+    translator = None  # safe fallback if not installed or key missing
 
 
 # ---------- Helpers ----------
@@ -39,14 +48,59 @@ def validate_columns(df, required_cols, label):
     return True
 
 
-def apply_glossary_translate(series_ar, glossary_df):
-    """Optional helper: build an English helper column via exact-match glossary."""
-    if glossary_df is None:
-        return series_ar.astype(str)
-    glossary_df["Arabic"] = glossary_df["Arabic"].astype(str)
-    glossary_df["English"] = glossary_df["English"].astype(str)
-    g = dict(zip(glossary_df["Arabic"], glossary_df["English"]))
-    return series_ar.astype(str).map(lambda x: g.get(x, x))
+def clean_arabic_text(s: str) -> str:
+    """Light e-commerce cleanup for Arabic (extendable)."""
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if not s:
+        return ""
+    # normalize spaces
+    s = re.sub(r"\s+", " ", s)
+    # normalize common units/spaces (extend rules as needed)
+    s = re.sub(r"\b(\d+)\s*(مل|ml)\b", r"\1 مل", s, flags=re.I)
+    s = re.sub(r"\b(\d+)\s*(جم|g)\b",  r"\1 جم", s, flags=re.I)
+    s = re.sub(r"\b(\d+)\s*(كغ|kg)\b", r"\1 كغ", s, flags=re.I)
+    s = re.sub(r"\b(\d+)\s*(قطعة|pcs?)\b", r"\1 قطعة", s, flags=re.I)
+    return s
+
+
+def translate_deepl_ar_to_en(texts):
+    """
+    Translate Arabic -> English with DeepL in safe batches.
+    DeepL recommends ≤ ~30k chars/request; we’ll batch by total chars.
+    """
+    if not translator:
+        return list(texts)  # no key/translator: return input as-is
+
+    out = []
+    batch, batch_chars = [], 0
+    LIMIT = 30000
+
+    def flush(items):
+        if not items:
+            return []
+        try:
+            res = translator.translate_text(items, source_lang="AR", target_lang="EN-GB")
+            if isinstance(res, list):
+                return [r.text for r in res]
+            return [res.text]
+        except Exception:
+            # fail-safe: return originals for this batch
+            return items
+
+    for t in texts:
+        t = t or ""
+        if batch and (batch_chars + len(t) > LIMIT):
+            out.extend(flush(batch))
+            batch, batch_chars = [], 0
+        batch.append(t)
+        batch_chars += len(t)
+
+    if batch:
+        out.extend(flush(batch))
+
+    return out
 
 
 def to_excel_download(df, sheet_name="Products"):
@@ -92,9 +146,7 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         pair_to_subsubnames[(str(mc), str(sc))] = ssubs
 
     # --- Lookup dictionaries to resolve NAMES -> NUMBERS on Apply ---
-    # (Main NAME, Sub NAME) -> Sub NUMBER
     sub_name_to_no_by_main = {}
-    # (Main NAME, Sub NAME, Sub-Sub NAME) -> Sub-Sub NUMBER
     ssub_name_to_no_by_main_sub = {}
 
     for _, r in map_df.iterrows():
@@ -103,7 +155,6 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         sc_no = r["sub_category_id NO"]
         ssc_name = r["sub_sub_category_id"]
         ssc_no = r["sub_sub_category_id NO"]
-
         sub_name_to_no_by_main[(mc, sc_name)] = sc_no
         ssub_name_to_no_by_main_sub[(mc, sc_name, ssc_name)] = ssc_no
 
@@ -121,6 +172,7 @@ st.title("🛒 Product List Translator & Category Mapper")
 
 st.markdown("""
 Upload your **Product List** and **Category Mapping** files.  
+Optionally auto-clean Arabic and translate to English with DeepL (if configured).  
 Search products, choose **Main (name) → Sub (name) → Sub-Sub (name)**, then **Apply to filtered rows**.  
 The app writes **numbers** for Sub & Sub-Sub from your mapping’s **“… NO”** columns; Main stays as a **name**.
 """)
@@ -142,7 +194,7 @@ glossary_df = read_any_table(glossary_file) if glossary_file else None
 ok = True
 if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
     ok = False
-# Ensure mapping has the exact required columns
+
 MAPPING_REQUIRED = [
     "category_id",
     "sub_category_id", "sub_category_id NO",
@@ -155,7 +207,30 @@ if not ok:
     st.info("Upload both files with the required headers to continue.")
     st.stop()
 
-# Build lookups
+# ---------- Auto-clean + translate (runs once per upload) ----------
+with st.expander("Translation options"):
+    auto_tx = st.checkbox("Auto-clean Arabic & translate to English (DeepL)", value=bool(translator),
+                          help="Uses your DeepL key from Secrets if available")
+
+if auto_tx and "name_ar" in prod_df.columns:
+    # Arabic cleanup
+    prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str).map(clean_arabic_text)
+    # Translate cleaned Arabic to English (batched)
+    prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
+    # Optional: also expose as ProductNameEn if you rely on that name elsewhere
+    if "ProductNameEn" not in prod_df.columns:
+        prod_df["ProductNameEn"] = prod_df["name_en"]
+else:
+    # Ensure columns exist for downstream code/UI
+    if "name_ar_clean" not in prod_df.columns:
+        prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str)
+    if "name_en" not in prod_df.columns:
+        # keep Arabic as fallback if no translation
+        prod_df["name_en"] = prod_df["name_ar_clean"]
+    if "ProductNameEn" not in prod_df.columns:
+        prod_df["ProductNameEn"] = prod_df["name_en"]
+
+# Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
 
 # ---------- Working dataframe persisted across searches ----------
@@ -168,10 +243,6 @@ for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
 
-# Optional English helper column for searching
-if "ProductNameEn" not in work.columns:
-    work["ProductNameEn"] = apply_glossary_translate(work["name_ar"], glossary_df)
-
 # --- Previews ---
 with st.expander("🔎 Product List (first rows)"):
     st.dataframe(work.head(30), use_container_width=True)
@@ -181,9 +252,16 @@ with st.expander("🗂️ Category Mapping (first rows)"):
 # ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
-q = st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", "")
-if q.strip():
-    qlower = q.strip().lower()
+c1, c2 = st.columns([3,1])
+with c1:
+    q = st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", key="search_q")
+with c2:
+    if st.button("Show all"):
+        st.session_state.search_q = ""
+        st.experimental_rerun()
+
+if st.session_state.get("search_q", "").strip():
+    qlower = st.session_state["search_q"].strip().lower()
     mask = work["name"].astype(str).str.lower().str.contains(qlower, na=False) | \
            work["name_ar"].astype(str).str.lower().str.contains(qlower, na=False) | \
            work["ProductNameEn"].astype(str).str.lower().str.contains(qlower, na=False)
@@ -228,18 +306,18 @@ if st.button("Apply to all filtered rows"):
     if ssub_no:
         work.loc[mask, "sub_sub_category_id"] = ssub_no  # write NUMBER
 
-    # Persist updates so next searches keep previous changes
+    # Persist updates for next searches
     st.session_state.work = work
 
     # Refresh filtered view
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# Show filtered preview (you should see numbers in sub/sub-sub columns)
+# Show filtered preview (numbers should appear in sub/sub-sub columns)
 st.dataframe(
-    filtered[["merchant_sku", "name", "name_ar",
+    filtered[["merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
               "category_id", "sub_category_id", "sub_sub_category_id"]],
-    use_container_width=True, height=340
+    use_container_width=True, height=360
 )
 
 # Optional reset (handy for testing)
@@ -258,4 +336,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS from your mapping. Edits persist across searches.")
+st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS. If DeepL is configured, Arabic is cleaned and translated at upload.")
