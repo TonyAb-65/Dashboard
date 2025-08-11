@@ -177,12 +177,12 @@ with col3:
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-# --- Reset working DF when a NEW product file is uploaded ---
+# --- Detect a NEW upload and clear previous working data ---
 if product_file is not None:
     upload_sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
     if st.session_state.get("upload_sig") != upload_sig:
         st.session_state.upload_sig = upload_sig
-        st.session_state.pop("work", None)  # drop previous working copy
+        st.session_state.pop("work", None)
 
 # Validate availability
 ok = True
@@ -219,15 +219,18 @@ else:
     st.warning("DeepL not active — showing cleaned Arabic in English column. "
                "Confirm Secrets + requirements.txt, then reboot if needed.")
 
+# OPTIONAL: also place English into `name` so the table shows it everywhere
+if "name" in prod_df.columns:
+    prod_df["name"] = prod_df["name_en"]
+
 # Keep ProductNameEn in sync (if other parts use it)
 prod_df["ProductNameEn"] = prod_df["name_en"]
 
 with st.expander("Translation preview (first 10)"):
     st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
 
-# After translation: use this processed DF as the working copy (first time per upload)
-if "work" not in st.session_state:
-    st.session_state.work = prod_df.copy()
+# IMPORTANT: after translation, ALWAYS use the processed DF as the working copy
+st.session_state.work = prod_df.copy()
 
 # Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
