@@ -14,16 +14,18 @@ REQUIRED_PRODUCT_COLS = [
     "sub_category_id", "sub_sub_category_id",
 ]
 
-# Optional glossary CSV columns for name_ar -> English helper (exact match)
-GLOSSARY_COLS = ["Arabic", "English"]
-
-# ---------- DeepL (optional) ----------
+# ---------- DeepL (auto) ----------
+translator = None
+deepl_active = False
 try:
     import deepl
     DEEPL_API_KEY = st.secrets.get("DEEPL_API_KEY")
-    translator = deepl.Translator(DEEPL_API_KEY) if DEEPL_API_KEY else None
+    if DEEPL_API_KEY:
+        translator = deepl.Translator(DEEPL_API_KEY)
+        deepl_active = True
 except Exception:
-    translator = None  # safe fallback if not installed or key missing
+    translator = None
+    deepl_active = False
 
 
 # ---------- Helpers ----------
@@ -49,7 +51,7 @@ def validate_columns(df, required_cols, label):
 
 
 def clean_arabic_text(s: str) -> str:
-    """Light e-commerce cleanup for Arabic (extendable)."""
+    """Light e-commerce cleanup for Arabic (extend these rules as you like)."""
     if not isinstance(s, str):
         return ""
     s = s.strip()
@@ -57,7 +59,7 @@ def clean_arabic_text(s: str) -> str:
         return ""
     # normalize spaces
     s = re.sub(r"\s+", " ", s)
-    # normalize common units/spaces (extend rules as needed)
+    # normalize common units/spaces
     s = re.sub(r"\b(\d+)\s*(مل|ml)\b", r"\1 مل", s, flags=re.I)
     s = re.sub(r"\b(\d+)\s*(جم|g)\b",  r"\1 جم", s, flags=re.I)
     s = re.sub(r"\b(\d+)\s*(كغ|kg)\b", r"\1 كغ", s, flags=re.I)
@@ -66,12 +68,9 @@ def clean_arabic_text(s: str) -> str:
 
 
 def translate_deepl_ar_to_en(texts):
-    """
-    Translate Arabic -> English with DeepL in safe batches.
-    DeepL recommends ≤ ~30k chars/request; we’ll batch by total chars.
-    """
+    """Translate Arabic -> English with DeepL in safe ~30k-character batches."""
     if not translator:
-        return list(texts)  # no key/translator: return input as-is
+        return list(texts)  # keep original (cleaned Arabic) if DeepL not available
 
     out = []
     batch, batch_chars = [], 0
@@ -86,8 +85,7 @@ def translate_deepl_ar_to_en(texts):
                 return [r.text for r in res]
             return [res.text]
         except Exception:
-            # fail-safe: return originals for this batch
-            return items
+            return items  # fail-safe: return originals for this batch
 
     for t in texts:
         t = t or ""
@@ -99,7 +97,6 @@ def translate_deepl_ar_to_en(texts):
 
     if batch:
         out.extend(flush(batch))
-
     return out
 
 
@@ -172,9 +169,9 @@ st.title("🛒 Product List Translator & Category Mapper")
 
 st.markdown("""
 Upload your **Product List** and **Category Mapping** files.  
-Optionally auto-clean Arabic and translate to English with DeepL (if configured).  
-Search products, choose **Main (name) → Sub (name) → Sub-Sub (name)**, then **Apply to filtered rows**.  
-The app writes **numbers** for Sub & Sub-Sub from your mapping’s **“… NO”** columns; Main stays as a **name**.
+Arabic is auto-cleaned; if a DeepL key is configured in Secrets, the app also translates to English.  
+Then search, choose **Main (name) → Sub (name) → Sub-Sub (name)**, and **Apply**.  
+The app writes **numbers** for Sub & Sub-Sub (from your “NO” columns); Main stays as a **name**.
 """)
 
 col1, col2, col3 = st.columns(3)
@@ -183,12 +180,11 @@ with col1:
 with col2:
     mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="map")
 with col3:
-    glossary_file = st.file_uploader("(Optional) Translation Glossary (.csv)", type=["csv"], key="gloss")
+    glossary_file = st.file_uploader("(Optional) Translation Glossary (.csv)", type=["csv"], key="gloss")  # reserved
 
 # Read files
 prod_df = read_any_table(product_file) if product_file else None
 map_df = read_any_table(mapping_file) if mapping_file else None
-glossary_df = read_any_table(glossary_file) if glossary_file else None
 
 # Validate availability
 ok = True
@@ -207,28 +203,33 @@ if not ok:
     st.info("Upload both files with the required headers to continue.")
     st.stop()
 
-# ---------- Auto-clean + translate (runs once per upload) ----------
-with st.expander("Translation options"):
-    auto_tx = st.checkbox("Auto-clean Arabic & translate to English (DeepL)", value=bool(translator),
-                          help="Uses your DeepL key from Secrets if available")
+# ---------- Auto-clean + translate (always runs; translates only if key present) ----------
+# Ensure helper columns exist
+for col in ["name_ar_clean", "name_en", "ProductNameEn"]:
+    if col not in prod_df.columns:
+        prod_df[col] = ""
 
-if auto_tx and "name_ar" in prod_df.columns:
-    # Arabic cleanup
+if "name_ar" in prod_df.columns:
     prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str).map(clean_arabic_text)
-    # Translate cleaned Arabic to English (batched)
-    prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
-    # Optional: also expose as ProductNameEn if you rely on that name elsewhere
-    if "ProductNameEn" not in prod_df.columns:
-        prod_df["ProductNameEn"] = prod_df["name_en"]
 else:
-    # Ensure columns exist for downstream code/UI
-    if "name_ar_clean" not in prod_df.columns:
-        prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str)
-    if "name_en" not in prod_df.columns:
-        # keep Arabic as fallback if no translation
+    st.error("Column 'name_ar' not found in your Product List file. Translation skipped.")
+
+if deepl_active and "name_ar_clean" in prod_df.columns:
+    st.info("🔤 DeepL key detected — translating Arabic → English…")
+    prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
+    st.success("Translation complete.")
+else:
+    # keep cleaned Arabic in English column as a fallback so the UI never breaks
+    if "name_ar_clean" in prod_df.columns:
         prod_df["name_en"] = prod_df["name_ar_clean"]
-    if "ProductNameEn" not in prod_df.columns:
-        prod_df["ProductNameEn"] = prod_df["name_en"]
+    st.warning("DeepL not active — showing cleaned Arabic in English column. "
+               "Confirm Secrets + requirements.txt, then reboot.")
+
+# Keep ProductNameEn in sync (if other parts of your app use it)
+prod_df["ProductNameEn"] = prod_df["name_en"]
+
+with st.expander("Translation preview (first 10)"):
+    st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
 
 # Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
@@ -252,7 +253,7 @@ with st.expander("🗂️ Category Mapping (first rows)"):
 # ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
-c1, c2 = st.columns([3,1])
+c1, c2 = st.columns([3, 1])
 with c1:
     q = st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", key="search_q")
 with c2:
@@ -336,4 +337,8 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Main category stays as a NAME (no numeric main ID provided). Sub & Sub-Sub are saved as NUMBERS. If DeepL is configured, Arabic is cleaned and translated at upload.")
+st.caption(
+    "Main category stays as a NAME (no numeric main ID provided). "
+    "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
+    "Arabic is always cleaned; if a DeepL key is present, English is auto-translated."
+)
