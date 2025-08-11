@@ -69,33 +69,26 @@ def clean_arabic_text(s: str) -> str:
 def translate_deepl_ar_to_en(texts):
     """
     Translate Arabic -> English with DeepL in safe batches.
-    Improvements:
-      - Limit by number of items AND characters (safer).
-      - On exception (quota/limit), stop gracefully and keep originals for the rest.
-      - Return full-length list aligned with inputs.
+    - Limits by number of items AND total characters.
+    - On error (quota/limit), it stops gracefully and reports.
+    - Returns full-length list aligned with inputs.
     """
     if not translator:
         return list(texts)
 
-    # Prepare result list (same length), default to original text
     results = list(texts)
-
-    # Keep only indices that actually have content to translate
-    idx_texts = [(i, t if isinstance(t, str) else "") for i, t in enumerate(texts)]
+    idx_texts = [(i, (t if isinstance(t, str) else "")) for i, t in enumerate(texts)]
     idx_texts = [(i, t) for i, t in idx_texts if t.strip()]
-
     if not idx_texts:
         return results
 
-    MAX_ITEMS = 45          # conservative item cap per request
-    MAX_CHARS = 28000       # conservative char cap per request
-
+    MAX_ITEMS = 45
+    MAX_CHARS = 28000
     start = 0
     translated_count = 0
     error_message = None
 
     while start < len(idx_texts):
-        # Build batch within both limits
         batch = []
         chars = 0
         k = start
@@ -107,28 +100,18 @@ def translate_deepl_ar_to_en(texts):
             chars += len(t)
             k += 1
 
-        # Translate this batch
         try:
             texts_only = [t for _, t in batch]
             res = translator.translate_text(texts_only, source_lang="AR", target_lang="EN-GB")
-            if isinstance(res, list):
-                out_texts = [r.text for r in res]
-            else:
-                out_texts = [res.text]
-
-            # Place back into results
+            out_texts = [r.text for r in res] if isinstance(res, list) else [res.text]
             for (i, _), out in zip(batch, out_texts):
                 results[i] = out
                 translated_count += 1
-
-            start = k  # move to next chunk
-
+            start = k
         except Exception as e:
-            # Stop translating further batches; keep remaining as original
             error_message = str(e)
             break
 
-    # Show a summary in the UI
     if translated_count:
         st.success(f"Translation complete: {translated_count} / {len(idx_texts)} rows translated.")
     else:
@@ -137,7 +120,7 @@ def translate_deepl_ar_to_en(texts):
     if error_message:
         st.warning(
             f"Stopped translating remaining rows due to an API error: {error_message}. "
-            "This often means you've hit a quota or request limit. You can try again later."
+            "This often indicates a quota or request limit; try again later."
         )
 
     return results
@@ -152,7 +135,6 @@ def to_excel_download(df, sheet_name="Products"):
     return buffer
 
 
-# ---------- Build mapping structures for cascade & lookups ----------
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     """
     Mapping columns EXACTLY:
@@ -286,33 +268,37 @@ for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
 
-# --- Previews ---
-with st.expander("🔎 Product List (first rows)"):
-    st.dataframe(work.head(30), use_container_width=True)
-with st.expander("🗂️ Category Mapping (first rows)"):
-    st.dataframe(map_df.head(30), use_container_width=True)
-
 # ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
+# Ensure search state key exists BEFORE rendering widget
+if "search_q" not in st.session_state:
+    st.session_state["search_q"] = ""
+
 c1, c2 = st.columns([3, 1])
 with c1:
-    q = st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", key="search_q")
+    st.text_input(
+        "Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):",
+        key="search_q",
+        placeholder="Type to filter…",
+    )
 with c2:
     if st.button("Show all"):
-        st.session_state.search_q = ""
+        st.session_state["search_q"] = ""
         st.rerun()
 
-if st.session_state.get("search_q", "").strip():
-    qlower = st.session_state["search_q"].strip().lower()
-    mask = work["name"].astype(str).str.lower().str.contains(qlower, na=False) | \
-           work["name_ar"].astype(str).str.lower().str.contains(qlower, na=False) | \
-           work["ProductNameEn"].astype(str).str.lower().str.contains(qlower, na=False)
+qval = st.session_state["search_q"].strip().lower()
+if qval:
+    mask = (
+        work["name"].astype(str).str.lower().str.contains(qval, na=False)
+        | work["name_ar"].astype(str).str.lower().str.contains(qval, na=False)
+        | work["ProductNameEn"].astype(str).str.lower().str.contains(qval, na=False)
+    )
 else:
     mask = pd.Series(True, index=work.index)
 
 filtered = work[mask].copy()
-st.caption(f"Matched rows: {filtered.shape[0]}")
+st.caption(f"Matched rows in view: {filtered.shape[0]}")
 
 # Cascading pickers (NAMES only)
 main_opts = [""] + lookups["main_names"]
@@ -352,12 +338,22 @@ if st.button("Apply to all filtered rows"):
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# Show filtered preview (should show numbers in sub/sub-sub columns)
+# ---------- Tables (show ALL rows; tall viewport) ----------
+st.markdown("### Current selection (all rows in view)")
 st.dataframe(
-    filtered[["merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
-              "category_id", "sub_category_id", "sub_sub_category_id"]],
-    use_container_width=True, height=360
+    filtered[[
+        "merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
+        "category_id", "sub_category_id", "sub_sub_category_id"
+    ]],
+    use_container_width=True,
+    height=900,  # tall viewport so you can scroll through many rows
 )
+
+# --- Quick previews for full DF and mapping (first rows only, separate) ---
+with st.expander("🔎 Product List (first rows)"):
+    st.dataframe(work.head(30), use_container_width=True)
+with st.expander("🗂️ Category Mapping (first rows)"):
+    st.dataframe(map_df.head(30), use_container_width=True)
 
 # Optional reset (handy for testing)
 with st.expander("Reset working data"):
@@ -367,11 +363,19 @@ with st.expander("Reset working data"):
 
 # ---------- Download ----------
 st.subheader("Download")
-excel_bytes = to_excel_download(work, sheet_name="Products")
+excel_full = to_excel_download(work, sheet_name="Products")
 st.download_button(
-    label="⬇️ Download Updated Excel",
-    data=excel_bytes,
+    label="⬇️ Download FULL Excel (all rows)",
+    data=excel_full,
     file_name="products_mapped.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+excel_filtered = to_excel_download(filtered, sheet_name="Filtered")
+st.download_button(
+    label="⬇️ Download FILTERED Excel (current view)",
+    data=excel_filtered,
+    file_name="products_filtered.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
