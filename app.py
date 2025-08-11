@@ -67,36 +67,80 @@ def clean_arabic_text(s: str) -> str:
 
 
 def translate_deepl_ar_to_en(texts):
-    """Translate Arabic -> English with DeepL in safe ~30k-character batches."""
+    """
+    Translate Arabic -> English with DeepL in safe batches.
+    Improvements:
+      - Limit by number of items AND characters (safer).
+      - On exception (quota/limit), stop gracefully and keep originals for the rest.
+      - Return full-length list aligned with inputs.
+    """
     if not translator:
-        return list(texts)  # keep original (cleaned Arabic) if DeepL not available
+        return list(texts)
 
-    out = []
-    batch, batch_chars = [], 0
-    LIMIT = 30000
+    # Prepare result list (same length), default to original text
+    results = list(texts)
 
-    def flush(items):
-        if not items:
-            return []
+    # Keep only indices that actually have content to translate
+    idx_texts = [(i, t if isinstance(t, str) else "") for i, t in enumerate(texts)]
+    idx_texts = [(i, t) for i, t in idx_texts if t.strip()]
+
+    if not idx_texts:
+        return results
+
+    MAX_ITEMS = 45          # conservative item cap per request
+    MAX_CHARS = 28000       # conservative char cap per request
+
+    start = 0
+    translated_count = 0
+    error_message = None
+
+    while start < len(idx_texts):
+        # Build batch within both limits
+        batch = []
+        chars = 0
+        k = start
+        while k < len(idx_texts) and len(batch) < MAX_ITEMS:
+            i, t = idx_texts[k]
+            if batch and (chars + len(t) > MAX_CHARS):
+                break
+            batch.append((i, t))
+            chars += len(t)
+            k += 1
+
+        # Translate this batch
         try:
-            res = translator.translate_text(items, source_lang="AR", target_lang="EN-GB")
+            texts_only = [t for _, t in batch]
+            res = translator.translate_text(texts_only, source_lang="AR", target_lang="EN-GB")
             if isinstance(res, list):
-                return [r.text for r in res]
-            return [res.text]
-        except Exception:
-            return items  # fail-safe: return originals for this batch
+                out_texts = [r.text for r in res]
+            else:
+                out_texts = [res.text]
 
-    for t in texts:
-        t = t or ""
-        if batch and (batch_chars + len(t) > LIMIT):
-            out.extend(flush(batch))
-            batch, batch_chars = [], 0
-        batch.append(t)
-        batch_chars += len(t)
+            # Place back into results
+            for (i, _), out in zip(batch, out_texts):
+                results[i] = out
+                translated_count += 1
 
-    if batch:
-        out.extend(flush(batch))
-    return out
+            start = k  # move to next chunk
+
+        except Exception as e:
+            # Stop translating further batches; keep remaining as original
+            error_message = str(e)
+            break
+
+    # Show a summary in the UI
+    if translated_count:
+        st.success(f"Translation complete: {translated_count} / {len(idx_texts)} rows translated.")
+    else:
+        st.warning("DeepL call returned no translations; keeping original Arabic.")
+
+    if error_message:
+        st.warning(
+            f"Stopped translating remaining rows due to an API error: {error_message}. "
+            "This often means you've hit a quota or request limit. You can try again later."
+        )
+
+    return results
 
 
 def to_excel_download(df, sheet_name="Products"):
@@ -212,14 +256,13 @@ else:
 if deepl_active and "name_ar_clean" in prod_df.columns:
     st.info("🔤 DeepL key detected — translating Arabic → English…")
     prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
-    st.success("Translation complete.")
 else:
     if "name_ar_clean" in prod_df.columns:
         prod_df["name_en"] = prod_df["name_ar_clean"]
     st.warning("DeepL not active — showing cleaned Arabic in English column. "
                "Confirm Secrets + requirements.txt, then reboot if needed.")
 
-# OPTIONAL: also place English into `name` so the table shows it everywhere
+# OPTIONAL: place English into `name` so the table/search show it easily
 if "name" in prod_df.columns:
     prod_df["name"] = prod_df["name_en"]
 
