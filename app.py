@@ -7,7 +7,6 @@ import streamlit as st
 st.set_page_config(page_title="Product List Translator & Category Mapper", layout="wide")
 
 # ---------- Expected Product List columns ----------
-# (Main stays as name; Sub & Sub-Sub store numbers after Apply)
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
@@ -51,7 +50,7 @@ def validate_columns(df, required_cols, label):
 
 
 def clean_arabic_text(s: str) -> str:
-    """Light e-commerce cleanup for Arabic (extend these rules as you like)."""
+    """Light e-commerce cleanup for Arabic (extend rules as needed)."""
     if not isinstance(s, str):
         return ""
     s = s.strip()
@@ -112,40 +111,32 @@ def to_excel_download(df, sheet_name="Products"):
 # ---------- Build mapping structures for cascade & lookups ----------
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     """
-    Assumes mapping columns EXACTLY as:
+    Mapping columns EXACTLY:
       category_id                (Main NAME)
       sub_category_id            (Sub NAME)
       sub_category_id NO         (Sub NUMBER/ID)
       sub_sub_category_id        (Sub-Sub NAME)
       sub_sub_category_id NO     (Sub-Sub NUMBER/ID)
-    - Dropdowns show NAMES.
-    - On Apply, we write numbers for Sub & Sub-Sub using the NO columns.
     """
-    # Normalize types/whitespace
     for c in ["category_id", "sub_category_id", "sub_category_id NO",
               "sub_sub_category_id", "sub_sub_category_id NO"]:
         if c in map_df.columns:
             map_df[c] = map_df[c].astype(str).str.strip()
 
-    # Unique mains (names)
     main_names = sorted(map_df["category_id"].dropna().unique().tolist())
 
-    # Main -> list of Sub NAMES
     main_to_subnames = {}
     for mc, g1 in map_df.groupby("category_id", dropna=True):
         subs = sorted(g1["sub_category_id"].dropna().unique().tolist())
         main_to_subnames[str(mc)] = subs
 
-    # (Main, Sub NAME) -> list of Sub-Sub NAMES
     pair_to_subsubnames = {}
     for (mc, sc), g2 in map_df.groupby(["category_id", "sub_category_id"], dropna=True):
         ssubs = sorted(g2["sub_sub_category_id"].dropna().unique().tolist())
         pair_to_subsubnames[(str(mc), str(sc))] = ssubs
 
-    # --- Lookup dictionaries to resolve NAMES -> NUMBERS on Apply ---
     sub_name_to_no_by_main = {}
     ssub_name_to_no_by_main_sub = {}
-
     for _, r in map_df.iterrows():
         mc = r["category_id"]
         sc_name = r["sub_category_id"]
@@ -184,13 +175,19 @@ with col3:
 
 # Read files
 prod_df = read_any_table(product_file) if product_file else None
-map_df = read_any_table(mapping_file) if mapping_file else None
+map_df  = read_any_table(mapping_file) if mapping_file else None
+
+# --- Reset working DF when a NEW product file is uploaded ---
+if product_file is not None:
+    upload_sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
+    if st.session_state.get("upload_sig") != upload_sig:
+        st.session_state.upload_sig = upload_sig
+        st.session_state.pop("work", None)  # drop previous working copy
 
 # Validate availability
 ok = True
 if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
     ok = False
-
 MAPPING_REQUIRED = [
     "category_id",
     "sub_category_id", "sub_category_id NO",
@@ -198,13 +195,11 @@ MAPPING_REQUIRED = [
 ]
 if map_df is None or not validate_columns(map_df, MAPPING_REQUIRED, "Category Mapping"):
     ok = False
-
 if not ok:
     st.info("Upload both files with the required headers to continue.")
     st.stop()
 
 # ---------- Auto-clean + translate (always runs; translates only if key present) ----------
-# Ensure helper columns exist
 for col in ["name_ar_clean", "name_en", "ProductNameEn"]:
     if col not in prod_df.columns:
         prod_df[col] = ""
@@ -219,27 +214,28 @@ if deepl_active and "name_ar_clean" in prod_df.columns:
     prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
     st.success("Translation complete.")
 else:
-    # keep cleaned Arabic in English column as a fallback so the UI never breaks
     if "name_ar_clean" in prod_df.columns:
         prod_df["name_en"] = prod_df["name_ar_clean"]
     st.warning("DeepL not active — showing cleaned Arabic in English column. "
-               "Confirm Secrets + requirements.txt, then reboot.")
+               "Confirm Secrets + requirements.txt, then reboot if needed.")
 
-# Keep ProductNameEn in sync (if other parts of your app use it)
+# Keep ProductNameEn in sync (if other parts use it)
 prod_df["ProductNameEn"] = prod_df["name_en"]
 
 with st.expander("Translation preview (first 10)"):
     st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
 
+# After translation: use this processed DF as the working copy (first time per upload)
+if "work" not in st.session_state:
+    st.session_state.work = prod_df.copy()
+
 # Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---------- Working dataframe persisted across searches ----------
-if "work" not in st.session_state:
-    st.session_state.work = prod_df.copy()
+# ---------- Working dataframe (persisted) ----------
 work = st.session_state.work
 
-# Ensure all expected columns exist
+# Ensure all expected columns exist in working df
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
@@ -259,7 +255,7 @@ with c1:
 with c2:
     if st.button("Show all"):
         st.session_state.search_q = ""
-        st.experimental_rerun()
+        st.rerun()
 
 if st.session_state.get("search_q", "").strip():
     qlower = st.session_state["search_q"].strip().lower()
@@ -294,11 +290,9 @@ def get_ssub_no(main_name, sub_name, ssub_name) -> str:
     return lookups["ssub_name_to_no_by_main_sub"].get((main_name, sub_name, ssub_name), "")
 
 if st.button("Apply to all filtered rows"):
-    # Main stays as name
     if sel_main:
         work.loc[mask, "category_id"] = sel_main
 
-    # Resolve numbers via mapping
     sub_no = get_sub_no(sel_main, sel_sub)
     ssub_no = get_ssub_no(sel_main, sel_sub, sel_subsub)
 
@@ -307,14 +301,12 @@ if st.button("Apply to all filtered rows"):
     if ssub_no:
         work.loc[mask, "sub_sub_category_id"] = ssub_no  # write NUMBER
 
-    # Persist updates for next searches
+    # Persist updates
     st.session_state.work = work
-
-    # Refresh filtered view
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# Show filtered preview (numbers should appear in sub/sub-sub columns)
+# Show filtered preview (should show numbers in sub/sub-sub columns)
 st.dataframe(
     filtered[["merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
               "category_id", "sub_category_id", "sub_sub_category_id"]],
@@ -325,7 +317,7 @@ st.dataframe(
 with st.expander("Reset working data"):
     if st.button("🔄 Reset working data (start over)"):
         st.session_state.pop("work", None)
-        st.experimental_rerun()
+        st.rerun()
 
 # ---------- Download ----------
 st.subheader("Download")
