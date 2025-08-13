@@ -2,7 +2,7 @@ streamlit
 pandas
 openpyxl
 xlsxwriter
-deepl
 requests
 Pillow
 openai
+deepl
