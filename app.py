@@ -12,34 +12,33 @@ from io import BytesIO
 
 # ---------- Page setup ----------
 st.set_page_config(
-    page_title="Product List: Mapping + AI Descriptions (OpenAI→DeepL)",
+    page_title="Product List: Mapping + AI Title (OpenAI→DeepL)",
     layout="wide",
 )
 
 # ---------- Expected Product List columns ----------
-# Your original product list headers:
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
-    # optional image URL column:
-    # 'thumbnail' (W) or 'image_url'
 ]
 
 # ---------- DeepL (official SDK) ----------
 translator = None
 deepl_active = False
+deepl_quota_note = ""
 try:
     import deepl
     DEEPL_API_KEY = st.secrets.get("DEEPL_API_KEY")
     if DEEPL_API_KEY:
         translator = deepl.Translator(DEEPL_API_KEY)
         deepl_active = True
-except Exception:
+except Exception as e:
     translator = None
     deepl_active = False
+    deepl_quota_note = f"(DeepL not active: {e})"
 
-# ---------- OpenAI (official SDK) for image→EN description ----------
+# ---------- OpenAI (official SDK) for image→EN title ----------
 openai_client = None
 openai_active = False
 try:
@@ -48,7 +47,7 @@ try:
     if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         openai_active = True
-except Exception:
+except Exception as e:
     openai_client = None
     openai_active = False
 
@@ -133,7 +132,7 @@ def translate_deepl_ar_to_en(texts):
 
 
 def translate_deepl_en_to_ar(texts):
-    """English -> Arabic with batching (for AI descriptions)."""
+    """English -> Arabic with batching (for AI titles).  If not active or quota, return original English."""
     if not translator:
         return list(texts)
 
@@ -165,7 +164,7 @@ def translate_deepl_en_to_ar(texts):
             error_message = str(e); break
 
     if translated_count:
-        st.info(f"EN→AR descriptions: {translated_count} translated.")
+        st.info(f"EN→AR titles: {translated_count} translated.")
     if error_message:
         st.warning(f"DeepL EN→AR stopped due to API error: {error_message}")
     return results
@@ -226,54 +225,62 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
     }
 
 
-# ---------- Description helpers (fallback templates) ----------
+# ---------- Title helpers ----------
+def strip_markdown(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    # remove markdown-like bold/italics/code/backticks
+    s = re.sub(r"[*_`]+", "", s)
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def tidy_title(s: str, max_chars: int = 70) -> str:
+    s = strip_markdown(s)
+    # prevent super-long sentences; keep words without cutting
+    if len(s) <= max_chars:
+        return s
+    cut = s[:max_chars].rstrip()
+    # avoid cutting a word
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    return cut
+
 SIZE_RE = re.compile(r"(?P<num>\d+(?:\.\d+)?)\s*(?P<u>ml|l|g|kg|oz|fl\s?oz|mL|ML|KG|G|L)\b", flags=re.I)
 COUNT_RE = re.compile(r"\b(?P<count>\d+)\s*(?:pcs?|قطع(?:ة)?|pack|pkt|Pk|CT)\b", flags=re.I)
-SCENT_RE = re.compile(r"\b(lemon|rose|lavender|musk|jasmine|apple|pine|fresh|ocean|vanilla|berry)\b", flags=re.I)
 
-def extract_attrs_en(name_en: str):
+def template_title_from_name(name_en: str) -> str:
+    """If OpenAI unavailable, build a compact title from existing English."""
     if not isinstance(name_en, str):
         name_en = ""
-    brand = name_en.split()[0] if name_en.strip() else ""
+    name_en = strip_markdown(name_en)
+    # try to capture size/count
     size = None
-    m = SIZE_RE.search(name_en); 
+    m = SIZE_RE.search(name_en)
     if m:
-        size = f'{m.group("num")} {m.group("u").upper()}'.replace("ML","ml").replace("KG","kg").replace("G","g")
-    count = None
-    m2 = COUNT_RE.search(name_en); 
+        size = f'{m.group("num")} {m.group("u").upper()}'.replace("ML", "ml").replace("KG", "kg").replace("G", "g")
+    cnt = None
+    m2 = COUNT_RE.search(name_en)
     if m2:
-        count = m2.group("count")
-    scent = None
-    m3 = SCENT_RE.search(name_en.lower()); 
-    if m3:
-        scent = m3.group(1).title()
-    return brand, size, count, scent
+        cnt = m2.group("count")
 
-def make_desc_en(title: str) -> str:
-    title = (title or "").strip()
-    brand, size, count, scent = extract_attrs_en(title)
+    # brand = first token
+    brand = name_en.split()[0] if name_en.strip() else ""
     parts = []
     if brand:
-        parts.append(f"{brand} — premium quality.")
-    if title:
-        parts.append(f"{title}.")
+        parts.append(brand)
+    # keep first ~7 words of the title
+    main = " ".join(name_en.split()[:7]).strip()
+    if main and main != brand:
+        parts.append(main)
     if size:
-        parts.append(f"Size: {size}.")
-    if count:
-        parts.append(f"Pack: {count} pcs.")
-    if scent:
-        parts.append(f"Scent: {scent}.")
-    parts.append("Ideal for everyday household use.")
-    return " ".join(parts)
-
-def make_desc_ar_from_title(title_ar: str) -> str:
-    t = clean_arabic_text(title_ar or "")
-    if not t:
-        return ""
-    return f"{t}. جودة عالية مناسبة للاستخدام اليومي في المنزل."
+        parts.append(size)
+    if cnt:
+        parts.append(f"{cnt} pcs")
+    title = " ".join(parts)
+    return tidy_title(title, 70)
 
 
-# ---------- OpenAI vision: describe an image URL ----------
 def is_valid_url(u: str) -> bool:
     try:
         p = urlparse(u)
@@ -281,22 +288,22 @@ def is_valid_url(u: str) -> bool:
     except Exception:
         return False
 
-def openai_describe_image(url: str) -> str:
+def openai_title_from_image(url: str, max_chars: int = 70) -> str:
     """
-    Returns a concise ecommerce-style ENGLISH product description from an image URL.
-    Falls back to empty string on error. Requires OPENAI_API_KEY.
+    Returns a concise ecommerce-ready EN TITLE from an image URL.
+    Strict prompt: single line, no markdown, 50–90 chars recommended via UI cap.
     """
     if not openai_active or not is_valid_url(url):
         return ""
 
     prompt = (
-        "You are a product copy expert. Look at the product image and write a concise, "
-        "ecommerce-ready English product description (1-2 sentences). "
-        "Include brand, form, size/count if visible, and typical use. "
-        "Avoid marketing fluff; be accurate to the image."
+        "Act as an e-commerce title writer. Look at the product image and return a SINGLE short product TITLE only, "
+        "no descriptions, no bullet points, no markdown, no extra text. Include brand if visible, key form, and size/count "
+        "if obvious. Keep it concise and scannable for a product listing. Example format:\n"
+        "“Brand Product Name, 500 ml” or “Brand Cleaning Sponges, Pack of 10”.\n"
+        "Output must be ONE line."
     )
     try:
-        # Using Chat Completions API (v1 python SDK)
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -310,18 +317,24 @@ def openai_describe_image(url: str) -> str:
             ],
             temperature=0.2,
         )
-        return resp.choices[0].message.content.strip()
+        title = resp.choices[0].message.content or ""
+        return tidy_title(title, max_chars)
     except Exception:
         return ""
 
 
-# ---------- Description generation (image -> EN; EN -> AR) ----------
-def generate_descriptions_via_openai(df: pd.DataFrame, mask: pd.Series = None) -> pd.DataFrame:
+# ---------- Description generation (image -> EN title; optionally EN -> AR) ----------
+def generate_titles_via_openai(
+    df: pd.DataFrame,
+    mask: pd.Series = None,
+    max_chars: int = 70,
+    translate_ar: bool = True,
+) -> pd.DataFrame:
     """
     For rows in mask (or all rows), use image URL (thumbnail or image_url)
-    -> OpenAI EN description -> DeepL EN->AR -> overwrite:
-       df['name'] (EN), df['name_ar'] (AR)
-    If image or OpenAI fails, fall back to template built from existing name_en/name.
+    -> OpenAI EN TITLE -> optionally DeepL EN->AR -> overwrite:
+       df['name'] (EN title), df['name_ar'] (AR title or EN mirror)
+    If no image/OpenAI, fall back to compact template from existing English (“name_en”/“name”).
     """
     work_df = df if mask is None else df.loc[mask].copy()
 
@@ -332,45 +345,47 @@ def generate_descriptions_via_openai(df: pd.DataFrame, mask: pd.Series = None) -
             img_col = candidate
             break
 
-    # Build EN descriptions
-    desc_en_list = []
+    en_titles = []
     for idx, row in work_df.iterrows():
         url = str(row.get(img_col, "")) if img_col else ""
-        en = ""
+        title = ""
         if url:
-            en = openai_describe_image(url)
-        if not en:
-            # fallback to template from existing English name
+            title = openai_title_from_image(url, max_chars=max_chars)
+        if not title:
             seed = row.get("name_en") or row.get("name") or ""
-            en = make_desc_en(str(seed))
-        desc_en_list.append(en)
+            title = template_title_from_name(str(seed))
+        en_titles.append(title)
 
-    desc_en = pd.Series(desc_en_list, index=work_df.index)
+    en_series = pd.Series(en_titles, index=work_df.index)
 
-    # Build AR descriptions (DeepL preferred)
-    if deepl_active:
-        desc_ar = translate_deepl_en_to_ar(desc_en.tolist())
-        desc_ar = pd.Series(desc_ar, index=work_df.index)
+    # Arabic titles
+    if translate_ar and deepl_active:
+        ar_titles = translate_deepl_en_to_ar(en_series.tolist())
+        ar_series = pd.Series(ar_titles, index=work_df.index)
     else:
-        # fallback Arabic from cleaned Arabic title
-        ar_seed = work_df.get("name_ar_clean", work_df.get("name_ar", pd.Series([""]*len(work_df)))).fillna("").astype(str)
-        desc_ar = ar_seed.map(make_desc_ar_from_title)
+        # DeepL unavailable/quota: mirror English for now
+        ar_series = en_series.copy()
 
-    # Overwrite columns A/B
-    df.loc[work_df.index, "name"] = desc_en
-    df.loc[work_df.index, "name_ar"] = desc_ar
+    df.loc[work_df.index, "name"] = en_series
+    df.loc[work_df.index, "name_ar"] = ar_series
     return df
 
 
 # ---------- UI ----------
-st.title("🛒 Product List: Mapping + AI Descriptions (OpenAI→DeepL)")
+st.title("🛒 Product List: Mapping + Short AI Title (OpenAI→DeepL)")
+
+if deepl_active:
+    st.caption("DeepL is active. If your monthly quota is exceeded, Arabic will mirror English until it resets.")
+else:
+    if deepl_quota_note:
+        st.caption(f"DeepL inactive: {deepl_quota_note}")
 
 st.markdown("""
 **Flow**  
 1) Upload **Product List** & **Category Mapping**.  
 2) (Optional) Auto AR→EN for search preview (name_en).  
 3) Search, pick Main/Sub/Sub-Sub, **Apply** (Sub/Sub-Sub saved as numbers).  
-4) (NEW) **Generate Descriptions from Images** → overwrite Column A (EN) & Column B (AR).  
+4) (NEW) **Generate Short Titles from Images** → overwrite Column A (EN) & Column B (AR or mirror).  
 5) Download full or filtered Excel.
 """)
 
@@ -435,14 +450,10 @@ with st.expander("Translation preview (first 10)"):
     st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
 
 # ---------- Create/keep the working dataframe ----------
-# Only replace the working df on first load OR new upload; keep it otherwise (so edits persist).
 if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 
-# Build lookups for mapping
 lookups = build_mapping_struct_fixed(map_df)
-
-# ---------- Working dataframe (persisted) ----------
 work = st.session_state.work
 
 # Ensure columns exist and are string-typed
@@ -455,7 +466,6 @@ for col in REQUIRED_PRODUCT_COLS:
 # ---------- Search + Bulk Assign ----------
 st.subheader("Find products & bulk-assign category IDs")
 
-# Ensure search key exists BEFORE rendering widget
 if "search_q" not in st.session_state:
     st.session_state["search_q"] = ""
 
@@ -517,40 +527,40 @@ if st.button("Apply to all filtered rows"):
     if ssub_no:
         work.loc[mask, "sub_sub_category_id"] = str(ssub_no)
 
-    # Persist updates
     st.session_state.work = work
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# ---------- NEW: Generate Descriptions from Images (OVERWRITES A/B) ----------
-st.subheader("AI Descriptions from Images (OpenAI → DeepL)")
+# ---------- NEW: Short Titles from Images (OVERWRITES A/B) ----------
+st.subheader("Short Titles from Images (OpenAI → DeepL)")
+title_col = None
+for cand in ["thumbnail", "image_url"]:
+    if cand in work.columns:
+        title_col = cand
+        break
+
 if not openai_active:
-    st.warning("OpenAI key not detected — set OPENAI_API_KEY in Streamlit Secrets to enable image-based descriptions.")
+    st.warning("OpenAI key not detected — set OPENAI_API_KEY in Streamlit Secrets to enable image-based titles.")
+
+max_len = st.slider("Max title length (chars)", min_value=50, max_value=90, value=70, step=5)
+translate_ar = st.checkbox("Translate English title to Arabic with DeepL (if available)", value=True)
+
 scope = st.radio("Scope", ["Filtered rows", "All rows"], horizontal=True)
-if st.button("🖼️ Generate from Images → English, then DeepL → Arabic (overwrite A/B)"):
+if st.button("🖼️ Generate short titles from images (overwrite A/B)"):
     if scope == "Filtered rows":
-        work = generate_descriptions_via_openai(work, mask=mask)
+        work = generate_titles_via_openai(work, mask=mask, max_chars=max_len, translate_ar=translate_ar)
     else:
-        work = generate_descriptions_via_openai(work, mask=None)
+        work = generate_titles_via_openai(work, mask=None, max_chars=max_len, translate_ar=translate_ar)
     st.session_state.work = work
     filtered = work[mask].copy()
-    st.success("Descriptions generated from images. Column A (EN) & B (AR) overwritten.")
+    msg = "Titles generated. Column A (EN) & B (AR/mirror) overwritten."
+    if translate_ar and not deepl_active:
+        msg += " DeepL not available: Arabic mirrors English."
+    st.success(msg)
 
 # ---------- Image preview (from column W) ----------
 st.subheader("Image thumbnails (from column W)")
-img_col = None
-for candidate in ["thumbnail", "image_url"]:
-    if candidate in work.columns:
-        img_col = candidate
-        break
-
-def is_valid_url(u: str) -> bool:
-    try:
-        p = urlparse(u)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
-
+img_col = title_col  # same detection
 def fetch_image_thumb(url: str, timeout=5):
     try:
         if not is_valid_url(url):
@@ -626,5 +636,5 @@ st.download_button(
 st.caption(
     "Main category stays as a NAME (no numeric main ID provided). "
     "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
-    "Arabic is cleaned. If keys are set: OpenAI describes images → English, then DeepL translates → Arabic."
+    "Short titles: OpenAI image → English (capped length); if DeepL active, English → Arabic, else Arabic mirrors English."
 )
