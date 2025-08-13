@@ -5,3 +5,4 @@ xlsxwriter
 deepl
 requests
 Pillow
+openai
