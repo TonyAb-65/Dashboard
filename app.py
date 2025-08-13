@@ -1,7 +1,15 @@
 import io
 import re
+import math
+from urllib.parse import urlparse
+
 import pandas as pd
 import streamlit as st
+
+# NEW
+import requests
+from PIL import Image
+from io import BytesIO
 
 # ---------- Page setup ----------
 st.set_page_config(page_title="Product List Translator & Category Mapper", layout="wide")
@@ -11,6 +19,8 @@ REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
+    # Optional new column for images:
+    # "image_url"
 ]
 
 # ---------- DeepL (auto) ----------
@@ -126,6 +136,54 @@ def translate_deepl_ar_to_en(texts):
     return results
 
 
+def translate_deepl_en_to_ar(texts):
+    """Translate English -> Arabic with batch safety (used for desc_ar if DeepL is available)."""
+    if not translator:
+        return list(texts)
+
+    results = list(texts)
+    idx_texts = [(i, (t if isinstance(t, str) else "")) for i, t in enumerate(texts)]
+    idx_texts = [(i, t) for i, t in idx_texts if t.strip()]
+    if not idx_texts:
+        return results
+
+    MAX_ITEMS = 45
+    MAX_CHARS = 28000
+    start = 0
+    translated_count = 0
+    error_message = None
+
+    while start < len(idx_texts):
+        batch = []
+        chars = 0
+        k = start
+        while k < len(idx_texts) and len(batch) < MAX_ITEMS:
+            i, t = idx_texts[k]
+            if batch and (chars + len(t) > MAX_CHARS):
+                break
+            batch.append((i, t))
+            chars += len(t)
+            k += 1
+
+        try:
+            texts_only = [t for _, t in batch]
+            res = translator.translate_text(texts_only, source_lang="EN", target_lang="AR")
+            out_texts = [r.text for r in res] if isinstance(res, list) else [res.text]
+            for (i, _), out in zip(batch, out_texts):
+                results[i] = out
+                translated_count += 1
+            start = k
+        except Exception as e:
+            error_message = str(e)
+            break
+
+    if translated_count:
+        st.info(f"Arabic description translation: {translated_count} entries.")
+    if error_message:
+        st.warning(f"Arabic desc translation stopped due to API error: {error_message}")
+    return results
+
+
 def to_excel_download(df, sheet_name="Products"):
     """Return an Excel bytes buffer to download."""
     buffer = io.BytesIO()
@@ -181,214 +239,51 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
     }
 
 
-# ---------- UI ----------
-st.title("🛒 Product List Translator & Category Mapper")
-
-st.markdown("""
-Upload your **Product List** and **Category Mapping** files.  
-Arabic is auto-cleaned; if a DeepL key is configured in Secrets, the app also translates to English.  
-Then search, choose **Main (name) → Sub (name) → Sub-Sub (name)**, and **Apply**.  
-The app writes **numbers** for Sub & Sub-Sub (from your “NO” columns); Main stays as a **name**.
-""")
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    product_file = st.file_uploader("Product List (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="prod")
-with col2:
-    mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="map")
-with col3:
-    glossary_file = st.file_uploader("(Optional) Translation Glossary (.csv)", type=["csv"], key="gloss")  # reserved
-
-# Read files
-prod_df = read_any_table(product_file) if product_file else None
-map_df  = read_any_table(mapping_file) if mapping_file else None
-
-# --- Detect a NEW upload and clear previous working data ---
-new_upload = False
-if product_file is not None:
-    upload_sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
-    if st.session_state.get("upload_sig") != upload_sig:
-        st.session_state.upload_sig = upload_sig
-        st.session_state.pop("work", None)   # discard old edits ONLY on new upload
-        new_upload = True
-
-# Validate availability
-ok = True
-if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
-    ok = False
-MAPPING_REQUIRED = [
-    "category_id",
-    "sub_category_id", "sub_category_id NO",
-    "sub_sub_category_id", "sub_sub_category_id NO",
-]
-if map_df is None or not validate_columns(map_df, MAPPING_REQUIRED, "Category Mapping"):
-    ok = False
-if not ok:
-    st.info("Upload both files with the required headers to continue.")
-    st.stop()
-
-# ---------- Auto-clean + translate (always runs; translates only if key present) ----------
-for col in ["name_ar_clean", "name_en", "ProductNameEn"]:
-    if col not in prod_df.columns:
-        prod_df[col] = ""
-
-if "name_ar" in prod_df.columns:
-    prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str).map(clean_arabic_text)
-else:
-    st.error("Column 'name_ar' not found in your Product List file. Translation skipped.")
-
-if deepl_active and "name_ar_clean" in prod_df.columns:
-    st.info("🔤 DeepL key detected — translating Arabic → English…")
-    prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
-else:
-    if "name_ar_clean" in prod_df.columns:
-        prod_df["name_en"] = prod_df["name_ar_clean"]
-    st.warning("DeepL not active — showing cleaned Arabic in English column. "
-               "Confirm Secrets + requirements.txt, then reboot if needed.")
-
-# OPTIONAL: place English into `name` so the table/search show it easily
-if "name" in prod_df.columns:
-    prod_df["name"] = prod_df["name_en"]
-
-# Keep ProductNameEn in sync (if other parts use it)
-prod_df["ProductNameEn"] = prod_df["name_en"]
-
-with st.expander("Translation preview (first 10)"):
-    st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
-
-# ---------- Create/keep the working dataframe ----------
-# Only replace the working df on first load OR new upload; keep it otherwise (so edits persist).
-if ("work" not in st.session_state) or new_upload:
-    st.session_state.work = prod_df.copy()
-
-# Build lookups for mapping
-lookups = build_mapping_struct_fixed(map_df)
-
-# ---------- Working dataframe (persisted) ----------
-work = st.session_state.work
-
-# Ensure columns exist and are string-typed (avoid NaN when writing numeric IDs as text)
-for col in REQUIRED_PRODUCT_COLS:
-    if col not in work.columns:
-        work[col] = ""
-    else:
-        work[col] = work[col].fillna("").astype(str)
-
-# ---------- Search + Bulk Assign ----------
-st.subheader("Find products & bulk-assign category IDs")
-
-# Ensure search key exists BEFORE rendering widget
-if "search_q" not in st.session_state:
-    st.session_state["search_q"] = ""
-
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.text_input(
-        "Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):",
-        key="search_q",
-        placeholder="Type to filter…",
-    )
-with c2:
-    if st.button("Show all"):
-        st.session_state["search_q"] = ""
-        st.rerun()
-
-qval = st.session_state["search_q"].strip().lower()
-if qval:
-    mask = (
-        work["name"].astype(str).str.lower().str.contains(qval, na=False)
-        | work["name_ar"].astype(str).str.lower().str.contains(qval, na=False)
-        | work["ProductNameEn"].astype(str).str.lower().str.contains(qval, na=False)
-    )
-else:
-    mask = pd.Series(True, index=work.index)
-
-filtered = work[mask].copy()
-st.caption(f"Matched rows in view: {filtered.shape[0]}")
-
-# Cascading pickers (NAMES only)
-main_opts = [""] + lookups["main_names"]
-sel_main = st.selectbox("Main (category_id — NAME)", options=main_opts)
-
-sub_opts = [""] + (lookups["main_to_subnames"].get(sel_main, []) if sel_main else [])
-sel_sub = st.selectbox("Sub (sub_category_id — NAME, filtered by Main)", options=sub_opts)
-
-subsub_opts = [""] + (lookups["pair_to_subsubnames"].get((sel_main, sel_sub), []) if sel_main and sel_sub else [])
-sel_subsub = st.selectbox("Sub-Sub (sub_sub_category_id — NAME, filtered by Sub)", options=subsub_opts)
-
-# ---- Apply: write Main as NAME; Sub & Sub-Sub as NUMBERS from mapping ----
-def get_sub_no(main_name, sub_name) -> str:
-    if not main_name or not sub_name:
-        return ""
-    return lookups["sub_name_to_no_by_main"].get((main_name, sub_name), "")
-
-def get_ssub_no(main_name, sub_name, ssub_name) -> str:
-    if not main_name or not sub_name or not ssub_name:
-        return ""
-    return lookups["ssub_name_to_no_by_main_sub"].get((main_name, sub_name, ssub_name), "")
-
-if st.button("Apply to all filtered rows"):
-    # Main stays as a NAME
-    if sel_main:
-        work.loc[mask, "category_id"] = sel_main
-
-    # Resolve numbers via mapping
-    sub_no = get_sub_no(sel_main, sel_sub)
-    ssub_no = get_ssub_no(sel_main, sel_sub, sel_subsub)
-
-    if sub_no:
-        work.loc[mask, "sub_category_id"] = str(sub_no)
-    if ssub_no:
-        work.loc[mask, "sub_sub_category_id"] = str(ssub_no)
-
-    # Persist updates so they survive future reruns/searches
-    st.session_state.work = work
-    filtered = work[mask].copy()
-    st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
-
-# ---------- Tables (show ALL rows; tall viewport) ----------
-st.markdown("### Current selection (all rows in view)")
-st.dataframe(
-    filtered[[
-        "merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
-        "category_id", "sub_category_id", "sub_sub_category_id"
-    ]],
-    use_container_width=True,
-    height=900,
+# ---------- Description helpers ----------
+SIZE_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<u>ml|l|g|kg|oz|fl\s?oz|mL|ML|KG|G|L)\b",
+    flags=re.I
 )
+COUNT_RE = re.compile(r"\b(?P<count>\d+)\s*(?:pcs?|قطع(?:ة)?|pack|pkt)\b", flags=re.I)
+SCENT_RE = re.compile(r"\b(lemon|rose|lavender|musk|jasmine|apple|pine|fresh|ocean)\b", flags=re.I)
 
-# --- Quick previews for full DF and mapping (first rows only) ---
-with st.expander("🔎 Product List (first rows)"):
-    st.dataframe(work.head(30), use_container_width=True)
-with st.expander("🗂️ Category Mapping (first rows)"):
-    st.dataframe(map_df.head(30), use_container_width=True)
+def extract_attrs_en(name_en: str):
+    """Parse common attributes from English name."""
+    if not isinstance(name_en, str):
+        name_en = ""
+    brand = ""
+    # Heuristic brand: first token capitalized sequence before a common term
+    tokens = name_en.split()
+    if tokens:
+        brand = tokens[0]
+    size = None
+    m = SIZE_RE.search(name_en)
+    if m:
+        size = f'{m.group("num")} {m.group("u").upper()}'.replace("ML", "ml").replace("L", "L").replace("KG", "kg").replace("G", "g")
 
-# Optional reset (handy for testing)
-with st.expander("Reset working data"):
-    if st.button("🔄 Reset working data (start over)"):
-        st.session_state.pop("work", None)
-        st.rerun()
+    count = None
+    m2 = COUNT_RE.search(name_en)
+    if m2:
+        count = m2.group("count")
 
-# ---------- Download ----------
-st.subheader("Download")
-excel_full = to_excel_download(work, sheet_name="Products")
-st.download_button(
-    label="⬇️ Download FULL Excel (all rows)",
-    data=excel_full,
-    file_name="products_mapped.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    scent = None
+    m3 = SCENT_RE.search(name_en.lower())
+    if m3:
+        scent = m3.group(1).title()
 
-excel_filtered = to_excel_download(filtered, sheet_name="Filtered")
-st.download_button(
-    label="⬇️ Download FILTERED Excel (current view)",
-    data=excel_filtered,
-    file_name="products_filtered.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    return brand, size, count, scent
 
-st.caption(
-    "Main category stays as a NAME (no numeric main ID provided). "
-    "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
-    "Arabic is always cleaned; if a DeepL key is present, English is auto-translated."
-)
+
+def make_desc_en(row):
+    """Simple ecommerce style English description."""
+    title = str(row.get("name_en") or row.get("name") or "").strip()
+    brand, size, count, scent = extract_attrs_en(title)
+
+    parts = []
+    if brand:
+        parts.append(f"{brand} — premium quality.")
+    parts.append(f"{title}.")
+    if size:
+        parts.append(f"Size: {size}.")
+    if count:
+       
