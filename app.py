@@ -4,7 +4,7 @@ import time
 import math
 import base64
 from typing import List, Tuple, Dict, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import pandas as pd
 import streamlit as st
@@ -159,7 +159,29 @@ def _default_headers(url: str) -> Dict[str, str]:
         "Referer": origin,
     }
 
+def proxyize(url: str) -> str:
+    """
+    Build a proxy URL (images.weserv.nl) so we can fetch images when the origin
+    blocks hotlinking or requires a strict referer.
+    """
+    try:
+        s = url.strip()
+        if s.startswith("http://"):
+            host_path = s[len("http://"):]
+        elif s.startswith("https://"):
+            host_path = s[len("https://"):]
+        else:
+            host_path = s
+        # weserv expects host/path WITHOUT scheme; URL-encode it
+        return f"https://images.weserv.nl/?url={quote(host_path, safe='')}&w=1280"
+    except Exception:
+        return url
+
 def fetch_image_bytes(url: str, timeout=20) -> Tuple[bytes, str]:
+    """
+    Fetch raw image bytes with browser-like headers.
+    Returns (bytes, mime). Raises on failure.
+    """
     if not is_valid_url(url):
         raise ValueError("Invalid URL")
     r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True)  # no stream
@@ -183,7 +205,15 @@ def fetch_thumb(url: str, timeout=8):
         img.thumbnail((256, 256))
         return img
     except Exception:
-        return None
+        # try proxy just for thumbnail preview
+        try:
+            purl = proxyize(url)
+            content, _ = fetch_image_bytes(purl, timeout=timeout)
+            img = Image.open(BytesIO(content)).convert("RGB")
+            img.thumbnail((256, 256))
+            return img
+        except Exception:
+            return None
 
 def compress_to_jpeg_bytes(content: bytes, max_side: int = 1280, quality: int = 85) -> bytes:
     img = Image.open(BytesIO(content))
@@ -209,7 +239,6 @@ VISION_PROMPT = (
 )
 
 def _responses_image_title(image_url: str) -> str:
-    # Responses API (preferred)
     try:
         resp = openai_client.responses.create(
             model="gpt-4o-mini",
@@ -226,7 +255,6 @@ def _responses_image_title(image_url: str) -> str:
         return ""
 
 def _chat_image_title(image_url: str) -> str:
-    # Chat Completions fallback (multimodal)
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -244,7 +272,6 @@ def _chat_image_title(image_url: str) -> str:
         return ""
 
 def openai_title_from_data_url(data_url: str, max_chars: int, stats: Dict[str, int]) -> str:
-    # Try Responses; if empty, try Chat
     txt = _responses_image_title(data_url)
     if txt:
         stats["responses_ok"] += 1
@@ -256,7 +283,6 @@ def openai_title_from_data_url(data_url: str, max_chars: int, stats: Dict[str, i
     return ""
 
 def openai_title_from_url(url: str, max_chars: int, stats: Dict[str, int]) -> str:
-    # Let OpenAI fetch the URL directly
     txt = _responses_image_title(url)
     if txt:
         stats["responses_ok"] += 1
@@ -403,7 +429,7 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-# ---------- Batched titles (download → dataURL → URL fallback) ----------
+# ---------- Batched titles (download → proxy → dataURL → URL fallbacks) ----------
 def titles_from_images_batched(
     df: pd.DataFrame,
     row_index: List[int],
@@ -413,14 +439,17 @@ def titles_from_images_batched(
     if "thumbnail" not in df.columns:
         st.error("Column 'thumbnail' not found (expected in column W).")
         return pd.Series([""] * len(row_index), index=row_index, dtype="object"), {
-            "ai":0,"fallback":0,"total":0,"download_ok":0,"openai_calls":0,"openai_errors":0,
-            "openai_via_url":0,"responses_ok":0,"chat_fallback_ok":0
+            "ai":0,"fallback":0,"total":0,"download_ok":0,"proxy_fetch_ok":0,
+            "openai_calls":0,"openai_errors":0,"openai_via_url":0,"openai_via_proxy_url":0,
+            "responses_ok":0,"chat_fallback_ok":0
         }
 
     titles_en = pd.Series([""] * len(row_index), index=row_index, dtype="object")
     stats = {"ai": 0, "fallback": 0, "total": len(row_index),
-             "download_ok": 0, "openai_calls": 0, "openai_errors": 0,
-             "openai_via_url": 0, "responses_ok": 0, "chat_fallback_ok": 0}
+             "download_ok": 0, "proxy_fetch_ok": 0,
+             "openai_calls": 0, "openai_errors": 0,
+             "openai_via_url": 0, "openai_via_proxy_url": 0,
+             "responses_ok": 0, "chat_fallback_ok": 0}
     prog = st.progress(0)
     steps = max(1, math.ceil(len(row_index) / max(1, batch_size)))
 
@@ -431,6 +460,7 @@ def titles_from_images_batched(
             url = normalize_url(raw_url)
             title = ""
             data_url = ""
+            proxy_url = proxyize(url) if url else ""
 
             # 1) Server download → JPEG → data URL
             if url:
@@ -438,11 +468,19 @@ def titles_from_images_batched(
                     raw, _ = fetch_image_bytes(url, timeout=20)
                     if raw:
                         jpg = compress_to_jpeg_bytes(raw, max_side=1280, quality=85)
-                        if jpg:
-                            data_url = to_data_url_jpeg(jpg)
-                            stats["download_ok"] += 1
+                        data_url = to_data_url_jpeg(jpg)
+                        stats["download_ok"] += 1
                 except Exception:
-                    data_url = ""
+                    # 1b) Try proxy download
+                    try:
+                        if proxy_url:
+                            raw, _ = fetch_image_bytes(proxy_url, timeout=20)
+                            if raw:
+                                jpg = compress_to_jpeg_bytes(raw, max_side=1280, quality=85)
+                                data_url = to_data_url_jpeg(jpg)
+                                stats["proxy_fetch_ok"] += 1
+                    except Exception:
+                        data_url = ""
 
             # 2) Use data URL with OpenAI
             if data_url and openai_active:
@@ -454,7 +492,7 @@ def titles_from_images_batched(
                         break
                     time.sleep(0.6 * (attempt + 1))
 
-            # 3) If no title yet, try letting OpenAI fetch the URL
+            # 3) If no title yet, try letting OpenAI fetch the original URL
             if not title and url and openai_active and is_valid_url(url):
                 for attempt in range(2):
                     t = openai_title_from_url(url, max_chars, stats)
@@ -465,6 +503,17 @@ def titles_from_images_batched(
                         break
                     time.sleep(0.6 * (attempt + 1))
 
+            # 3b) If still nothing, try OpenAI with the PROXY URL
+            if not title and proxy_url and openai_active and is_valid_url(proxy_url):
+                for attempt in range(2):
+                    t = openai_title_from_url(proxy_url, max_chars, stats)
+                    stats["openai_calls"] += 1
+                    if t:
+                        title = t
+                        stats["openai_via_proxy_url"] += 1
+                        break
+                    time.sleep(0.6 * (attempt + 1))
+
             # 4) Final fallback
             if title:
                 stats["ai"] += 1
@@ -472,7 +521,7 @@ def titles_from_images_batched(
                 seed = df.loc[i, "name"]
                 title = template_title_from_name(str(seed))
                 stats["fallback"] += 1
-                stats["openai_errors"] += 1  # counted as “no vision title”
+                stats["openai_errors"] += 1
 
             titles_en.loc[i] = title
 
@@ -495,47 +544,7 @@ with pre2:
     if deepl_status_note:
         st.caption(deepl_status_note)
 with pre3:
-    st.caption("If server download is blocked, the app lets OpenAI fetch the URL directly.")
-
-# ---------- Self‑check tools ----------
-with st.expander("🧪 Self‑Check (debug before batch)"):
-    st.write("Use these quick checks to confirm vision calls work from this environment.")
-
-    # 1) Key sanity
-    st.write("- **OpenAI key present**:", "✅" if openai_active else "❌")
-    if openai_active:
-        # 2) Tiny inline image vision check
-        tiny = Image.new("RGB", (64, 64), color=(255, 0, 0))
-        buf = BytesIO(); tiny.save(buf, format="JPEG"); buf.seek(0)
-        tiny_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        tiny_data_url = f"data:image/jpeg;base64,{tiny_b64}"
-        if st.button("Run tiny inline image vision test"):
-            out = _responses_image_title(tiny_data_url) or _chat_image_title(tiny_data_url)
-            st.write("Model returned:", out if out else "(empty)")
-
-        # 3) Try a specific URL (will try data‑URL path then direct‑URL path)
-        test_url = st.text_input("Try with a real product image URL")
-        if st.button("Run vision on this URL") and test_url:
-            u = normalize_url(test_url)
-            diag = {"normalized": u, "download_ok": False, "responses_ok": False, "chat_ok": False, "direct_responses_ok": False, "direct_chat_ok": False}
-            try:
-                raw, _ = fetch_image_bytes(u, timeout=20)
-                jpg = compress_to_jpeg_bytes(raw, max_side=1280, quality=85)
-                data_url = to_data_url_jpeg(jpg)
-                diag["download_ok"] = True
-            except Exception:
-                data_url = ""
-            if data_url:
-                t1 = _responses_image_title(data_url); diag["responses_ok"] = bool(t1)
-                if not t1:
-                    t1 = _chat_image_title(data_url); diag["chat_ok"] = bool(t1)
-                st.write("DataURL path title:", t1 or "(empty)")
-            # direct url
-            t2 = _responses_image_title(u); diag["direct_responses_ok"] = bool(t2)
-            if not t2:
-                t2 = _chat_image_title(u); diag["direct_chat_ok"] = bool(t2)
-            st.write("Direct URL path title:", t2 or "(empty)")
-            st.write("Diag:", diag)
+    st.caption("If origin blocks server fetch, we auto‑proxy the image.")
 
 st.markdown("""
 **Flow**  
@@ -580,20 +589,18 @@ if not ok:
     st.info("Upload both files with the required headers to continue.")
     st.stop()
 
-# Working DF persistence
+# Working DF
 if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
 work.columns = [str(c).strip() for c in work.columns]
 
-# Ensure required cols exist & string-typed
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
     else:
         work[col] = work[col].fillna("").astype(str)
 
-# Build mapping lookups
 lookups = build_mapping_struct_fixed(map_df)
 
 # ---------- Search + Bulk Apply ----------
@@ -714,9 +721,9 @@ if st.button("🖼️ Generate short titles (batched)"):
 
         st.success(
             f"Done. AI titles: {stats['ai']} | fallbacks: {stats['fallback']} "
-            f"| downloads OK: {stats['download_ok']} | OpenAI calls: {stats['openai_calls']} "
-            f"| via URL: {stats['openai_via_url']} | responses_ok: {stats['responses_ok']} | chat_ok: {stats['chat_fallback_ok']} "
-            f"| errors: {stats['openai_errors']}"
+            f"| downloads OK: {stats['download_ok']} | proxy fetch OK: {stats['proxy_fetch_ok']} "
+            f"| OpenAI calls: {stats['openai_calls']} | via URL: {stats['openai_via_url']} | via PROXY URL: {stats['openai_via_proxy_url']} "
+            f"| responses_ok: {stats['responses_ok']} | chat_ok: {stats['chat_fallback_ok']} | errors: {stats['openai_errors']}"
         )
         st.dataframe(work.loc[idx_list, ["merchant_sku", "thumbnail", "name"]].head(12), use_container_width=True)
 
@@ -732,10 +739,9 @@ if "thumbnail" in work.columns:
             if img:
                 st.image(img, caption=f"Row {filtered.index[i]}", use_container_width=True)
             else:
-                if is_valid_url(url):
-                    st.image(url, caption=f"(direct) Row {filtered.index[i]}", use_container_width=True)
-                else:
-                    st.write("No image")
+                # show proxy preview if direct fails
+                purl = proxyize(url)
+                st.image(purl, caption=f"(proxy) Row {filtered.index[i]}", use_container_width=True)
 else:
     st.info("No `thumbnail` column detected.")
 
@@ -773,4 +779,4 @@ st.download_button(
     file_name="products_filtered.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-st.caption("Batched titles: server download → data URL → OpenAI, with a direct‑URL fallback. Images come from column W: `thumbnail`.")
+st.caption("Batched titles: server download → (proxy if needed) → data URL → OpenAI, with direct‑URL + proxy‑URL fallbacks. Images come from column W: `thumbnail`.")
