@@ -12,21 +12,27 @@ import requests
 from PIL import Image
 from io import BytesIO
 
-# ---------- Page ----------
+# =========================
+# Page
+# =========================
 st.set_page_config(
-    page_title="Product Mapping + Batched AI Titles (OpenAI → DeepL/OpenAI)",
+    page_title="Product Mapping + (Manual) AI Titles",
     layout="wide",
 )
 
-# ---------- Expected Product List columns ----------
+# =========================
+# Expected Product List columns
+# =========================
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
-    # image URL column W — we will ALWAYS read 'thumbnail'
+    # image URL column W — we ALWAYS read 'thumbnail' when you ask us to
 ]
 
-# ---------- API clients ----------
+# =========================
+# API clients
+# =========================
 # DeepL
 translator = None
 deepl_active = False
@@ -59,15 +65,16 @@ except Exception as e:
     openai_active = False
     openai_status_note = f"(OpenAI unavailable: {e})"
 
-# ---------- File IO ----------
-def read_any_table(uploaded_file):
-    if uploaded_file is None:
-        return None
-    fn = uploaded_file.name.lower()
-    if fn.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file, engine="openpyxl")
-    if fn.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
+# =========================
+# File IO helpers
+# =========================
+def _read_any_table_bytes(name: str, data: bytes):
+    name = name.lower()
+    bio = io.BytesIO(data)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(bio, engine="openpyxl")
+    if name.endswith(".csv"):
+        return pd.read_csv(bio)
     raise ValueError("Please upload .xlsx, .xls, or .csv")
 
 def validate_columns(df, required_cols, label):
@@ -77,7 +84,9 @@ def validate_columns(df, required_cols, label):
         return False
     return True
 
-# ---------- Text helpers ----------
+# =========================
+# Text helpers
+# =========================
 def strip_markdown(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -102,6 +111,7 @@ def template_title_from_name(name_en: str) -> str:
         name_en = ""
     name_en = strip_markdown(name_en)
     brand = name_en.split()[0] if name_en.strip() else ""
+
     size = None
     m = SIZE_RE.search(name_en)
     if m:
@@ -110,6 +120,7 @@ def template_title_from_name(name_en: str) -> str:
     m2 = COUNT_RE.search(name_en)
     if m2:
         cnt = m2.group("count")
+
     parts = []
     if brand:
         parts.append(brand)
@@ -122,7 +133,9 @@ def template_title_from_name(name_en: str) -> str:
         parts.append(f"{cnt} pcs")
     return tidy_title(" ".join(parts), 70)
 
-# ---------- Image/URL helpers ----------
+# =========================
+# Image / URL helpers
+# =========================
 def is_valid_url(u: str) -> bool:
     try:
         p = urlparse(u)
@@ -160,10 +173,6 @@ def _default_headers(url: str) -> Dict[str, str]:
     }
 
 def proxyize(url: str) -> str:
-    """
-    Build a proxy URL (images.weserv.nl) so we can fetch images when the origin
-    blocks hotlinking or requires a strict referer.
-    """
     try:
         s = url.strip()
         if s.startswith("http://"):
@@ -172,19 +181,14 @@ def proxyize(url: str) -> str:
             host_path = s[len("https://"):]
         else:
             host_path = s
-        # weserv expects host/path WITHOUT scheme; URL-encode it
         return f"https://images.weserv.nl/?url={quote(host_path, safe='')}&w=1280"
     except Exception:
         return url
 
 def fetch_image_bytes(url: str, timeout=20) -> Tuple[bytes, str]:
-    """
-    Fetch raw image bytes with browser-like headers.
-    Returns (bytes, mime). Raises on failure.
-    """
     if not is_valid_url(url):
         raise ValueError("Invalid URL")
-    r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True)  # no stream
+    r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True)
     r.raise_for_status()
     content = r.content
     if not content:
@@ -199,13 +203,13 @@ def fetch_image_bytes(url: str, timeout=20) -> Tuple[bytes, str]:
     return content, mime
 
 def fetch_thumb(url: str, timeout=8):
+    # Only used when user clicks "Show thumbnails"
     try:
         content, _ = fetch_image_bytes(url, timeout=timeout)
         img = Image.open(BytesIO(content)).convert("RGB")
         img.thumbnail((256, 256))
         return img
     except Exception:
-        # try proxy just for thumbnail preview
         try:
             purl = proxyize(url)
             content, _ = fetch_image_bytes(purl, timeout=timeout)
@@ -231,7 +235,9 @@ def to_data_url_jpeg(content: bytes) -> str:
     b64 = base64.b64encode(content).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
 
-# ---------- OpenAI vision (Responses → Chat fallback) ----------
+# =========================
+# OpenAI vision (Responses → Chat fallback)
+# =========================
 VISION_PROMPT = (
     "You are an e-commerce title generator. Return ONE short product TITLE only, "
     "6–8 words, max ~70 chars. Include brand if visible and size/count if obvious. "
@@ -293,7 +299,9 @@ def openai_title_from_url(url: str, max_chars: int, stats: Dict[str, int]) -> st
         return tidy_title(txt, max_chars)
     return ""
 
-# ---------- Translation ----------
+# =========================
+# Translation
+# =========================
 def _deepl_batch(texts: List[str]) -> List[str]:
     if not translator:
         return list(texts)
@@ -388,7 +396,9 @@ def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> p
         return pd.Series(out, index=titles_en.index)
     return titles_en.copy()
 
-# ---------- Mapping structures ----------
+# =========================
+# Mapping structures
+# =========================
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id", "sub_category_id", "sub_category_id NO",
               "sub_sub_category_id", "sub_sub_category_id NO"]:
@@ -421,7 +431,9 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         "ssub_name_to_no_by_main_sub": ssub_name_to_no_by_main_sub,
     }
 
-# ---------- Excel download ----------
+# =========================
+# Excel download
+# =========================
 def to_excel_download(df, sheet_name="Products"):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -429,7 +441,9 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-# ---------- Batched titles (download → proxy → dataURL → URL fallbacks) ----------
+# =========================
+# Title generation (manual only)
+# =========================
 def titles_from_images_batched(
     df: pd.DataFrame,
     row_index: List[int],
@@ -462,7 +476,7 @@ def titles_from_images_batched(
             data_url = ""
             proxy_url = proxyize(url) if url else ""
 
-            # 1) Server download → JPEG → data URL
+            # Server download → JPEG → data URL
             if url:
                 try:
                     raw, _ = fetch_image_bytes(url, timeout=20)
@@ -471,7 +485,6 @@ def titles_from_images_batched(
                         data_url = to_data_url_jpeg(jpg)
                         stats["download_ok"] += 1
                 except Exception:
-                    # 1b) Try proxy download
                     try:
                         if proxy_url:
                             raw, _ = fetch_image_bytes(proxy_url, timeout=20)
@@ -482,7 +495,7 @@ def titles_from_images_batched(
                     except Exception:
                         data_url = ""
 
-            # 2) Use data URL with OpenAI
+            # Use data URL with OpenAI
             if data_url and openai_active:
                 for attempt in range(2):
                     t = openai_title_from_data_url(data_url, max_chars, stats)
@@ -492,7 +505,7 @@ def titles_from_images_batched(
                         break
                     time.sleep(0.6 * (attempt + 1))
 
-            # 3) If no title yet, try letting OpenAI fetch the original URL
+            # Let OpenAI fetch the original URL
             if not title and url and openai_active and is_valid_url(url):
                 for attempt in range(2):
                     t = openai_title_from_url(url, max_chars, stats)
@@ -503,7 +516,7 @@ def titles_from_images_batched(
                         break
                     time.sleep(0.6 * (attempt + 1))
 
-            # 3b) If still nothing, try OpenAI with the PROXY URL
+            # Let OpenAI fetch the PROXY URL
             if not title and proxy_url and openai_active and is_valid_url(proxy_url):
                 for attempt in range(2):
                     t = openai_title_from_url(proxy_url, max_chars, stats)
@@ -514,7 +527,7 @@ def titles_from_images_batched(
                         break
                     time.sleep(0.6 * (attempt + 1))
 
-            # 4) Final fallback
+            # Final fallback
             if title:
                 stats["ai"] += 1
             else:
@@ -530,10 +543,38 @@ def titles_from_images_batched(
 
     return titles_en, stats
 
-# ---------- UI ----------
-st.title("🛒 Product Mapping + Batched AI Titles (OpenAI → DeepL/OpenAI)")
+# =========================
+# Session-state persistence for uploads & working data
+# =========================
+def cache_upload(file, key_bytes: str, key_name: str, key_df: str):
+    """
+    Read and cache uploaded file bytes + name + parsed df into session_state,
+    so reruns do not lose them.
+    """
+    if file is not None:
+        data = file.read()
+        st.session_state[key_bytes] = data
+        st.session_state[key_name] = file.name
+        st.session_state[key_df] = _read_any_table_bytes(file.name, data)
 
-# Preflight/status
+def get_cached_df(key_bytes: str, key_name: str, key_df: str):
+    """
+    Return cached DataFrame if present, else None.
+    """
+    if key_df in st.session_state and st.session_state[key_df] is not None:
+        return st.session_state[key_df]
+    return None
+
+def clear_cached_upload(key_bytes: str, key_name: str, key_df: str):
+    for k in [key_bytes, key_name, key_df]:
+        if k in st.session_state:
+            st.session_state.pop(k, None)
+
+# =========================
+# UI – Header / Status
+# =========================
+st.title("🛒 Product Mapping + Manual AI Title Generation")
+
 pre1, pre2, pre3 = st.columns(3)
 with pre1:
     st.metric("OpenAI Vision", "Active" if openai_active else "Inactive")
@@ -544,36 +585,40 @@ with pre2:
     if deepl_status_note:
         st.caption(deepl_status_note)
 with pre3:
-    st.caption("If origin blocks server fetch, we auto‑proxy the image.")
+    st.caption("Nothing auto-runs. You choose when to fetch images or generate titles.")
 
 st.markdown("""
 **Flow**  
-1) Upload **Product List** and **Category Mapping**.  
-2) Search, pick Main/Sub/Sub-Sub → **Apply** (Sub/Sub-Sub saved as numbers).  
-3) **Batched image → EN short titles** from column **W: `thumbnail`**; then EN→AR via **DeepL / OpenAI / None**.  
-4) Download full or filtered Excel.
+1) Upload **Product List** and **Category Mapping** (they stay cached).  
+2) (Optional) **Show thumbnails (preview)** — only if you click it.  
+3) (Optional) **Generate AI titles** — only if you enable and click it.  
+4) Assign **Sub / Sub‑Sub** categories and **Download**.
 """)
 
-# Uploads
+# =========================
+# Uploads (cached)
+# =========================
 c1, c2, c3 = st.columns(3)
 with c1:
-    product_file = st.file_uploader("Product List (.xlsx/.csv) — must include 'thumbnail' in column W", type=["xlsx", "xls", "csv"], key="prod")
+    product_file = st.file_uploader("Product List (.xlsx/.csv) — contains 'thumbnail' in column W", type=["xlsx", "xls", "csv"], key="prod")
+    if product_file:
+        cache_upload(product_file, "prod_bytes", "prod_name", "prod_df")
+
 with c2:
     mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="map")
+    if mapping_file:
+        cache_upload(mapping_file, "map_bytes", "map_name", "map_df")
+
 with c3:
-    glossary_file = st.file_uploader("(Optional) Glossary (.csv, reserved)", type=["csv"], key="gloss")
+    st.caption("Use the buttons below to replace or clear uploads if needed.")
+    if st.button("🔁 Clear Product upload"):
+        clear_cached_upload("prod_bytes", "prod_name", "prod_df")
+    if st.button("🔁 Clear Mapping upload"):
+        clear_cached_upload("map_bytes", "map_name", "map_df")
 
-prod_df = read_any_table(product_file) if product_file else None
-map_df  = read_any_table(mapping_file) if mapping_file else None
-
-# Reset working data if new upload
-new_upload = False
-if product_file is not None:
-    sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
-    if st.session_state.get("upload_sig") != sig:
-        st.session_state.upload_sig = sig
-        st.session_state.pop("work", None)
-        new_upload = True
+# Get cached DFs
+prod_df = get_cached_df("prod_bytes", "prod_name", "prod_df")
+map_df  = get_cached_df("map_bytes", "map_name", "map_df")
 
 # Validate availability
 ok = True
@@ -586,25 +631,30 @@ if map_df is None or not validate_columns(map_df, [
 ], "Category Mapping"):
     ok = False
 if not ok:
-    st.info("Upload both files with the required headers to continue.")
+    st.info("Upload and cache both files with the required headers to continue.")
     st.stop()
 
-# Working DF
-if ("work" not in st.session_state) or new_upload:
+# Working DF persistence (never reset unless user clears uploads)
+if "work" not in st.session_state:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
 work.columns = [str(c).strip() for c in work.columns]
 
+# Ensure required cols exist & string-typed
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
     else:
         work[col] = work[col].fillna("").astype(str)
 
+# Build mapping lookups
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---------- Search + Bulk Apply ----------
+# =========================
+# Search + Bulk Apply
+# =========================
 st.subheader("Find products & bulk-assign category IDs")
+
 if "search_q" not in st.session_state:
     st.session_state["search_q"] = ""
 
@@ -661,27 +711,46 @@ if st.button("Apply to all filtered rows"):
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# ---------- Batched image → EN title; EN → AR ----------
-st.subheader("Batched image → EN short title (from column 'thumbnail'); EN → AR via DeepL / OpenAI / None")
+# =========================
+# Manual thumbnails (only if you click)
+# =========================
+with st.expander("🖼️ Show thumbnails (preview) — manual"):
+    if "thumbnail" not in work.columns:
+        st.info("No `thumbnail` column found.")
+    else:
+        non_empty = (work["thumbnail"].astype(str).str.strip() != "").sum()
+        st.caption(f"Non-empty thumbnail URLs: {int(non_empty)}")
+        if st.button("Render thumbnails (first 24)"):
+            urls = [str(u).strip().strip('"\'') for u in filtered["thumbnail"].fillna("").astype(str).tolist()]
+            show_n = min(24, len(urls))
+            cols = st.columns(6)
+            for i, url in enumerate(urls[:show_n]):
+                with cols[i % 6]:
+                    img = fetch_thumb(url)
+                    if img:
+                        st.image(img, caption=f"Row {filtered.index[i]}", use_container_width=True)
+                    else:
+                        purl = proxyize(url)
+                        st.image(purl, caption=f"(proxy) Row {filtered.index[i]}", use_container_width=True)
+
+# =========================
+# Manual AI title generation (only if you enable + click)
+# =========================
+st.subheader("Manual: Image → EN short title; EN → AR via DeepL / OpenAI / None")
+
+enable_ai = st.checkbox("Enable AI title generation (manual)", value=False)
+
 colA, colB, colC, colD = st.columns(4)
 with colA:
-    max_len = st.slider("Max title length", 50, 90, 70, 5)
+    max_len = st.slider("Max title length", 50, 90, 70, 5, disabled=not enable_ai)
 with colB:
-    batch_size = st.slider("Batch size", 20, 100, 50, 5)
+    batch_size = st.slider("Batch size", 20, 100, 50, 5, disabled=not enable_ai)
 with colC:
-    engine = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"])
+    engine = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"], disabled=not enable_ai)
 with colD:
-    scope = st.selectbox("Scope", ["Filtered rows", "All rows"])
+    scope = st.selectbox("Scope", ["Filtered rows", "All rows"], disabled=not enable_ai)
 
-st.caption("🖼️ Using image URLs from **column W: `thumbnail`**.")
-if "thumbnail" not in work.columns:
-    st.warning("No 'thumbnail' column found.")
-else:
-    non_empty = (work["thumbnail"].astype(str).str.strip() != "").sum()
-    st.caption(f"Non-empty thumbnail URLs: {int(non_empty)}")
-
-# Mini test (first 5 rows)
-if st.button("🧪 Test first 5 rows"):
+if enable_ai and st.button("🧪 Test first 5 rows (manual)"):
     idx_list = (filtered.index.tolist() if scope == "Filtered rows" else work.index.tolist())[:5]
     if not idx_list:
         st.warning("No rows to process.")
@@ -694,8 +763,7 @@ if st.button("🧪 Test first 5 rows"):
             "generated_en": titles_en.loc[idx_list],
         }), use_container_width=True)
 
-# Main run
-if st.button("🖼️ Generate short titles (batched)"):
+if enable_ai and st.button("🖼️ Generate short titles (manual)"):
     idx_list = filtered.index.tolist() if scope == "Filtered rows" else work.index.tolist()
     if not idx_list:
         st.warning("No rows to process.")
@@ -727,25 +795,9 @@ if st.button("🖼️ Generate short titles (batched)"):
         )
         st.dataframe(work.loc[idx_list, ["merchant_sku", "thumbnail", "name"]].head(12), use_container_width=True)
 
-# ---------- Image thumbnails ----------
-st.subheader("Image thumbnails (from column 'thumbnail')")
-if "thumbnail" in work.columns:
-    urls = [str(u).strip().strip('"\'') for u in filtered["thumbnail"].fillna("").astype(str).tolist()]
-    show_n = min(24, len(urls))
-    cols = st.columns(6)
-    for i, url in enumerate(urls[:show_n]):
-        with cols[i % 6]:
-            img = fetch_thumb(url)
-            if img:
-                st.image(img, caption=f"Row {filtered.index[i]}", use_container_width=True)
-            else:
-                # show proxy preview if direct fails
-                purl = proxyize(url)
-                st.image(purl, caption=f"(proxy) Row {filtered.index[i]}", use_container_width=True)
-else:
-    st.info("No `thumbnail` column detected.")
-
-# ---------- Tables ----------
+# =========================
+# Tables
+# =========================
 st.markdown("### Current selection (all rows in view)")
 st.dataframe(
     filtered[["merchant_sku", "name", "name_ar", "category_id", "sub_category_id", "sub_sub_category_id"]],
@@ -758,12 +810,14 @@ with st.expander("🔎 Product List (first rows)"):
 with st.expander("🗂️ Category Mapping (first rows)"):
     st.dataframe(map_df.head(30), use_container_width=True)
 
-with st.expander("Reset working data"):
-    if st.button("🔄 Reset working data (start over)"):
-        st.session_state.pop("work", None)
-        st.rerun()
+with st.expander("Reset working data (keeps uploads cached)"):
+    if st.button("🔄 Reset working data to original upload"):
+        st.session_state.work = st.session_state["prod_df"].copy() if "prod_df" in st.session_state else prod_df.copy()
+        st.success("Working data reset.")
 
-# ---------- Downloads ----------
+# =========================
+# Downloads
+# =========================
 st.subheader("Download")
 full_xlsx = to_excel_download(work, "Products")
 st.download_button(
@@ -779,4 +833,3 @@ st.download_button(
     file_name="products_filtered.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-st.caption("Batched titles: server download → (proxy if needed) → data URL → OpenAI, with direct‑URL + proxy‑URL fallbacks. Images come from column W: `thumbnail`.")
