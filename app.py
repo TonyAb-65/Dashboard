@@ -149,11 +149,13 @@ def fetch_thumb(url: str, timeout=7):
         }
         r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
         r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "").lower()
-        if "image" not in ctype and not url.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
-            return None
         content = r.content
-        img = Image.open(BytesIO(content)).convert("RGB")
+
+        # Try to open regardless of Content-Type; some CDNs mislabel as text/html
+        try:
+            img = Image.open(BytesIO(content)).convert("RGB")
+        except Exception:
+            return None
         img.thumbnail((256, 256))
         return img
     except Exception:
@@ -363,7 +365,7 @@ def titles_from_images_batched(
     for step, start in enumerate(range(0, len(row_index), batch_size), start=1):
         chunk_idx = row_index[start : start + batch_size]
         for i in chunk_idx:
-            url = str(df.loc[i, "thumbnail"])
+            url = str(df.loc[i, "thumbnail"]).strip().strip('"\'')  # clean URL
             title = ""
             if url:
                 for attempt in range(3):
@@ -437,6 +439,11 @@ if not ok:
 if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
+
+# ✅ Normalize headers to remove hidden spaces/case issues
+work.columns = [str(c).strip() for c in work.columns]
+# If you prefer case-insensitive across files, uncomment:
+# work.columns = [str(c).strip().lower() for c in work.columns]
 
 # Ensure required cols exist & string-typed
 for col in REQUIRED_PRODUCT_COLS:
@@ -524,6 +531,10 @@ with colD:
 st.caption("🖼️ Using image URLs from **column W: `thumbnail`** (exact header required).")
 if "thumbnail" not in work.columns:
     st.warning("No 'thumbnail' column found. Add it to column W and re-upload to enable image-based titles.")
+else:
+    # Quick sanity check on URLs
+    non_empty_count = (work["thumbnail"].astype(str).str.strip() != "").sum()
+    st.caption(f"Non-empty thumbnail URLs found: {int(non_empty_count)}")
 
 if st.button("🖼️ Generate short titles (batched)"):
     # target indices
@@ -575,7 +586,7 @@ if st.button("🔁 Re-translate Arabic from current English"):
 # ---------- Image thumbnails (from column W: thumbnail) ----------
 st.subheader("Image thumbnails (from column 'thumbnail')")
 if "thumbnail" in work.columns:
-    urls = filtered["thumbnail"].fillna("").astype(str).tolist()
+    urls = [str(u).strip().strip('"\'') for u in filtered["thumbnail"].fillna("").astype(str).tolist()]
     show_n = min(24, len(urls))
     cols = st.columns(6)
     for i, url in enumerate(urls[:show_n]):
