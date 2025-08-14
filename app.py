@@ -2,13 +2,13 @@ import io
 import re
 import time
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from io import BytesIO
 
 # ---------- Page ----------
@@ -137,29 +137,75 @@ def is_valid_url(u: str) -> bool:
         return False
 
 
-def fetch_thumb(url: str, timeout=7):
-    """Fetch a small thumbnail for preview; return PIL.Image or None."""
+def _default_headers(url: str) -> Dict[str, str]:
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    return {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/125 Safari/537.36"),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": origin,
+    }
+
+
+def fetch_thumb(url: str, timeout=8):
+    """
+    Fetch a small thumbnail for preview; return PIL.Image or None.
+    Less strict about content-type; adds common headers & referer.
+    """
     try:
         if not is_valid_url(url):
             return None
-        headers = {
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/125 Safari/537.36")
-        }
-        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
+        r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True, stream=True)
         r.raise_for_status()
         content = r.content
-
-        # Try to open regardless of Content-Type; some CDNs mislabel as text/html
         try:
-            img = Image.open(BytesIO(content)).convert("RGB")
+            img = Image.open(BytesIO(content))
+            # Convert if possible; if Pillow lacks a plugin (rare), this will raise.
+            img = img.convert("RGB")
+            img.thumbnail((256, 256))
+            return img
+        except UnidentifiedImageError:
+            # Not an image or unsupported format
+            return None
         except Exception:
             return None
-        img.thumbnail((256, 256))
-        return img
     except Exception:
         return None
+
+
+def diagnose_image_url(url: str, timeout=8) -> Dict[str, Any]:
+    """Return a structured diagnostic dict for a single URL."""
+    diag: Dict[str, Any] = {
+        "url": url,
+        "is_valid_url": is_valid_url(url),
+        "status_code": None,
+        "content_type": None,
+        "bytes": None,
+        "pil_ok": None,
+        "error": None,
+    }
+    if not diag["is_valid_url"]:
+        diag["error"] = "Invalid URL schema or host"
+        return diag
+    try:
+        r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True, stream=True)
+        diag["status_code"] = r.status_code
+        ct = r.headers.get("Content-Type", "")
+        diag["content_type"] = ct
+        content = r.content
+        diag["bytes"] = len(content)
+        try:
+            Image.open(BytesIO(content))
+            diag["pil_ok"] = True
+        except Exception as e:
+            diag["pil_ok"] = False
+            diag["error"] = f"PIL decode failed: {type(e).__name__}"
+    except Exception as e:
+        diag["error"] = f"Request error: {type(e).__name__}"
+    return diag
 
 
 # ---------- OpenAI: image → EN short title ----------
@@ -440,9 +486,9 @@ if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
 
-# ✅ Normalize headers to remove hidden spaces/case issues
+# ✅ Normalize headers to remove hidden spaces/case issues (keeps original case)
 work.columns = [str(c).strip() for c in work.columns]
-# If you prefer case-insensitive across files, uncomment:
+# If you want case-insensitive everywhere, uncomment:
 # work.columns = [str(c).strip().lower() for c in work.columns]
 
 # Ensure required cols exist & string-typed
@@ -564,25 +610,6 @@ if st.button("🖼️ Generate short titles (batched)"):
         filtered = work[mask].copy()
         st.success("Titles updated (Column A EN, Column B AR).")
 
-# Re-translate Arabic later without regenerating English
-st.caption("Need to re-translate Arabic later (e.g., after DeepL quota resets)?")
-colR1, colR2, colR3 = st.columns([2,2,6])
-with colR1:
-    re_engine = st.selectbox("Re-translate engine", ["DeepL", "OpenAI", "None"], key="reeng")
-with colR2:
-    re_scope = st.selectbox("Rows", ["Filtered rows", "All rows"], key="rescope")
-if st.button("🔁 Re-translate Arabic from current English"):
-    idx = (filtered.index.tolist() if st.session_state["rescope"] == "Filtered rows" else work.index.tolist())
-    if not idx:
-        st.warning("No rows to process.")
-    else:
-        en_titles_now = work.loc[idx, "name"].fillna("").astype(str)
-        ar_titles_new = translate_en_titles(en_titles_now, st.session_state["reeng"], batch_size)
-        work.loc[idx, "name_ar"] = ar_titles_new
-        st.session_state.work = work
-        filtered = work[mask].copy()
-        st.success("Arabic re-translation complete.")
-
 # ---------- Image thumbnails (from column W: thumbnail) ----------
 st.subheader("Image thumbnails (from column 'thumbnail')")
 if "thumbnail" in work.columns:
@@ -595,9 +622,30 @@ if "thumbnail" in work.columns:
             if img:
                 st.image(img, caption=f"Row {filtered.index[i]}", use_container_width=True)
             else:
-                st.write("No image")
+                # Fallback: try direct URL rendering client-side
+                if is_valid_url(url):
+                    st.image(url, caption=f"(direct) Row {filtered.index[i]}", use_container_width=True)
+                else:
+                    st.write("No image")
 else:
     st.info("No `thumbnail` column detected, so no thumbnails to show.")
+
+# ---------- Diagnostics ----------
+with st.expander("🧪 Image fetch diagnostics"):
+    sample_urls = []
+    if "thumbnail" in work.columns:
+        sample_urls = [u for u in work["thumbnail"].astype(str).map(lambda x: x.strip().strip('"\'')) if u][:5]
+    st.write("First URLs (up to 5):")
+    for u in sample_urls:
+        st.code(u)
+    if st.button("Run diagnostics on first URLs"):
+        for u in sample_urls:
+            d = diagnose_image_url(u)
+            st.json(d)
+    test_url = st.text_input("Test a specific image URL")
+    if st.button("Diagnose this URL") and test_url:
+        d = diagnose_image_url(test_url.strip().strip('"\''))  # clean
+        st.json(d)
 
 # ---------- Tables ----------
 st.markdown("### Current selection (all rows in view)")
