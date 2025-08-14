@@ -2,32 +2,31 @@ import io
 import re
 import time
 import math
-import random
 from typing import List, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
-
-# HTTP + images
 import requests
 from PIL import Image
 from io import BytesIO
 
-# ---------------- Page ----------------
+# ---------- Page ----------
 st.set_page_config(
     page_title="Product Mapping + Batched AI Titles (OpenAI → DeepL/OpenAI)",
     layout="wide",
 )
 
-# ---------------- Expected Product Columns (your original layout) ----------------
+# ---------- Expected Product List columns (original layout) ----------
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
+    # image URL column W — we will ALWAYS read 'thumbnail'
 ]
 
-# ---------------- DeepL ----------------
+# ---------- API clients ----------
+# DeepL
 translator = None
 deepl_active = False
 deepl_status_note = ""
@@ -42,7 +41,7 @@ except Exception as e:
     deepl_active = False
     deepl_status_note = f"(DeepL unavailable: {e})"
 
-# ---------------- OpenAI ----------------
+# OpenAI
 openai_client = None
 openai_active = False
 try:
@@ -51,12 +50,12 @@ try:
     if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         openai_active = True
-except Exception as e:
+except Exception:
     openai_client = None
     openai_active = False
 
 
-# ---------------- File IO helpers ----------------
+# ---------- File IO ----------
 def read_any_table(uploaded_file):
     """Load xlsx/xls/csv with explicit engine in cloud."""
     if uploaded_file is None:
@@ -77,76 +76,7 @@ def validate_columns(df, required_cols, label):
     return True
 
 
-# ---------------- Arabic clean (for AR→EN preview) ----------------
-def clean_arabic_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.strip()
-    if not s:
-        return ""
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\b(\d+)\s*(مل|ml)\b", r"\1 مل", s, flags=re.I)
-    s = re.sub(r"\b(\d+)\s*(جم|g)\b",  r"\1 جم", s, flags=re.I)
-    s = re.sub(r"\b(\d+)\s*(كغ|kg)\b", r"\1 كغ", s, flags=re.I)
-    s = re.sub(r"\b(\d+)\s*(قطعة|pcs?)\b", r"\1 قطعة", s, flags=re.I)
-    return s
-
-
-# ---------------- DeepL batched translation ----------------
-def _deepl_batch(texts: List[str], source: str, target: str) -> List[str]:
-    if not translator:
-        return list(texts)
-    if not texts:
-        return []
-    # Split into batches respecting generous limits
-    MAX_ITEMS = 45
-    MAX_CHARS = 28000
-
-    out = [""] * len(texts)
-    idx_texts = [(i, t if isinstance(t, str) else "") for i, t in enumerate(texts)]
-    idx_texts = [(i, t) for i, t in idx_texts if t.strip()]
-
-    start = 0
-    while start < len(idx_texts):
-        chars = 0
-        batch: List[Tuple[int, str]] = []
-        k = start
-        while k < len(idx_texts) and len(batch) < MAX_ITEMS:
-            i, t = idx_texts[k]
-            if batch and chars + len(t) > MAX_CHARS:
-                break
-            batch.append((i, t)); chars += len(t); k += 1
-
-        # retry on transient failures
-        for attempt in range(3):
-            try:
-                texts_only = [t for _, t in batch]
-                res = translator.translate_text(texts_only, source_lang=source, target_lang=target)
-                outs = [r.text for r in (res if isinstance(res, list) else [res])]
-                for (i, _), txt in zip(batch, outs):
-                    out[i] = txt
-                break
-            except Exception:
-                # small backoff
-                time.sleep(1.2 * (attempt + 1))
-        start = k
-        time.sleep(0.35)  # gentle throttle
-    # Fill empties with originals
-    for i, t in enumerate(out):
-        if not t and texts[i]:
-            out[i] = texts[i]
-    return out
-
-
-def translate_deepl_ar_to_en(texts: List[str]) -> List[str]:
-    return _deepl_batch(texts, "AR", "EN-GB") if deepl_active else list(texts)
-
-
-def translate_deepl_en_to_ar(texts: List[str]) -> List[str]:
-    return _deepl_batch(texts, "EN", "AR") if deepl_active else list(texts)
-
-
-# ---------------- OpenAI helpers ----------------
+# ---------- Text helpers ----------
 def strip_markdown(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -170,7 +100,7 @@ COUNT_RE = re.compile(r"\b(?P<count>\d+)\s*(?:pcs?|قطع(?:ة)?|pack|pkt|Pk|CT)
 
 
 def template_title_from_name(name_en: str) -> str:
-    """Compact fallback title when no image or OpenAI."""
+    """Compact fallback title when no image or OpenAI returns nothing."""
     if not isinstance(name_en, str):
         name_en = ""
     name_en = strip_markdown(name_en)
@@ -198,6 +128,7 @@ def template_title_from_name(name_en: str) -> str:
     return tidy_title(" ".join(parts), 70)
 
 
+# ---------- Image helpers ----------
 def is_valid_url(u: str) -> bool:
     try:
         p = urlparse(u)
@@ -206,6 +137,30 @@ def is_valid_url(u: str) -> bool:
         return False
 
 
+def fetch_thumb(url: str, timeout=7):
+    """Fetch a small thumbnail for preview; return PIL.Image or None."""
+    try:
+        if not is_valid_url(url):
+            return None
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/125 Safari/537.36")
+        }
+        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "").lower()
+        if "image" not in ctype and not url.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            return None
+        content = r.content
+        img = Image.open(BytesIO(content)).convert("RGB")
+        img.thumbnail((256, 256))
+        return img
+    except Exception:
+        return None
+
+
+# ---------- OpenAI: image → EN short title ----------
 def openai_title_from_image(url: str, max_chars: int) -> str:
     if not openai_active or not is_valid_url(url):
         return ""
@@ -238,13 +193,51 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
         return ""
 
 
+# ---------- Translation engines ----------
+def _deepl_batch(texts: List[str]) -> List[str]:
+    """DeepL EN→AR batched."""
+    if not translator:
+        return list(texts)
+    if not texts:
+        return []
+    MAX_ITEMS = 45
+    MAX_CHARS = 28000
+    out = [""] * len(texts)
+    idx_texts = [(i, t if isinstance(t, str) else "") for i, t in enumerate(texts)]
+    idx_texts = [(i, t) for i, t in idx_texts if t.strip()]
+    start = 0
+    while start < len(idx_texts):
+        chars = 0
+        batch: List[Tuple[int, str]] = []
+        k = start
+        while k < len(idx_texts) and len(batch) < MAX_ITEMS:
+            i, t = idx_texts[k]
+            if batch and chars + len(t) > MAX_CHARS:
+                break
+            batch.append((i, t)); chars += len(t); k += 1
+        for attempt in range(3):
+            try:
+                texts_only = [t for _, t in batch]
+                res = translator.translate_text(texts_only, source_lang="EN", target_lang="AR")
+                outs = [r.text for r in (res if isinstance(res, list) else [res])]
+                for (i, _), txt in zip(batch, outs):
+                    out[i] = txt
+                break
+            except Exception:
+                time.sleep(1.2 * (attempt + 1))
+        start = k
+        time.sleep(0.35)
+    for i, t in enumerate(out):
+        if not t and texts[i]:
+            out[i] = texts[i]
+    return out
+
+
 def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
-    """Translate a list of short EN titles to Arabic using OpenAI (batched)."""
+    """OpenAI EN→AR translation, batched."""
     if not openai_active or not texts:
         return list(texts)
-
     out = [""] * len(texts)
-    # Keep batches small to avoid long prompts
     BATCH = 40
 
     def translate_chunk(chunk_items: List[Tuple[int, str]]):
@@ -260,15 +253,12 @@ def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
             try:
                 resp = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": sys},
-                        {"role": "user", "content": usr},
-                    ],
+                    messages=[{"role": "system", "content": sys},
+                              {"role": "user", "content": usr}],
                     temperature=0.0,
                 )
                 txt = (resp.choices[0].message.content or "").strip()
                 lines_ar = [l.strip() for l in txt.splitlines() if l.strip()][: len(lines)]
-                # pad if model returned fewer lines
                 while len(lines_ar) < len(lines):
                     lines_ar.append(lines[len(lines_ar)])
                 for (i, _), t_ar in zip(chunk_items, lines_ar):
@@ -276,8 +266,6 @@ def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
                 return
             except Exception:
                 time.sleep(1.2 * (attempt + 1))
-
-        # on failure, mirror English
         for (i, t_en) in chunk_items:
             out[i] = t_en
 
@@ -287,15 +275,29 @@ def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
         chunk = items[start : start + BATCH]
         translate_chunk(chunk)
         time.sleep(0.35)
-
-    # fill empties
     for i, t in enumerate(out):
         if not t and texts[i]:
             out[i] = texts[i]
     return out
 
 
-# ---------------- Mapping structures (your original rules) ----------------
+def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> pd.Series:
+    texts = titles_en.fillna("").astype(str).tolist()
+    if engine == "DeepL" and deepl_active:
+        out = _deepl_batch(texts)
+        return pd.Series(out, index=titles_en.index)
+    if engine == "OpenAI":
+        out = []
+        for start in range(0, len(texts), batch_size):
+            part = texts[start : start + batch_size]
+            out.extend(openai_translate_en_to_ar_batch(part))
+            time.sleep(0.35)
+        return pd.Series(out, index=titles_en.index)
+    # None: mirror English
+    return titles_en.copy()
+
+
+# ---------- Mapping structures (your original rules) ----------
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id", "sub_category_id", "sub_category_id NO",
               "sub_sub_category_id", "sub_sub_category_id NO"]:
@@ -334,7 +336,7 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
     }
 
 
-# ---------------- Excel download ----------------
+# ---------- Excel download ----------
 def to_excel_download(df, sheet_name="Products"):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -343,7 +345,7 @@ def to_excel_download(df, sheet_name="Products"):
     return buf
 
 
-# ---------------- Batched Title Pipeline ----------------
+# ---------- Batched titles from images (ALWAYS reads 'thumbnail') ----------
 def titles_from_images_batched(
     df: pd.DataFrame,
     row_index: List[int],
@@ -351,84 +353,55 @@ def titles_from_images_batched(
     batch_size: int,
 ) -> pd.Series:
     """Return EN titles for given row indices (batched, throttled, retries)."""
-    # find image column
-    img_col = None
-    for c in ("thumbnail", "image_url"):
-        if c in df.columns:
-            img_col = c
-            break
+    if "thumbnail" not in df.columns:
+        st.error("Column 'thumbnail' not found (expected in column W).")
+        return pd.Series([""] * len(row_index), index=row_index, dtype="object")
 
     titles_en = pd.Series([""] * len(row_index), index=row_index, dtype="object")
-
     prog = st.progress(0)
-    steps = math.ceil(len(row_index) / max(1, batch_size))
+    steps = max(1, math.ceil(len(row_index) / max(1, batch_size)))
     for step, start in enumerate(range(0, len(row_index), batch_size), start=1):
         chunk_idx = row_index[start : start + batch_size]
         for i in chunk_idx:
-            url = str(df.loc[i, img_col]) if img_col else ""
+            url = str(df.loc[i, "thumbnail"])
             title = ""
             if url:
-                # retry a couple of times on OpenAI/image issues
                 for attempt in range(3):
                     title = openai_title_from_image(url, max_chars)
                     if title:
                         break
                     time.sleep(0.6 * (attempt + 1))
             if not title:
-                # fallback from existing English
-                seed = df.loc[i, "name_en"] if "name_en" in df.columns else df.loc[i, "name"]
+                seed = df.loc[i, "name"]
                 title = template_title_from_name(str(seed))
             titles_en.loc[i] = title
-
         prog.progress(min(step / steps, 1.0))
-        time.sleep(0.35)  # gentle throttle between batches
+        time.sleep(0.35)  # throttle between batches
     return titles_en
 
 
-def translate_en_titles(
-    titles_en: pd.Series,
-    engine: str,
-    batch_size: int,
-) -> pd.Series:
-    """Translate English titles to Arabic with chosen engine."""
-    texts = titles_en.fillna("").astype(str).tolist()
-    if engine == "DeepL" and deepl_active:
-        # reuse DeepL batching (internally batched)
-        out = translate_deepl_en_to_ar(texts)
-        return pd.Series(out, index=titles_en.index)
-
-    if engine == "OpenAI":
-        # custom OpenAI batch (we'll chunk ourselves)
-        out = []
-        for start in range(0, len(texts), batch_size):
-            part = texts[start : start + batch_size]
-            out.extend(openai_translate_en_to_ar_batch(part))
-            time.sleep(0.35)
-        return pd.Series(out, index=titles_en.index)
-
-    # engine "None" or DeepL not available: mirror English
-    return titles_en.copy()
-
-
-# ---------------- UI ----------------
+# ---------- UI ----------
 st.title("🛒 Product Mapping + Batched AI Titles (OpenAI → DeepL/OpenAI)")
+
 if deepl_active:
-    st.caption("DeepL available. If you hit the monthly quota, switch the translation engine to OpenAI or None.")
+    st.caption("DeepL available. Translation happens ONLY after English titles are generated from images.")
 elif deepl_status_note:
     st.caption(deepl_status_note)
 
 st.markdown("""
 **Flow**  
 1) Upload **Product List** and **Category Mapping**.  
-2) (Optional) Arabic→English preview for search.  
-3) Search, pick Main/Sub/Sub-Sub, **Apply** (Sub/Sub-Sub saved as numbers).  
-4) (NEW) **Batched image → EN short titles**; EN→AR via **DeepL / OpenAI / None**.  
-5) Download full or filtered Excel.
+2) Search, pick Main/Sub/Sub-Sub → **Apply** (Sub/Sub-Sub saved as numbers).  
+3) (NEW) **Batched image → EN short titles** from column **W: `thumbnail`**; then EN→AR via **DeepL / OpenAI / None**.  
+4) Download full or filtered Excel.
+
+**Note:** We removed the earlier Arabic→English step at upload.
 """)
 
+# Uploads
 c1, c2, c3 = st.columns(3)
 with c1:
-    product_file = st.file_uploader("Product List (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="prod")
+    product_file = st.file_uploader("Product List (.xlsx/.csv) — must include 'thumbnail' in column W", type=["xlsx", "xls", "csv"], key="prod")
 with c2:
     mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx", "xls", "csv"], key="map")
 with c3:
@@ -437,7 +410,7 @@ with c3:
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-# Reset working data when a new product file arrives
+# Reset working data if new upload
 new_upload = False
 if product_file is not None:
     sig = (product_file.name, product_file.size, getattr(product_file, "type", None))
@@ -446,55 +419,36 @@ if product_file is not None:
         st.session_state.pop("work", None)
         new_upload = True
 
+# Validate availability
 ok = True
 if prod_df is None or not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
     ok = False
-MAPPING_REQUIRED = [
+if map_df is None or not validate_columns(map_df, [
     "category_id",
     "sub_category_id", "sub_category_id NO",
     "sub_sub_category_id", "sub_sub_category_id NO",
-]
-if map_df is None or not validate_columns(map_df, MAPPING_REQUIRED, "Category Mapping"):
+], "Category Mapping"):
     ok = False
 if not ok:
     st.info("Upload both files with the required headers to continue.")
     st.stop()
 
-# ---- Precompute name_en for search (optional AR→EN) ----
-for c in ["name_ar_clean", "name_en", "ProductNameEn"]:
-    if c not in prod_df.columns:
-        prod_df[c] = ""
-
-if "name_ar" in prod_df.columns:
-    prod_df["name_ar_clean"] = prod_df["name_ar"].astype(str).map(clean_arabic_text)
-
-if deepl_active:
-    st.info("🔤 Translating Arabic → English for search (name_en)…")
-    prod_df["name_en"] = translate_deepl_ar_to_en(prod_df["name_ar_clean"].fillna("").tolist())
-else:
-    prod_df["name_en"] = prod_df["name_ar_clean"]  # simple mirror if DeepL missing
-
-prod_df["ProductNameEn"] = prod_df["name_en"]
-
-with st.expander("Translation preview (first 10)"):
-    st.dataframe(prod_df[["name_ar", "name_ar_clean", "name_en"]].head(10), use_container_width=True)
-
-# ---- Working DF persistence ----
+# Working DF persistence
 if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
 
-# Ensure required cols exist
+# Ensure required cols exist & string-typed
 for col in REQUIRED_PRODUCT_COLS:
     if col not in work.columns:
         work[col] = ""
     else:
         work[col] = work[col].fillna("").astype(str)
 
-# ---- Build mapping lookups ----
+# Build mapping lookups
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---- Search + Bulk Apply ----
+# ---------- Search + Bulk Apply ----------
 st.subheader("Find products & bulk-assign category IDs")
 if "search_q" not in st.session_state:
     st.session_state["search_q"] = ""
@@ -513,7 +467,6 @@ if q:
     mask = (
         work["name"].astype(str).str.lower().str.contains(q, na=False)
         | work["name_ar"].astype(str).str.lower().str.contains(q, na=False)
-        | work["ProductNameEn"].astype(str).str.lower().str.contains(q, na=False)
     )
 else:
     mask = pd.Series(True, index=work.index)
@@ -553,8 +506,8 @@ if st.button("Apply to all filtered rows"):
     filtered = work[mask].copy()
     st.success("Applied (Main name; Sub & Sub-Sub numbers) to all filtered rows.")
 
-# ---- Batched Titles from Images ----
-st.subheader("Batched image → EN title; EN → AR via DeepL / OpenAI / None")
+# ---------- Batched image → EN title; EN → AR ----------
+st.subheader("Batched image → EN short title (from column 'thumbnail'); EN → AR via DeepL / OpenAI / None")
 
 # Controls
 colA, colB, colC, colD = st.columns(4)
@@ -567,7 +520,11 @@ with colC:
 with colD:
     scope = st.selectbox("Scope", ["Filtered rows", "All rows"])
 
-# Generate button
+# Fixed image column
+st.caption("🖼️ Using image URLs from **column W: `thumbnail`** (exact header required).")
+if "thumbnail" not in work.columns:
+    st.warning("No 'thumbnail' column found. Add it to column W and re-upload to enable image-based titles.")
+
 if st.button("🖼️ Generate short titles (batched)"):
     # target indices
     if scope == "Filtered rows":
@@ -579,14 +536,13 @@ if st.button("🖼️ Generate short titles (batched)"):
         st.warning("No rows to process.")
     else:
         st.info(f"Processing {len(idx_list)} rows in batches of {batch_size}…")
-        # EN titles from images
+        # 1) English titles from images
         titles_en = titles_from_images_batched(work, idx_list, max_len, batch_size)
-        # Write English titles
         work.loc[idx_list, "name"] = titles_en.loc[idx_list]
 
-        # Arabic titles
+        # 2) Arabic titles per chosen engine
         if engine == "DeepL" and not deepl_active:
-            st.warning("DeepL not available. Arabic will mirror English.")
+            st.warning("DeepL not available (or quota exceeded). Arabic will mirror English.")
             titles_ar = titles_en.loc[idx_list]
         else:
             st.info(f"Translating English → Arabic via {engine}…")
@@ -597,8 +553,8 @@ if st.button("🖼️ Generate short titles (batched)"):
         filtered = work[mask].copy()
         st.success("Titles updated (Column A EN, Column B AR).")
 
-# Re-run only Arabic translation later (e.g., after quota resets)
-st.caption("Need to re-translate Arabic later without regenerating English?")
+# Re-translate Arabic later without regenerating English
+st.caption("Need to re-translate Arabic later (e.g., after DeepL quota resets)?")
 colR1, colR2, colR3 = st.columns([2,2,6])
 with colR1:
     re_engine = st.selectbox("Re-translate engine", ["DeepL", "OpenAI", "None"], key="reeng")
@@ -616,30 +572,10 @@ if st.button("🔁 Re-translate Arabic from current English"):
         filtered = work[mask].copy()
         st.success("Arabic re-translation complete.")
 
-# ---- Image preview (column W) ----
-st.subheader("Image thumbnails (from column W)")
-img_col = None
-for c in ("thumbnail", "image_url"):
-    if c in work.columns:
-        img_col = c
-        break
-
-def fetch_thumb(url: str, timeout=5):
-    try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https") or not p.netloc:
-            return None
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        img = Image.open(BytesIO(r.content)).convert("RGB")
-        img.thumbnail((256, 256))
-        return img
-    except Exception:
-        return None
-
-if img_col:
-    st.caption(f"Using image URLs from column: **{img_col}** (current selection)")
-    urls = filtered[img_col].fillna("").astype(str).tolist()
+# ---------- Image thumbnails (from column W: thumbnail) ----------
+st.subheader("Image thumbnails (from column 'thumbnail')")
+if "thumbnail" in work.columns:
+    urls = filtered["thumbnail"].fillna("").astype(str).tolist()
     show_n = min(24, len(urls))
     cols = st.columns(6)
     for i, url in enumerate(urls[:show_n]):
@@ -650,13 +586,13 @@ if img_col:
             else:
                 st.write("No image")
 else:
-    st.info("No `thumbnail` / `image_url` column found.")
+    st.info("No `thumbnail` column detected, so no thumbnails to show.")
 
-# ---- Tables ----
+# ---------- Tables ----------
 st.markdown("### Current selection (all rows in view)")
 st.dataframe(
     filtered[[
-        "merchant_sku", "name", "name_ar", "name_ar_clean", "name_en",
+        "merchant_sku", "name", "name_ar",
         "category_id", "sub_category_id", "sub_sub_category_id"
     ]],
     use_container_width=True,
@@ -673,7 +609,7 @@ with st.expander("Reset working data"):
         st.session_state.pop("work", None)
         st.rerun()
 
-# ---- Downloads ----
+# ---------- Downloads ----------
 st.subheader("Download")
 full_xlsx = to_excel_download(work, "Products")
 st.download_button(
@@ -693,5 +629,6 @@ st.download_button(
 st.caption(
     "Main category remains a NAME (no numeric main ID provided). "
     "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
-    "Batched titles: OpenAI vision → English (short), then Arabic via DeepL/OpenAI/None."
+    "Batched titles: OpenAI vision → English (short), then Arabic via DeepL/OpenAI/None. "
+    "Images are always read from column W: 'thumbnail'."
 )
