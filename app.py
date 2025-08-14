@@ -2,6 +2,7 @@ import io
 import re
 import time
 import math
+import base64
 from typing import List, Tuple, Dict, Any
 from urllib.parse import urlparse
 
@@ -44,16 +45,19 @@ except Exception as e:
 # OpenAI
 openai_client = None
 openai_active = False
+openai_status_note = ""
 try:
     from openai import OpenAI
     OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
     if OPENAI_API_KEY:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         openai_active = True
-except Exception:
+    else:
+        openai_status_note = "(OpenAI API key not set in secrets)"
+except Exception as e:
     openai_client = None
     openai_active = False
-
+    openai_status_note = f"(OpenAI unavailable: {e})"
 
 # ---------- File IO ----------
 def read_any_table(uploaded_file):
@@ -67,14 +71,12 @@ def read_any_table(uploaded_file):
         return pd.read_csv(uploaded_file)
     raise ValueError("Please upload .xlsx, .xls, or .csv")
 
-
 def validate_columns(df, required_cols, label):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         st.error(f"{label}: missing required columns: {missing}")
         return False
     return True
-
 
 # ---------- Text helpers ----------
 def strip_markdown(s: str) -> str:
@@ -83,7 +85,6 @@ def strip_markdown(s: str) -> str:
     s = re.sub(r"[*_`]+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def tidy_title(s: str, max_chars: int = 70) -> str:
     s = strip_markdown(s)
@@ -94,10 +95,8 @@ def tidy_title(s: str, max_chars: int = 70) -> str:
         cut = cut[: cut.rfind(" ")]
     return cut
 
-
 SIZE_RE = re.compile(r"(?P<num>\d+(?:\.\d+)?)\s*(?P<u>ml|l|g|kg|oz|fl\s?oz|mL|ML|KG|G|L)\b", flags=re.I)
 COUNT_RE = re.compile(r"\b(?P<count>\d+)\s*(?:pcs?|قطع(?:ة)?|pack|pkt|Pk|CT)\b", flags=re.I)
-
 
 def template_title_from_name(name_en: str) -> str:
     """Compact fallback title when no image or OpenAI returns nothing."""
@@ -105,7 +104,6 @@ def template_title_from_name(name_en: str) -> str:
         name_en = ""
     name_en = strip_markdown(name_en)
     brand = name_en.split()[0] if name_en.strip() else ""
-
     size = None
     m = SIZE_RE.search(name_en)
     if m:
@@ -114,7 +112,6 @@ def template_title_from_name(name_en: str) -> str:
     m2 = COUNT_RE.search(name_en)
     if m2:
         cnt = m2.group("count")
-
     parts = []
     if brand:
         parts.append(brand)
@@ -127,7 +124,6 @@ def template_title_from_name(name_en: str) -> str:
         parts.append(f"{cnt} pcs")
     return tidy_title(" ".join(parts), 70)
 
-
 # ---------- Image helpers ----------
 def is_valid_url(u: str) -> bool:
     try:
@@ -135,7 +131,6 @@ def is_valid_url(u: str) -> bool:
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
-
 
 def _default_headers(url: str) -> Dict[str, str]:
     parsed = urlparse(url)
@@ -149,32 +144,40 @@ def _default_headers(url: str) -> Dict[str, str]:
         "Referer": origin,
     }
 
+def fetch_image_bytes(url: str, timeout=10) -> Tuple[bytes, str]:
+    """
+    Fetch raw image bytes with browser-like headers.
+    Returns (bytes, mime). Raises on failure.
+    """
+    if not is_valid_url(url):
+        raise ValueError("Invalid URL")
+    r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True, stream=True)
+    r.raise_for_status()
+    content = r.content
+    mime = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    # Fallback MIME guess
+    if not mime or "text/html" in mime:
+        try:
+            fmt = Image.open(BytesIO(content)).format or "JPEG"
+            mime = f"image/{fmt.lower()}"
+        except Exception:
+            mime = "image/jpeg"
+    return content, mime
 
 def fetch_thumb(url: str, timeout=8):
-    """
-    Fetch a small thumbnail for preview; return PIL.Image or None.
-    Less strict about content-type; adds common headers & referer.
-    """
+    """Fetch a small thumbnail for preview; return PIL.Image or None."""
     try:
-        if not is_valid_url(url):
-            return None
-        r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True, stream=True)
-        r.raise_for_status()
-        content = r.content
-        try:
-            img = Image.open(BytesIO(content))
-            # Convert if possible; if Pillow lacks a plugin (rare), this will raise.
-            img = img.convert("RGB")
-            img.thumbnail((256, 256))
-            return img
-        except UnidentifiedImageError:
-            # Not an image or unsupported format
-            return None
-        except Exception:
-            return None
+        content, _ = fetch_image_bytes(url, timeout=timeout)
+        img = Image.open(BytesIO(content))
+        img = img.convert("RGB")
+        img.thumbnail((256, 256))
+        return img
     except Exception:
         return None
 
+def to_data_url(content: bytes, mime: str) -> str:
+    b64 = base64.b64encode(content).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
 def diagnose_image_url(url: str, timeout=8) -> Dict[str, Any]:
     """Return a structured diagnostic dict for a single URL."""
@@ -193,8 +196,7 @@ def diagnose_image_url(url: str, timeout=8) -> Dict[str, Any]:
     try:
         r = requests.get(url, timeout=timeout, headers=_default_headers(url), allow_redirects=True, stream=True)
         diag["status_code"] = r.status_code
-        ct = r.headers.get("Content-Type", "")
-        diag["content_type"] = ct
+        diag["content_type"] = r.headers.get("Content-Type", "")
         content = r.content
         diag["bytes"] = len(content)
         try:
@@ -207,10 +209,9 @@ def diagnose_image_url(url: str, timeout=8) -> Dict[str, Any]:
         diag["error"] = f"Request error: {type(e).__name__}"
     return diag
 
-
-# ---------- OpenAI: image → EN short title ----------
-def openai_title_from_image(url: str, max_chars: int) -> str:
-    if not openai_active or not is_valid_url(url):
+# ---------- OpenAI: image → EN short title (now supports data URLs) ----------
+def openai_title_from_image_data(data_url: str, max_chars: int) -> str:
+    if not openai_active:
         return ""
     prompt = (
         "You are an e-commerce title generator. Return ONE short product TITLE only, "
@@ -223,13 +224,12 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system",
-                 "content": "You are a precise e-commerce title writer. Output one short title only."},
+                {"role": "system", "content": "You are a precise e-commerce title writer. Output one short title only."},
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": url}},
+                        {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 },
             ],
@@ -239,7 +239,6 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
         return tidy_title(title, max_chars)
     except Exception:
         return ""
-
 
 # ---------- Translation engines ----------
 def _deepl_batch(texts: List[str]) -> List[str]:
@@ -280,14 +279,12 @@ def _deepl_batch(texts: List[str]) -> List[str]:
             out[i] = texts[i]
     return out
 
-
 def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
     """OpenAI EN→AR translation, batched."""
     if not openai_active or not texts:
         return list(texts)
     out = [""] * len(texts)
     BATCH = 40
-
     def translate_chunk(chunk_items: List[Tuple[int, str]]):
         lines = [t for _, t in chunk_items]
         joined = "\n".join(lines)
@@ -316,7 +313,6 @@ def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
                 time.sleep(1.2 * (attempt + 1))
         for (i, t_en) in chunk_items:
             out[i] = t_en
-
     items = [(i, t if isinstance(t, str) else "") for i, t in enumerate(texts)]
     items = [(i, t) for i, t in items if t.strip()]
     for start in range(0, len(items), BATCH):
@@ -327,7 +323,6 @@ def openai_translate_en_to_ar_batch(texts: List[str]) -> List[str]:
         if not t and texts[i]:
             out[i] = texts[i]
     return out
-
 
 def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> pd.Series:
     texts = titles_en.fillna("").astype(str).tolist()
@@ -344,26 +339,21 @@ def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> p
     # None: mirror English
     return titles_en.copy()
 
-
 # ---------- Mapping structures (your original rules) ----------
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id", "sub_category_id", "sub_category_id NO",
               "sub_sub_category_id", "sub_sub_category_id NO"]:
         if c in map_df.columns:
             map_df[c] = map_df[c].astype(str).str.strip()
-
     main_names = sorted(map_df["category_id"].dropna().unique().tolist())
-
     main_to_subnames = {}
     for mc, g1 in map_df.groupby("category_id", dropna=True):
         subs = sorted(g1["sub_category_id"].dropna().unique().tolist())
         main_to_subnames[str(mc)] = subs
-
     pair_to_subsubnames = {}
     for (mc, sc), g2 in map_df.groupby(["category_id", "sub_category_id"], dropna=True):
         ssubs = sorted(g2["sub_sub_category_id"].dropna().unique().tolist())
         pair_to_subsubnames[(str(mc), str(sc))] = ssubs
-
     sub_name_to_no_by_main = {}
     ssub_name_to_no_by_main_sub = {}
     for _, r in map_df.iterrows():
@@ -374,7 +364,6 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         sscno = r["sub_sub_category_id NO"]
         sub_name_to_no_by_main[(mc, scn)] = scno
         ssub_name_to_no_by_main_sub[(mc, scn, sscn)] = sscno
-
     return {
         "main_names": main_names,
         "main_to_subnames": main_to_subnames,
@@ -382,7 +371,6 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         "sub_name_to_no_by_main": sub_name_to_no_by_main,
         "ssub_name_to_no_by_main_sub": ssub_name_to_no_by_main_sub,
     }
-
 
 # ---------- Excel download ----------
 def to_excel_download(df, sheet_name="Products"):
@@ -392,55 +380,84 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-
 # ---------- Batched titles from images (ALWAYS reads 'thumbnail') ----------
 def titles_from_images_batched(
     df: pd.DataFrame,
     row_index: List[int],
     max_chars: int,
     batch_size: int,
-) -> pd.Series:
-    """Return EN titles for given row indices (batched, throttled, retries)."""
+) -> Tuple[pd.Series, Dict[str, int]]:
+    """
+    Build EN titles for the given rows.
+    For each row: fetch image bytes with headers → make data URL → call OpenAI.
+    Returns (titles_en, stats).
+    """
     if "thumbnail" not in df.columns:
         st.error("Column 'thumbnail' not found (expected in column W).")
-        return pd.Series([""] * len(row_index), index=row_index, dtype="object")
+        return pd.Series([""] * len(row_index), index=row_index, dtype="object"), {"ai":0,"fallback":0,"total":0}
 
     titles_en = pd.Series([""] * len(row_index), index=row_index, dtype="object")
+    stats = {"ai": 0, "fallback": 0, "total": len(row_index)}
     prog = st.progress(0)
     steps = max(1, math.ceil(len(row_index) / max(1, batch_size)))
+
     for step, start in enumerate(range(0, len(row_index), batch_size), start=1):
         chunk_idx = row_index[start : start + batch_size]
         for i in chunk_idx:
-            url = str(df.loc[i, "thumbnail"]).strip().strip('"\'')  # clean URL
+            url = str(df.loc[i, "thumbnail"]).strip().strip('"\'')
             title = ""
-            if url:
-                for attempt in range(3):
-                    title = openai_title_from_image(url, max_chars)
-                    if title:
-                        break
-                    time.sleep(0.6 * (attempt + 1))
-            if not title:
+            data_url = ""
+            if openai_active and url:
+                # Fetch image bytes first, then pass as data URL
+                try:
+                    content, mime = fetch_image_bytes(url, timeout=10)
+                    data_url = to_data_url(content, mime)
+                except Exception:
+                    data_url = ""
+
+                if data_url:
+                    # up to 3 attempts for transient errors
+                    for attempt in range(3):
+                        title = openai_title_from_image_data(data_url, max_chars)
+                        if title:
+                            break
+                        time.sleep(0.6 * (attempt + 1))
+
+            if title:
+                stats["ai"] += 1
+            else:
                 seed = df.loc[i, "name"]
                 title = template_title_from_name(str(seed))
-            titles_en.loc[i] = title
-        prog.progress(min(step / steps, 1.0))
-        time.sleep(0.35)  # throttle between batches
-    return titles_en
+                stats["fallback"] += 1
 
+            titles_en.loc[i] = title
+
+        prog.progress(min(step / steps, 1.0))
+        time.sleep(0.2)  # modest throttle between batches
+
+    return titles_en, stats
 
 # ---------- UI ----------
 st.title("🛒 Product Mapping + Batched AI Titles (OpenAI → DeepL/OpenAI)")
 
-if deepl_active:
-    st.caption("DeepL available. Translation happens ONLY after English titles are generated from images.")
-elif deepl_status_note:
-    st.caption(deepl_status_note)
+# Preflight status
+pre_c1, pre_c2, pre_c3 = st.columns(3)
+with pre_c1:
+    st.metric("OpenAI Vision status", "Active" if openai_active else "Inactive")
+    if openai_status_note:
+        st.caption(openai_status_note)
+with pre_c2:
+    st.metric("DeepL status", "Active" if deepl_active else "Inactive")
+    if deepl_status_note:
+        st.caption(deepl_status_note)
+with pre_c3:
+    st.caption("Images are fetched server-side and sent to OpenAI as data URLs to avoid CDN hotlink issues.")
 
 st.markdown("""
 **Flow**  
 1) Upload **Product List** and **Category Mapping**.  
 2) Search, pick Main/Sub/Sub-Sub → **Apply** (Sub/Sub-Sub saved as numbers).  
-3) (NEW) **Batched image → EN short titles** from column **W: `thumbnail`**; then EN→AR via **DeepL / OpenAI / None**.  
+3) **Batched image → EN short titles** from column **W: `thumbnail`**; then EN→AR via **DeepL / OpenAI / None**.  
 4) Download full or filtered Excel.
 
 **Note:** We removed the earlier Arabic→English step at upload.
@@ -486,10 +503,8 @@ if ("work" not in st.session_state) or new_upload:
     st.session_state.work = prod_df.copy()
 work = st.session_state.work
 
-# ✅ Normalize headers to remove hidden spaces/case issues (keeps original case)
+# Normalize headers (strip spaces; keep original case)
 work.columns = [str(c).strip() for c in work.columns]
-# If you want case-insensitive everywhere, uncomment:
-# work.columns = [str(c).strip().lower() for c in work.columns]
 
 # Ensure required cols exist & string-typed
 for col in REQUIRED_PRODUCT_COLS:
@@ -567,7 +582,7 @@ colA, colB, colC, colD = st.columns(4)
 with colA:
     max_len = st.slider("Max title length", 50, 90, 70, 5)
 with colB:
-    batch_size = st.slider("Batch size", 25, 100, 50, 5)
+    batch_size = st.slider("Batch size", 20, 100, 50, 5)
 with colC:
     engine = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"])
 with colD:
@@ -578,28 +593,25 @@ st.caption("🖼️ Using image URLs from **column W: `thumbnail`** (exact heade
 if "thumbnail" not in work.columns:
     st.warning("No 'thumbnail' column found. Add it to column W and re-upload to enable image-based titles.")
 else:
-    # Quick sanity check on URLs
     non_empty_count = (work["thumbnail"].astype(str).str.strip() != "").sum()
     st.caption(f"Non-empty thumbnail URLs found: {int(non_empty_count)}")
 
 if st.button("🖼️ Generate short titles (batched)"):
-    # target indices
-    if scope == "Filtered rows":
-        idx_list = filtered.index.tolist()
-    else:
-        idx_list = work.index.tolist()
-
+    idx_list = filtered.index.tolist() if scope == "Filtered rows" else work.index.tolist()
     if not idx_list:
         st.warning("No rows to process.")
     else:
         st.info(f"Processing {len(idx_list)} rows in batches of {batch_size}…")
-        # 1) English titles from images
-        titles_en = titles_from_images_batched(work, idx_list, max_len, batch_size)
+        # 1) English titles from images (using data URLs)
+        titles_en, stats = titles_from_images_batched(work, idx_list, max_len, batch_size)
         work.loc[idx_list, "name"] = titles_en.loc[idx_list]
 
         # 2) Arabic titles per chosen engine
         if engine == "DeepL" and not deepl_active:
             st.warning("DeepL not available (or quota exceeded). Arabic will mirror English.")
+            titles_ar = titles_en.loc[idx_list]
+        elif engine == "OpenAI" and not openai_active:
+            st.warning("OpenAI not available. Arabic will mirror English.")
             titles_ar = titles_en.loc[idx_list]
         else:
             st.info(f"Translating English → Arabic via {engine}…")
@@ -608,9 +620,15 @@ if st.button("🖼️ Generate short titles (batched)"):
         work.loc[idx_list, "name_ar"] = titles_ar
         st.session_state.work = work
         filtered = work[mask].copy()
-        st.success("Titles updated (Column A EN, Column B AR).")
+        st.success(f"Titles updated (EN+AR). AI titles: {stats['ai']}, fallbacks: {stats['fallback']}.")
 
-# ---------- Image thumbnails (from column W: thumbnail) ----------
+        # Quick preview
+        st.dataframe(
+            work.loc[idx_list, ["merchant_sku", "thumbnail", "name"]].head(12),
+            use_container_width=True,
+        )
+
+# ---------- Image thumbnails ----------
 st.subheader("Image thumbnails (from column 'thumbnail')")
 if "thumbnail" in work.columns:
     urls = [str(u).strip().strip('"\'') for u in filtered["thumbnail"].fillna("").astype(str).tolist()]
@@ -622,7 +640,6 @@ if "thumbnail" in work.columns:
             if img:
                 st.image(img, caption=f"Row {filtered.index[i]}", use_container_width=True)
             else:
-                # Fallback: try direct URL rendering client-side
                 if is_valid_url(url):
                     st.image(url, caption=f"(direct) Row {filtered.index[i]}", use_container_width=True)
                 else:
@@ -688,6 +705,6 @@ st.download_button(
 st.caption(
     "Main category remains a NAME (no numeric main ID provided). "
     "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
-    "Batched titles: OpenAI vision → English (short), then Arabic via DeepL/OpenAI/None. "
+    "Batched titles: OpenAI vision now uses server-fetched images (data URLs) to avoid CDN blocking. "
     "Images are always read from column W: 'thumbnail'."
 )
