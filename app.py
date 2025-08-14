@@ -209,7 +209,7 @@ def diagnose_image_url(url: str, timeout=8) -> Dict[str, Any]:
         diag["error"] = f"Request error: {type(e).__name__}"
     return diag
 
-# ---------- OpenAI: image → EN short title (now supports data URLs) ----------
+# ---------- OpenAI: image → EN short title (data URLs) ----------
 def openai_title_from_image_data(data_url: str, max_chars: int) -> str:
     if not openai_active:
         return ""
@@ -380,7 +380,7 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-# ---------- Batched titles from images (ALWAYS reads 'thumbnail') ----------
+# ---------- Batched titles from images (data URLs) ----------
 def titles_from_images_batched(
     df: pd.DataFrame,
     row_index: List[int],
@@ -394,10 +394,10 @@ def titles_from_images_batched(
     """
     if "thumbnail" not in df.columns:
         st.error("Column 'thumbnail' not found (expected in column W).")
-        return pd.Series([""] * len(row_index), index=row_index, dtype="object"), {"ai":0,"fallback":0,"total":0}
+        return pd.Series([""] * len(row_index), index=row_index, dtype="object"), {"ai":0,"fallback":0,"total":0,"download_ok":0,"openai_calls":0,"openai_errors":0}
 
     titles_en = pd.Series([""] * len(row_index), index=row_index, dtype="object")
-    stats = {"ai": 0, "fallback": 0, "total": len(row_index)}
+    stats = {"ai": 0, "fallback": 0, "total": len(row_index), "download_ok": 0, "openai_calls": 0, "openai_errors": 0}
     prog = st.progress(0)
     steps = max(1, math.ceil(len(row_index) / max(1, batch_size)))
 
@@ -407,21 +407,23 @@ def titles_from_images_batched(
             url = str(df.loc[i, "thumbnail"]).strip().strip('"\'')
             title = ""
             data_url = ""
-            if openai_active and url:
-                # Fetch image bytes first, then pass as data URL
+            if url:
                 try:
-                    content, mime = fetch_image_bytes(url, timeout=10)
-                    data_url = to_data_url(content, mime)
+                    content, mime = fetch_image_bytes(url, timeout=12)
+                    data_url = to_data_url(content, mime); stats["download_ok"] += 1
                 except Exception:
                     data_url = ""
 
-                if data_url:
-                    # up to 3 attempts for transient errors
-                    for attempt in range(3):
-                        title = openai_title_from_image_data(data_url, max_chars)
-                        if title:
-                            break
-                        time.sleep(0.6 * (attempt + 1))
+            if data_url and openai_active:
+                for attempt in range(3):
+                    t = openai_title_from_image_data(data_url, max_chars)
+                    stats["openai_calls"] += 1
+                    if t:
+                        title = t
+                        break
+                    time.sleep(0.6 * (attempt + 1))
+                if not title:
+                    stats["openai_errors"] += 1
 
             if title:
                 stats["ai"] += 1
@@ -433,7 +435,7 @@ def titles_from_images_batched(
             titles_en.loc[i] = title
 
         prog.progress(min(step / steps, 1.0))
-        time.sleep(0.2)  # modest throttle between batches
+        time.sleep(0.2)  # modest throttle
 
     return titles_en, stats
 
@@ -578,7 +580,7 @@ if st.button("Apply to all filtered rows"):
 st.subheader("Batched image → EN short title (from column 'thumbnail'); EN → AR via DeepL / OpenAI / None")
 
 # Controls
-colA, colB, colC, colD = st.columns(4)
+colA, colB, colC, colD, colE = st.columns(5)
 with colA:
     max_len = st.slider("Max title length", 50, 90, 70, 5)
 with colB:
@@ -587,6 +589,8 @@ with colC:
     engine = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"])
 with colD:
     scope = st.selectbox("Scope", ["Filtered rows", "All rows"])
+with colE:
+    use_openai = st.checkbox("Use OpenAI for title generation", value=True, help="If off, will only use fallback-from-name.")
 
 # Fixed image column
 st.caption("🖼️ Using image URLs from **column W: `thumbnail`** (exact header required).")
@@ -596,13 +600,37 @@ else:
     non_empty_count = (work["thumbnail"].astype(str).str.strip() != "").sum()
     st.caption(f"Non-empty thumbnail URLs found: {int(non_empty_count)}")
 
+# Guardrails before running
+if use_openai and not openai_active:
+    st.error("OpenAI is inactive (no/invalid API key). Turn off 'Use OpenAI for title generation' or set OPENAI_API_KEY in secrets.")
+
+# Mini test (first 5 rows)
+if st.button("🧪 Test first 5 rows"):
+    idx_list = (filtered.index.tolist() if scope == "Filtered rows" else work.index.tolist())[:5]
+    if not idx_list:
+        st.warning("No rows to process.")
+    else:
+        titles_en, stats = titles_from_images_batched(work, idx_list, max_len, batch_size=5)
+        st.write("Stats:", stats)
+        st.dataframe(
+            pd.DataFrame({
+                "merchant_sku": work.loc[idx_list, "merchant_sku"],
+                "thumbnail": work.loc[idx_list, "thumbnail"],
+                "generated_en": titles_en.loc[idx_list],
+            }),
+            use_container_width=True
+        )
+
+# Main run
 if st.button("🖼️ Generate short titles (batched)"):
+    if use_openai and not openai_active:
+        st.stop()  # hard stop to avoid wasting time
     idx_list = filtered.index.tolist() if scope == "Filtered rows" else work.index.tolist()
     if not idx_list:
         st.warning("No rows to process.")
     else:
         st.info(f"Processing {len(idx_list)} rows in batches of {batch_size}…")
-        # 1) English titles from images (using data URLs)
+        # 1) English titles
         titles_en, stats = titles_from_images_batched(work, idx_list, max_len, batch_size)
         work.loc[idx_list, "name"] = titles_en.loc[idx_list]
 
@@ -620,7 +648,11 @@ if st.button("🖼️ Generate short titles (batched)"):
         work.loc[idx_list, "name_ar"] = titles_ar
         st.session_state.work = work
         filtered = work[mask].copy()
-        st.success(f"Titles updated (EN+AR). AI titles: {stats['ai']}, fallbacks: {stats['fallback']}.")
+
+        st.success(
+            f"Done. AI titles: {stats['ai']} | fallbacks: {stats['fallback']} "
+            f"| image downloads OK: {stats['download_ok']} | OpenAI calls: {stats['openai_calls']} | OpenAI errors: {stats['openai_errors']}"
+        )
 
         # Quick preview
         st.dataframe(
@@ -705,6 +737,6 @@ st.download_button(
 st.caption(
     "Main category remains a NAME (no numeric main ID provided). "
     "Sub & Sub-Sub are saved as NUMBERS from your mapping. "
-    "Batched titles: OpenAI vision now uses server-fetched images (data URLs) to avoid CDN blocking. "
+    "Batched titles: images are fetched server-side and sent to OpenAI as data URLs. "
     "Images are always read from column W: 'thumbnail'."
 )
