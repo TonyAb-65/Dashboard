@@ -834,3 +834,13 @@ st.download_button(
     file_name="products_filtered.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+# New test function for CodeRabbit review
+def divide_numbers(a, b):
+    # Intentional issues for CodeRabbit to catch:
+    # 1. No error handling for division by zero
+    # 2. No type checking (if someone passes a string, it will break)
+    # 3. No docstring or explanation
+    return a / b
+
+# Quick test call
+print(divide_numbers(10, 0))
