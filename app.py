@@ -53,6 +53,10 @@ try:
 except Exception:
     openai_client = None
     openai_active = False
+    # ---------- Key status ----------
+st.sidebar.markdown("### 🔑 API Key Status")
+st.sidebar.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
+st.sidebar.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
 
 
 # ---------- File IO ----------
@@ -89,6 +93,8 @@ def tidy_title(s: str, max_chars: int = 70) -> str:
     if " " in cut: cut = cut[: cut.rfind(" ")]
     return cut
 
+from urllib.parse import urlsplit, urlunsplit, quote
+
 def is_valid_url(u: str) -> bool:
     if not isinstance(u, str): return False
     u = u.strip().strip('"').strip("'")
@@ -102,7 +108,6 @@ def _normalize_url(u: str) -> str:
     u = (u or "").strip().strip('"').strip("'")
     p = urlsplit(u)
     path = quote(p.path, safe="/:%@&?=#,+!$;'()*[]")
-    # Re-encode query safely
     if p.query:
         parts = []
         for kv in p.query.split("&"):
@@ -319,22 +324,31 @@ else:
 filtered = work[mask].copy()
 st.caption(f"Rows in current filtered view: {filtered.shape[0]}")
 
-# A) Preview images (manual trigger, no auto-fetch)
+# A) Preview images (manual trigger, browser fetch)
 st.subheader("A) Preview images (manual)")
-st.caption("Click to fetch thumbnails. Nothing loads automatically.")
+st.caption("Click to fetch thumbnails in your browser. Nothing loads automatically.")
 if st.button("Preview first 24 images in CURRENT filtered view"):
     view = filtered.head(24).copy()
     if "thumbnail" in view.columns and len(view) > 0:
         cols = st.columns(6)
         for j, (i, row) in enumerate(view.iterrows()):
             with cols[j % 6]:
-                img = fetch_thumb(str(row.get("thumbnail", "")))
-                if img:
-                    st.image(img, caption=f"Row {i}", use_container_width=True)
+                url = _normalize_url(str(row.get("thumbnail", "")))
+                if is_valid_url(url):
+                    # Let the browser fetch the URL directly
+                    st.image(url, caption=f"Row {i}", use_container_width=True)
                 else:
                     st.write("No image / bad URL")
     else:
         st.info("No thumbnails in current filtered view.")
+
+with st.expander("Image diagnostics (manual)"):
+    st.caption("Helps confirm URLs are valid and reachable.")
+    if st.button("Show first 10 normalized URLs"):
+        sample = filtered["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in filtered.columns else []
+        for u in sample:
+            norm = _normalize_url(u)
+            st.write({"raw": u, "normalized": norm, "valid": is_valid_url(norm)})
 
 # B) Pick rows to generate titles from image
 st.subheader("B) Pick rows to generate titles from image")
