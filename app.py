@@ -181,25 +181,38 @@ def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
 
 # ============================== OPENAI & TRANSLATION ======================
 def openai_title_from_image(url: str, max_chars: int) -> str:
-    if not openai_active or not is_valid_url(url): return ""
-    prompt=("Return ONE short product TITLE only (6–8 words, max ~70 chars). "
-            "Include brand if visible and size/count if obvious. No markdown.")
+    if not openai_active or not is_valid_url(url):
+        return ""
+    prompt = (
+        "Look at the product photo and return ONE short English title only. "
+        "Keep it 6–8 words, ≤70 characters. "
+        "Include brand if visible and size/count if obvious. "
+        "Output ONLY the title, nothing else."
+    )
     try:
-        resp=openai_client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role":"system","content":"You are a precise e-commerce title writer. Output one short title only."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":_normalize_url(url)}}
-                ]}
+                {"role": "system", "content": "You are a precise e-commerce title writer."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": _normalize_url(url)}},
+                    ],
+                },
             ],
-            temperature=0.2,
+            temperature=0,
+            max_tokens=100,
         )
-        title=resp.choices[0].message.content or ""
-        return tidy_title(title,max_chars)
-    except Exception:
+        title = resp.choices[0].message.get("content", "")
+        if not title:
+            return ""
+        return tidy_title(title, max_chars)
+    except Exception as e:
+        st.warning(f"OpenAI error: {e}")
         return ""
+
 
 def deepl_batch_en2ar(texts: List[str]) -> List[str]:
     if not translator: return list(texts)
