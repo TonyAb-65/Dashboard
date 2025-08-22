@@ -1,4 +1,4 @@
-# Product Mapping Dashboard — Master (UI intact, manual trigger, batched pipeline, persistent cache)
+# Product Mapping Dashboard — Master (UI intact, manual trigger, batched pipeline, persistent cache, clearer job panel)
 
 import io, re, time, math, hashlib, base64
 from typing import List, Iterable, Dict, Tuple
@@ -14,7 +14,7 @@ from io import BytesIO
 # ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
 
-# ===== UI THEME & HEADER (unchanged styling) =====
+# ===== UI THEME & HEADER =====
 EMERALD = "#10b981"
 EMERALD_DARK = "#059669"
 TEXT_LIGHT = "#f8fafc"
@@ -59,13 +59,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ============== REQUIRED COLUMNS (unchanged) ==============
+# ============== REQUIRED COLUMNS ==============
 REQUIRED_PRODUCT_COLS = [
     "name","name_ar","merchant_sku","category_id","category_id_ar",
     "sub_category_id","sub_sub_category_id","thumbnail",
 ]
 
-# ============== API CLIENTS (unchanged) ==============
+# ============== API CLIENTS ==============
 translator=None; deepl_active=False
 try:
     import deepl
@@ -90,7 +90,7 @@ def global_cache() -> dict:
     # {file_hash: {sku: {"en": "...", "ar": "..."}}}
     return {}
 
-# ============== FILE IO (unchanged) ==============
+# ============== FILE IO ==============
 def read_any_table(uploaded_file):
     if uploaded_file is None: return None
     fn = uploaded_file.name.lower()
@@ -110,7 +110,7 @@ def hash_uploaded_file(uploaded_file) -> str:
     except Exception:
         return hashlib.sha256(str(uploaded_file.name).encode()).hexdigest()
 
-# ============== HELPERS (unchanged logic) ==============
+# ============== HELPERS ==============
 STOP={"the","and","for","with","of","to","in","on","by","a","an","&","-",
       "ml","g","kg","l","oz","pcs","pc","pack","pkt","ct","size","new","extra","x"}
 
@@ -172,7 +172,7 @@ def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     except Exception:
         return ""
 
-# ============== OpenAI + Translation (unchanged API usage) ==============
+# ============== OpenAI + Translation ==============
 def openai_title_from_image(url:str,max_chars:int)->str:
     if not openai_active: return ""
     data_url=fetch_image_as_data_url(url)
@@ -229,7 +229,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int)->pd.Se
         return pd.Series(out, index=titles_en.index)
     return titles_en.copy()
 
-# ============== Mapping lookups (unchanged) ==============
+# ============== Mapping lookups ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
         if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
@@ -245,13 +245,13 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
-# ============== Downloads (unchanged) ==============
+# ============== Downloads ==============
 def to_excel_download(df, sheet_name="Products"):
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
     buf.seek(0); return buf
 
-# ============== Uploads (unchanged behavior; no auto processing) ==============
+# ============== Uploads ==============
 c1,c2=st.columns(2)
 with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
 with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
@@ -261,9 +261,9 @@ if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"
         and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
     st.stop()
 
-# ============== Memory & State (unchanged) ==============
+# ============== Memory & State ==============
 st.session_state.setdefault("file_hash", None)
-st.session_state.setdefault("proc_cache", {})  # fast in-session cache
+st.session_state.setdefault("proc_cache", {})
 st.session_state.setdefault("audit_rows", [])
 st.session_state.setdefault("keyword_library", [])
 st.session_state.setdefault("page_size", 200)
@@ -280,7 +280,7 @@ if st.session_state.file_hash != current_hash:
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
-# Prefill from persistent cache if this file was seen before (no auto processing)
+# Prefill from persistent cache if this file was seen before
 _g = global_cache()
 file_store = _g.get(current_hash, {})
 if file_store:
@@ -291,7 +291,7 @@ if file_store:
             if entry.get("en"): work.at[i, "name"] = entry["en"]
             if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
 
-# ============== Sidebar NAV (unchanged) ==============
+# ============== Sidebar NAV ==============
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
@@ -303,7 +303,7 @@ with st.sidebar:
         index=0
     )
 
-# ============== Shared utils (unchanged) ==============
+# ============== Shared utils ==============
 def is_nonempty_series(s: pd.Series) -> pd.Series:
     return s.notna() & s.astype(str).str.strip().ne("")
 
@@ -320,7 +320,7 @@ def mapping_stats(df: pd.DataFrame):
     en_ok=int(is_nonempty_series(df["name"].fillna("")).sum()); ar_ok=int(is_nonempty_series(df["name_ar"].fillna("")).sum())
     return total,mapped,unmapped,en_ok,ar_ok,mm
 
-# ============== Sections (unchanged UI) ==============
+# ============== Sections ==============
 def sec_overview():
     st.subheader("Overview")
     total,mapped,unmapped,en_ok,ar_ok,mm = mapping_stats(work)
@@ -399,8 +399,8 @@ def sec_titles():
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10)
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
 
-    # Safe preview (no DeltaGenerator echo)
-    if st.button("Preview first 24 images", key="btn_preview_imgs"):
+    # Preview 24 images (no processing)
+    if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base.head(24)
         if "thumbnail" in view.columns and len(view) > 0:
@@ -494,16 +494,40 @@ def sec_titles():
         return updated, failed
 
     # === FULL AUTOMATIC BATCHED PIPELINE (manual trigger only) ===
-    if st.button("Run FULL pipeline on scope", key="btn_full_pipeline"):
+    if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
         idx_all = base.index.tolist()
         if not idx_all:
             st.info("No rows in scope.")
         else:
+            st.info(
+                f"Scope: {scope} • Batch(image→EN)={fetch_batch} • Batch(EN→AR)={trans_batch} • "
+                f"Only empty EN={'Yes' if only_empty else 'No'} • Force overwrite={'Yes' if force_over else 'No'}"
+            )
+
             total = len(idx_all)
             bar = st.progress(0.0, text="Starting…")
             en_up=en_skip=en_fail=ar_up=ar_fail=0
 
+            # Live job panel
+            st.caption("Job panel")
+            jp_cols = st.columns(5)
+            c_total, c_done, c_en, c_ar, c_batch = jp_cols
+            c_total.metric("Rows in scope", total)
+            done_placeholder = c_done.empty()
+            en_placeholder   = c_en.empty()
+            ar_placeholder   = c_ar.empty()
+            batch_placeholder= c_batch.empty()
+
+            def update_panel(done, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches):
+                done_placeholder.metric("Rows processed", done)
+                en_placeholder.metric("EN titles", f"✔ {en_up}", f"skip {en_skip} / fail {en_fail}")
+                ar_placeholder.metric("AR translated", f"✔ {ar_up}", f"fail {ar_fail}")
+                batch_placeholder.metric("Batch", f"{batch_no}/{total_batches}")
+
+            total_batches = math.ceil(total / fetch_batch)
+            batch_no = 0
             for s in range(0, total, fetch_batch):
+                batch_no += 1
                 batch_idx = idx_all[s:s+fetch_batch]
 
                 u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over)
@@ -512,14 +536,16 @@ def sec_titles():
                 u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over)
                 ar_up += u2; ar_fail += f2
 
-                bar.progress(min((s+len(batch_idx))/total,1.0),
-                             text=f"Processed {s+len(batch_idx)}/{total} rows")
+                done_count = s + len(batch_idx)
+                bar.progress(min(done_count/total,1.0),
+                             text=f"Processed {done_count}/{total} rows")
+                update_panel(done_count, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches)
                 time.sleep(0.15)
 
             st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | "
                        f"AR updated {ar_up}, failed {ar_fail}")
 
-    # Optional targeted runners remain available
+    # Optional targeted runners
     cA,cB=st.columns(2)
     with cA:
         if st.button("Run ONLY missing EN"):
@@ -654,15 +680,13 @@ def sec_settings():
                 norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
-            # Clear in-session
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
-            # Clear persistent for this file only
             store = global_cache()
             if st.session_state.file_hash in store:
                 del store[st.session_state.file_hash]
             st.success("Cleared.")
 
-# ============== Router (unchanged) ==============
+# ============== Router ==============
 if section=="📊 Overview":
     sec_overview()
 elif section=="🔎 Filter":
