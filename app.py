@@ -1,4 +1,4 @@
-# Product Mapping Dashboard – Restored Sidebar Nav + Pro UI + Full Pipeline + Memory + Audit
+# Product Mapping Dashboard — Master (UI intact, manual trigger, batched pipeline, persistent cache)
 
 import io, re, time, math, hashlib, base64
 from typing import List, Iterable, Dict, Tuple
@@ -14,7 +14,7 @@ from io import BytesIO
 # ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
 
-# ===== UI THEME & HEADER =====
+# ===== UI THEME & HEADER (unchanged styling) =====
 EMERALD = "#10b981"
 EMERALD_DARK = "#059669"
 TEXT_LIGHT = "#f8fafc"
@@ -59,13 +59,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ============== REQUIRED COLUMNS ==============
+# ============== REQUIRED COLUMNS (unchanged) ==============
 REQUIRED_PRODUCT_COLS = [
     "name","name_ar","merchant_sku","category_id","category_id_ar",
     "sub_category_id","sub_sub_category_id","thumbnail",
 ]
 
-# ============== API CLIENTS ==============
+# ============== API CLIENTS (unchanged) ==============
 translator=None; deepl_active=False
 try:
     import deepl
@@ -84,7 +84,13 @@ try:
 except Exception:
     openai_client=None; openai_active=False
 
-# ============== FILE IO ==============
+# -------- Persistent cache across reruns (per server process) --------
+@st.cache_resource
+def global_cache() -> dict:
+    # {file_hash: {sku: {"en": "...", "ar": "..."}}}
+    return {}
+
+# ============== FILE IO (unchanged) ==============
 def read_any_table(uploaded_file):
     if uploaded_file is None: return None
     fn = uploaded_file.name.lower()
@@ -104,7 +110,7 @@ def hash_uploaded_file(uploaded_file) -> str:
     except Exception:
         return hashlib.sha256(str(uploaded_file.name).encode()).hexdigest()
 
-# ============== HELPERS ==============
+# ============== HELPERS (unchanged logic) ==============
 STOP={"the","and","for","with","of","to","in","on","by","a","an","&","-",
       "ml","g","kg","l","oz","pcs","pc","pack","pkt","ct","size","new","extra","x"}
 
@@ -145,6 +151,7 @@ def _normalize_url(u:str)->str:
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
 def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
+    """Manual fetch → data URL. Not auto-run on upload."""
     try:
         if not is_valid_url(url): return ""
         url=_normalize_url(url)
@@ -165,7 +172,7 @@ def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     except Exception:
         return ""
 
-# ============== OpenAI + Translation ==============
+# ============== OpenAI + Translation (unchanged API usage) ==============
 def openai_title_from_image(url:str,max_chars:int)->str:
     if not openai_active: return ""
     data_url=fetch_image_as_data_url(url)
@@ -222,7 +229,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int)->pd.Se
         return pd.Series(out, index=titles_en.index)
     return titles_en.copy()
 
-# ============== Mapping lookups ==============
+# ============== Mapping lookups (unchanged) ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
         if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
@@ -238,13 +245,13 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
-# ============== Downloads ==============
+# ============== Downloads (unchanged) ==============
 def to_excel_download(df, sheet_name="Products"):
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
     buf.seek(0); return buf
 
-# ============== Uploads ==============
+# ============== Uploads (unchanged behavior; no auto processing) ==============
 c1,c2=st.columns(2)
 with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
 with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
@@ -254,9 +261,9 @@ if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"
         and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
     st.stop()
 
-# ============== Memory & State ==============
+# ============== Memory & State (unchanged) ==============
 st.session_state.setdefault("file_hash", None)
-st.session_state.setdefault("proc_cache", {})
+st.session_state.setdefault("proc_cache", {})  # fast in-session cache
 st.session_state.setdefault("audit_rows", [])
 st.session_state.setdefault("keyword_library", [])
 st.session_state.setdefault("page_size", 200)
@@ -273,7 +280,18 @@ if st.session_state.file_hash != current_hash:
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
-# ============== Sidebar NAV ==============
+# Prefill from persistent cache if this file was seen before (no auto processing)
+_g = global_cache()
+file_store = _g.get(current_hash, {})
+if file_store:
+    for i, row in work.iterrows():
+        sku = str(row["merchant_sku"])
+        entry = file_store.get(sku)
+        if entry:
+            if entry.get("en"): work.at[i, "name"] = entry["en"]
+            if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
+
+# ============== Sidebar NAV (unchanged) ==============
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
@@ -285,7 +303,7 @@ with st.sidebar:
         index=0
     )
 
-# ============== Shared utils ==============
+# ============== Shared utils (unchanged) ==============
 def is_nonempty_series(s: pd.Series) -> pd.Series:
     return s.notna() & s.astype(str).str.strip().ne("")
 
@@ -302,7 +320,7 @@ def mapping_stats(df: pd.DataFrame):
     en_ok=int(is_nonempty_series(df["name"].fillna("")).sum()); ar_ok=int(is_nonempty_series(df["name_ar"].fillna("")).sum())
     return total,mapped,unmapped,en_ok,ar_ok,mm
 
-# ============== Sections ==============
+# ============== Sections (unchanged UI) ==============
 def sec_overview():
     st.subheader("Overview")
     total,mapped,unmapped,en_ok,ar_ok,mm = mapping_stats(work)
@@ -363,6 +381,8 @@ def sec_filter():
 
 def sec_titles():
     st.subheader("Titles & Translate")
+
+    # Controls
     c1,c2,c3,c4=st.columns(4)
     with c1: max_len=st.slider("Max EN length",50,90,70,5)
     with c2: engine=st.selectbox("Arabic engine", ["DeepL","OpenAI","None"])
@@ -379,81 +399,144 @@ def sec_titles():
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10)
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
 
-    if st.button("Preview first 24 images"):
-        view=base.head(24).copy()
-        if "thumbnail" in view.columns and len(view)>0:
-            cols=st.columns(6)
-            for j,(i,row) in enumerate(view.iterrows()):
-                with cols[j%6]:
-                    url=_normalize_url(str(row.get("thumbnail","")))
-                    st.image(url, caption=f"Row {i}", use_container_width=True) if is_valid_url(url) else st.write("Bad URL")
-        else: st.info("No thumbnails.")
+    # Safe preview (no DeltaGenerator echo)
+    if st.button("Preview first 24 images", key="btn_preview_imgs"):
+        gallery = st.container()
+        view = base.head(24)
+        if "thumbnail" in view.columns and len(view) > 0:
+            cols = gallery.columns(6)
+            for j, (i, row) in enumerate(view.iterrows()):
+                url = _normalize_url(str(row.get("thumbnail", "")))
+                with cols[j % 6]:
+                    if is_valid_url(url):
+                        st.image(url, caption=f"Row {i}", use_container_width=True)
+                    else:
+                        st.caption("Bad URL")
+        else:
+            st.info("No thumbnails found in current scope.")
 
-    def run_titles(idx):
+    # ---------- Batched workers with persistent cache ----------
+    def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
-        prog=st.progress(0.0, text="EN title generation…")
-        for s in range(0,len(idx),fetch_batch):
-            chunk=idx[s:s+fetch_batch]
+        store = global_cache().setdefault(st.session_state.file_hash, {})
+        for s in range(0, len(idx), fetch_batch):
+            chunk = idx[s:s+fetch_batch]
             for i in chunk:
-                sku=str(work.at[i,"merchant_sku"])
-                cache=st.session_state.proc_cache.get(sku,{})
-                cur_en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
-                url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
-                if not force_over and cache.get("name"):
-                    work.at[i,"name"]=cache["name"]; skipped+=1; continue
-                if only_empty and cur_en and not force_over:
-                    st.session_state.proc_cache.setdefault(sku,{})["name"]=cur_en; skipped+=1; continue
-                t=openai_title_from_image(url,max_len) if url else ""
-                if t:
-                    work.at[i,"name"]=t; st.session_state.proc_cache.setdefault(sku,{})["name"]=t; updated+=1
-                else:
-                    failed+=1; st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"no title or fetch failed","url":url})
-            prog.progress(min((s+len(chunk))/len(idx),1.0)); time.sleep(0.02)
-        st.success(f"EN titles → updated {updated}, skipped {skipped}, failed {failed}")
+                sku = str(work.at[i,"merchant_sku"])
+                cache_local = st.session_state.proc_cache.get(sku, {})
+                cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+                url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
 
-    def run_trans(idx):
-        if engine not in ("DeepL","OpenAI"): st.info("Translation engine None."); return
+                # prefer persistent store if not forcing
+                if not force_over and store.get(sku, {}).get("en"):
+                    work.at[i,"name"] = store[sku]["en"]
+                    st.session_state.proc_cache.setdefault(sku,{})["name"] = store[sku]["en"]
+                    skipped += 1
+                    continue
+
+                if not force_over and cache_local.get("name"):
+                    work.at[i,"name"] = cache_local["name"]; skipped += 1; continue
+                if only_empty and cur_en and not force_over:
+                    st.session_state.proc_cache.setdefault(sku,{})["name"]=cur_en; skipped += 1; continue
+
+                title = openai_title_from_image(url, max_len) if url else ""
+                if title:
+                    work.at[i,"name"] = title
+                    st.session_state.proc_cache.setdefault(sku,{})["name"] = title
+                    store.setdefault(sku, {})["en"] = title          # persist
+                    updated += 1
+                else:
+                    failed += 1
+                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"no title or fetch failed","url":url})
+        return updated, skipped, failed
+
+    def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
+        if engine not in ("DeepL","OpenAI"): return 0,0
+        store = global_cache().setdefault(st.session_state.file_hash, {})
         ids=[]; texts=[]
         for i in idx:
             sku=str(work.at[i,"merchant_sku"])
-            cache=st.session_state.proc_cache.get(sku,{})
+            cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+
             if not en:
-                st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])}); continue
-            if not force_over and cache.get("name_ar"):
-                work.at[i,"name_ar"]=cache["name_ar"]; continue
+                st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
+                continue
+
+            # prefer persistent store if not forcing
+            if not force_over and store.get(sku, {}).get("ar"):
+                work.at[i,"name_ar"] = store[sku]["ar"]
+                st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]
+                continue
+
+            if not force_over and cache_local.get("name_ar"):
+                work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
                 ids.append(i); texts.append(en)
+
         updated=failed=0
-        if texts:
-            prog=st.progress(0.0, text="EN → AR…"); out=[]
-            for s in range(0,len(texts),trans_batch):
-                out.extend(translate_en_titles(pd.Series(texts[s:s+trans_batch]), engine, trans_batch).tolist())
-                prog.progress(min((s+len(texts[s:s+trans_batch]))/len(texts),1.0)); time.sleep(0.02)
-            for j,i in enumerate(ids):
-                ar=out[j] if j<len(out) else ""
+        for s in range(0, len(texts), trans_batch):
+            chunk = texts[s:s+trans_batch]
+            outs = translate_en_titles(pd.Series(chunk), engine, trans_batch).tolist()
+            for j, _ in enumerate(chunk):
+                i = ids[s+j]
+                ar = outs[j] if j < len(outs) else ""
                 if ar:
-                    work.at[i,"name_ar"]=ar; sku=str(work.at[i,"merchant_sku"])
-                    st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=ar; updated+=1
+                    work.at[i,"name_ar"] = ar
+                    sku = str(work.at[i,"merchant_sku"])
+                    st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
+                    store.setdefault(sku, {})["ar"] = ar            # persist
+                    updated += 1
                 else:
-                    failed+=1; st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
-        st.success(f"AR translations → updated {updated}, failed {failed}")
+                    failed += 1
+                    st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
+        return updated, failed
 
-    ids=base.index.tolist()
-    if st.button("Run FULL pipeline on scope"):
-        if not ids: st.info("No rows.")
-        else: run_titles(ids); run_trans(ids)
+    # === FULL AUTOMATIC BATCHED PIPELINE (manual trigger only) ===
+    if st.button("Run FULL pipeline on scope", key="btn_full_pipeline"):
+        idx_all = base.index.tolist()
+        if not idx_all:
+            st.info("No rows in scope.")
+        else:
+            total = len(idx_all)
+            bar = st.progress(0.0, text="Starting…")
+            en_up=en_skip=en_fail=ar_up=ar_fail=0
 
+            for s in range(0, total, fetch_batch):
+                batch_idx = idx_all[s:s+fetch_batch]
+
+                u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over)
+                en_up += u; en_skip += k; en_fail += f
+
+                u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over)
+                ar_up += u2; ar_fail += f2
+
+                bar.progress(min((s+len(batch_idx))/total,1.0),
+                             text=f"Processed {s+len(batch_idx)}/{total} rows")
+                time.sleep(0.15)
+
+            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | "
+                       f"AR updated {ar_up}, failed {ar_fail}")
+
+    # Optional targeted runners remain available
     cA,cB=st.columns(2)
     with cA:
         if st.button("Run ONLY missing EN"):
             ids=base[~is_nonempty_series(base["name"].fillna(""))].index.tolist()
-            run_titles(ids) if ids else st.info("No missing EN.")
+            if ids:
+                u,k,f = run_titles(ids, fetch_batch, max_len, only_empty, force_over)
+                st.success(f"EN → updated {u}, skipped {k}, failed {f}")
+            else:
+                st.info("No missing EN.")
     with cB:
         if st.button("Run ONLY missing AR"):
             ids=base[~is_nonempty_series(base["name_ar"].fillna(""))].index.tolist()
-            run_trans(ids) if ids else st.info("No missing AR.")
+            if ids:
+                u2,f2 = run_trans(ids, trans_batch, engine, force_over)
+                st.success(f"AR → updated {u2}, failed {f2}")
+            else:
+                st.info("No missing AR.")
 
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
@@ -571,10 +654,15 @@ def sec_settings():
                 norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
+            # Clear in-session
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
+            # Clear persistent for this file only
+            store = global_cache()
+            if st.session_state.file_hash in store:
+                del store[st.session_state.file_hash]
             st.success("Cleared.")
 
-# ============== Router ==============
+# ============== Router (unchanged) ==============
 if section=="📊 Overview":
     sec_overview()
 elif section=="🔎 Filter":
