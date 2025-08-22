@@ -1,3 +1,7 @@
+# Product Mapping Dashboard – full app
+# UI: branded header, clean tabs, sidebar analytics, manual image preview,
+# keyword library with explicit selection, full-sheet pagination.
+
 import io
 import re
 import time
@@ -12,18 +16,47 @@ import requests
 from PIL import Image
 from io import BytesIO
 
-# ---------- Page ----------
-st.set_page_config(page_title="Product Mapper: Images → Titles → Groups", layout="wide")
+# ============================== PAGE & THEME ===============================
+st.set_page_config(
+    page_title="Product Mapping Dashboard",
+    page_icon="🧭",
+    layout="wide",
+)
 
-# ---------- Expected Product List columns ----------
+# Minimal CSS polish
+st.markdown("""
+<style>
+/* Brand header */
+.app-header {padding: 8px 0 2px 0; border-bottom: 1px solid #e6e6e6;}
+.app-title {font-size: 26px; font-weight: 700; letter-spacing:.2px;}
+.app-subtitle {color:#666; font-size:14px;}
+/* Section titles tighter */
+h2, h3 {margin-top: 0.6rem; margin-bottom: 0.4rem;}
+/* Dataframe rounded corners */
+.block-container .stDataFrame, .block-container .stTable {border-radius: 8px; overflow: hidden;}
+/* Buttons spacing */
+.stButton>button {border-radius: 6px;}
+/* Sidebar badges */
+.kpi {font-weight:600;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="app-header">
+  <div class="app-title">🧭 Product Mapping Dashboard</div>
+  <div class="app-subtitle">Images → Titles → Arabic → Categorization → Export</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ============================== REQUIRED COLUMNS ==========================
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
-    "thumbnail",  # column W should be named exactly this
+    "thumbnail",
 ]
 
-# ---------- API clients ----------
+# ============================== API CLIENTS ===============================
 # DeepL
 translator = None
 deepl_active = False
@@ -50,13 +83,13 @@ except Exception:
     openai_client = None
     openai_active = False
 
-# ---------- Key status ----------
+# Sidebar API status
 with st.sidebar:
-    st.markdown("### 🔑 API Key Status")
+    st.markdown("### 🔑 API Keys")
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
     st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
 
-# ---------- File IO ----------
+# ============================== FILE IO ===================================
 def read_any_table(uploaded_file):
     if uploaded_file is None:
         return None
@@ -74,7 +107,7 @@ def validate_columns(df, required_cols: Iterable[str], label: str) -> bool:
         return False
     return True
 
-# ---------- Helpers ----------
+# ============================== HELPERS ===================================
 def strip_markdown(s: str) -> str:
     if not isinstance(s, str): return ""
     s = re.sub(r"[*_`]+", "", s)
@@ -104,7 +137,7 @@ def _normalize_url(u: str) -> str:
     if p.query:
         parts = []
         for kv in p.query.split("&"):
-            if kv == "": continue
+            if not kv: continue
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 parts.append(f"{quote(k, safe=':/@')}={quote(v, safe=':/@')}")
@@ -146,7 +179,7 @@ def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
         except Exception:
             return None
 
-# ---------- OpenAI: image → EN short title ----------
+# ============================== OPENAI & TRANSLATION ======================
 def openai_title_from_image(url: str, max_chars: int) -> str:
     if not openai_active or not is_valid_url(url): return ""
     prompt = (
@@ -171,7 +204,6 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
     except Exception:
         return ""
 
-# ---------- Translation ----------
 def deepl_batch_en2ar(texts: List[str]) -> List[str]:
     if not translator: return list(texts)
     try:
@@ -208,7 +240,7 @@ def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> p
         return pd.Series(out_all, index=titles_en.index)
     return titles_en.copy()
 
-# ---------- Mapping ----------
+# ============================== MAPPING LOOKUPS ===========================
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
         if c in map_df.columns: map_df[c] = map_df[c].astype(str).str.strip()
@@ -227,7 +259,7 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main, sub), "")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main, sub, ssub), "")
 
-# ---------- Excel download ----------
+# ============================== DOWNLOAD ==================================
 def to_excel_download(df, sheet_name="Products"):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -235,15 +267,12 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-# ---------- Token helpers for auto-groups ----------
+# ============================== TOKENS ====================================
 STOP={"the","and","for","with","of","to","in","on","by","a","an","&","-","ml","g","kg","l","oz","pcs","pc","pack","pkt","ct","size","new","extra","x"}
 def tokenize(name): 
     return [t for t in re.split(r"[^A-Za-z0-9]+", str(name).lower()) if t and t not in STOP and len(t)>2 and not t.isdigit()]
 
-# ---------- UI ----------
-st.title("🛒 Product Mapper: Images → EN Title → AR → Grouping")
-
-# Upload
+# ============================== UPLOAD ====================================
 c1,c2 = st.columns(2)
 with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
 with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
@@ -261,20 +290,50 @@ if "work" not in st.session_state:
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---------- Session stores ----------
+# ============================== SIDEBAR ANALYTICS =========================
+def mapping_stats(df: pd.DataFrame):
+    mapped_mask = df["sub_category_id"].astype(str).str.strip().ne("") & df["sub_sub_category_id"].astype(str).str.strip().ne("")
+    total = len(df)
+    mapped = int(mapped_mask.sum())
+    unmapped = total - mapped
+    pct = 0 if total == 0 else round(mapped*100/total, 1)
+    named = int(df["name"].astype(str).str.strip().ne("").sum())
+    titled_pct = 0 if total == 0 else round(named*100/total, 1)
+    return total, mapped, unmapped, pct, named, titled_pct
+
+with st.sidebar:
+    st.markdown("### 📊 Overview")
+    total, mapped, unmapped, pct, named, titled_pct = mapping_stats(work)
+    cA, cB = st.columns(2)
+    with cA:
+        st.metric("Total rows", total)
+        st.metric("Mapped rows", mapped, f"{pct}%")
+    with cB:
+        st.metric("Unmapped rows", unmapped)
+        st.metric("Titled rows (EN)", named, f"{titled_pct}%")
+    st.progress(pct/100 if pct else 0.0)
+
+    # Top categories chart (by category_id)
+    st.markdown("#### Top Categories")
+    cat_counts = work["category_id"].astype(str).replace({"": "—"}).value_counts().head(10).rename_axis("category").reset_index(name="count")
+    if len(cat_counts) > 0:
+        st.bar_chart(cat_counts.set_index("category"))
+
+# ============================== SESSION STATE =============================
 st.session_state.setdefault("keyword_rules", [])
 st.session_state.setdefault("keyword_library", [])
+st.session_state.setdefault("page_size", 200)
+st.session_state.setdefault("page_num", 1)
 
-# ---------- Tabs ----------
+# ============================== TABS ======================================
 tab_filter, tab_titles, tab_group, tab_dl, tab_settings = st.tabs(
     ["🔎 Filter", "🖼️ Titles & Translate", "🧩 Grouping", "⬇️ Downloads", "⚙️ Settings"]
 )
 
-# === FILTER TAB ===
+# ------------------------------ FILTER TAB --------------------------------
 with tab_filter:
     st.subheader("Filter view")
 
-    # Search controls
     cA, cB, cC, cD = st.columns([3,2,2,2])
     with cA:
         q = st.text_input("Search query", value=st.session_state.get("search_q",""), placeholder="e.g., dishwashing / صابون / SKU123")
@@ -286,7 +345,6 @@ with tab_filter:
     with cD:
         whole_word = st.checkbox("Whole word", value=False)
 
-    # Unmapped filter
     cE, cF = st.columns([2,2])
     with cE:
         unmapped_only = st.checkbox("Show Unmapped Only", value=st.session_state.get("show_unmapped", False))
@@ -298,7 +356,6 @@ with tab_filter:
             q = ""
             unmapped_only = False
 
-    # Build mask
     def build_filter_mask(df: pd.DataFrame, query: str, fields: List[str], mode: str, whole_word: bool):
         if not query.strip():
             base = pd.Series(True, index=df.index)
@@ -318,13 +375,9 @@ with tab_filter:
                         if f in df.columns:
                             term_mask |= df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(term_mask)
-            if not parts:
-                base = pd.Series(True, index=df.index)
-            else:
-                base = parts[0]
-                for p in parts[1:]:
-                    base = (base & p) if mode == "AND" else (base | p)
-
+            base = parts[0] if parts else pd.Series(True, index=df.index)
+            for p in parts[1:]:
+                base = (base & p) if mode == "AND" else (base | p)
         if unmapped_only:
             unmapped = (
                 (df["sub_category_id"].astype(str).str.strip()=="") |
@@ -342,7 +395,7 @@ with tab_filter:
         use_container_width=True, height=360
     )
 
-# === TITLES & TRANSLATE TAB ===
+# --------------------------- TITLES & TRANSLATE ---------------------------
 with tab_titles:
     st.subheader("Manual: image preview → generate EN title → optional AR")
 
@@ -362,7 +415,6 @@ with tab_titles:
                 with cols[j % 6]:
                     url = _normalize_url(str(row.get("thumbnail", "")))
                     if is_valid_url(url):
-                        # Prefer browser fetch for reliability
                         st.image(url, caption=f"Row {i}", use_container_width=True)
                     else:
                         st.write("No image / bad URL")
@@ -376,7 +428,6 @@ with tab_titles:
                 norm = _normalize_url(u)
                 st.write({"raw": u, "normalized": norm, "valid": is_valid_url(norm)})
 
-    # Selection + actions
     sku_opts = filtered["merchant_sku"].astype(str).tolist()
     sel_skus = st.multiselect("Select SKUs to process", options=sku_opts, default=sku_opts)
 
@@ -396,7 +447,7 @@ with tab_titles:
                     work.at[i, "name"] = title
                     updated += 1
                 prog.progress(k / len(idx))
-                time.sleep(0.05)
+                time.sleep(0.03)
             st.success(f"Generated titles for {updated} row(s).")
 
     if st.button("Translate selected rows' EN titles → AR"):
@@ -409,7 +460,7 @@ with tab_titles:
             work.loc[idx, "name_ar"] = trans
             st.success(f"Translated {len(idx)} row(s) to Arabic.")
 
-# === GROUPING TAB ===
+# ------------------------------- GROUPING ---------------------------------
 with tab_group:
     st.subheader("Keyword Library and Rules")
 
@@ -417,22 +468,25 @@ with tab_group:
 
     with left:
         st.markdown("**Keyword library**")
-        # Library add/remove
         new_kws_text = st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndetergent gel\ndishwashing")
         if st.button("➕ Add to library"):
             fresh = [k.strip() for k in new_kws_text.splitlines() if k.strip()]
             if fresh:
                 existing = set(st.session_state.keyword_library)
                 st.session_state.keyword_library.extend([k for k in fresh if k not in existing])
+                # keep order, de-dupe
+                st.session_state.keyword_library = list(dict.fromkeys(st.session_state.keyword_library))
                 st.success(f"Added {len(fresh)} keyword(s).")
             else:
                 st.info("Nothing to add.")
+
         lib_selected = st.multiselect(
             "Pick keywords from library",
             options=st.session_state.keyword_library,
-            default=st.session_state.keyword_library,
+            default=[],  # do NOT auto-select all
             key="lib_pick_for_rule"
         )
+
         to_remove = st.multiselect("Remove from library", options=st.session_state.keyword_library, key="lib_remove")
         if st.button("🗑️ Remove selected from library"):
             if to_remove:
@@ -452,7 +506,7 @@ with tab_group:
         scope_filtered_only = st.checkbox("Apply within CURRENT filtered view only", value=True)
 
         if st.button("Add rule using selected keywords"):
-            chosen_kws = lib_selected or [k.strip() for k in new_kws_text.splitlines() if k.strip()]
+            chosen_kws = lib_selected if lib_selected else [k.strip() for k in new_kws_text.splitlines() if k.strip()]
             if not chosen_kws:
                 st.warning("Select keywords from library or add some.")
             elif not (k_main and k_sub and k_ssub):
@@ -467,7 +521,6 @@ with tab_group:
                 })
                 st.success(f"Added rule with {len(chosen_kws)} keyword(s).")
 
-        # Existing rules
         if st.session_state.keyword_rules:
             st.divider()
             for idx_rule, rule in enumerate(st.session_state.keyword_rules):
@@ -504,7 +557,6 @@ with tab_group:
                         if not chosen_skus:
                             st.info("No SKUs selected.")
                         else:
-                            # Map back to main DataFrame indices
                             apply_mask = work["merchant_sku"].astype(str).isin(chosen_skus)
                             work.loc[apply_mask,"category_id"] = rule["main"]
                             work.loc[apply_mask,"sub_category_id"] = get_sub_no(lookups, rule["main"], rule["sub"])
@@ -519,7 +571,6 @@ with tab_group:
         else:
             st.info("Add keyword rules to map big buckets fast.")
 
-    # Auto-groups
     st.divider()
     st.subheader("Auto-Groups by feature tokens")
     use_entire = st.checkbox("Build groups from ALL rows (ignore filter)", value=False)
@@ -556,23 +607,28 @@ with tab_group:
     else:
         st.info("No frequent tokens found. Adjust threshold or dataset.")
 
-# === DOWNLOADS TAB ===
+# ------------------------------- DOWNLOADS --------------------------------
 with tab_dl:
     st.subheader("Review & Download")
-    st.write("Filtered view")
-    st.dataframe(
-        filtered[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
-        use_container_width=True, height=320
-    )
-    st.write("Full sheet")
-    st.dataframe(
-        work[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
-        use_container_width=True, height=320
-    )
-    st.download_button("⬇️ Download FULL Excel", to_excel_download(work), file_name="products_mapped.xlsx")
-    st.download_button("⬇️ Download FILTERED Excel", to_excel_download(filtered), file_name="products_filtered.xlsx")
 
-# === SETTINGS TAB ===
+    st.markdown("**Full sheet preview with pagination**")
+    cpg1, cpg2 = st.columns([1,1])
+    with cpg1:
+        st.session_state.page_size = st.number_input("Rows per page", min_value=50, max_value=5000, value=st.session_state.page_size, step=50)
+    total_rows = work.shape[0]
+    total_pages = max(1, math.ceil(total_rows / st.session_state.page_size))
+    with cpg2:
+        st.session_state.page_num = st.number_input("Page", min_value=1, max_value=total_pages, value=min(st.session_state.page_num, total_pages), step=1)
+    start = (st.session_state.page_num - 1) * st.session_state.page_size
+    end = start + st.session_state.page_size
+    page_df = work.iloc[start:end].copy()
+    st.caption(f"Showing rows {start+1}–{min(end,total_rows)} of {total_rows}")
+    st.dataframe(page_df, use_container_width=True, height=360)
+
+    st.download_button("⬇️ Download FULL Excel", to_excel_download(work), file_name="products_mapped.xlsx")
+    st.download_button("⬇️ Download CURRENT PAGE Excel", to_excel_download(page_df), file_name="products_page.xlsx")
+
+# ------------------------------- SETTINGS ---------------------------------
 with tab_settings:
     st.subheader("Diagnostics")
     if st.button("Show 10 sample normalized thumbnail URLs"):
