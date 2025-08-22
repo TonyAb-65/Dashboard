@@ -1,4 +1,4 @@
-# Product Mapping Dashboard – redesigned workflow (fixed fetch_thumb syntax)
+# Product Mapping Dashboard – redesigned workflow (no matplotlib)
 # - Cleaner tabs
 # - Collapsible advanced filter
 # - Keyword Library drives grouping directly
@@ -6,7 +6,7 @@
 # - Batch mapping for multiple selected keywords/tokens
 # - Titles: run on empty only vs force refresh + before/after preview
 # - Sheet tab with pagination and row coloring + quick view toggles
-# - Sidebar analytics: key status, KPIs, pie chart, top unmapped tokens
+# - Sidebar analytics: key status, KPIs, bar chart, top unmapped tokens
 
 import io
 import re
@@ -21,7 +21,6 @@ import streamlit as st
 import requests
 from PIL import Image
 from io import BytesIO
-import matplotlib.pyplot as plt
 
 # ============================== PAGE & THEME ===============================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
@@ -295,11 +294,9 @@ with st.sidebar:
     st.metric("Titled rows (EN)", named, f"{titled_pct}%")
     st.progress(pct/100 if pct else 0.0)
 
-    # Pie chart mapped vs unmapped
-    fig, ax = plt.subplots(figsize=(3.6,3.6))
-    ax.pie([mapped, unmapped], labels=["Mapped","Unmapped"], autopct="%1.0f%%", startangle=90)
-    ax.axis('equal')
-    st.pyplot(fig, use_container_width=False)
+    # Pie-like bar chart using Streamlit native charting
+    st.markdown("#### Mapped vs Unmapped")
+    st.bar_chart(pd.DataFrame({"count":[mapped, unmapped]}, index=["Mapped","Unmapped"]))
 
     # Top unmapped tokens
     st.markdown("#### Top tokens in Unmapped")
@@ -309,8 +306,10 @@ with st.sidebar:
         counts.update(tokenize(r.get("name","")))
         counts.update(tokenize(r.get("name_ar","")))
     top = pd.DataFrame(counts.most_common(5), columns=["token","count"])
-    if len(top)>0: st.table(top)
-    else: st.caption("No tokens found.")
+    if len(top)>0:
+        st.table(top)
+    else:
+        st.caption("No tokens found.")
 
 # ============================== SESSION STATE =============================
 st.session_state.setdefault("keyword_library", [])
