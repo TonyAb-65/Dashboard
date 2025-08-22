@@ -1,11 +1,11 @@
-# Product Mapping Dashboard – batch pipeline + per-file memory
-# - Batch: image→EN titles for all, then EN→AR for all
-# - Scope: All rows or Current filtered view
-# - Caching: remembers results per file hash so re-uploads skip processed rows
-# - New file: cache resets automatically
-# - Vision fix: fetch image bytes locally and send as data URL to OpenAI (works when site blocks hotlinking)
-# - No auto-fetch on upload; explicit Run buttons
-# - Grouping via Keyword Library; Sheet preview with pagination
+# Product Mapping Dashboard – pro UI + fixed unmapped filter + full pipeline + memory + audit
+# - Emerald-green sidebar, clean header
+# - New OVERVIEW tab for KPIs and charts
+# - Unmapped filter fixed (proper NaN/blank handling) in both Filter and Sheet tabs
+# - Batch: image→EN titles (via data URL) → AR translation
+# - Per-file cache by file hash; resets on new upload
+# - Audit log for failures; downloadable
+# - Manual, scope-aware controls
 
 import io
 import re
@@ -25,21 +25,49 @@ from io import BytesIO
 
 # ============================== PAGE & THEME ===============================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
-st.markdown("""
+
+EMERALD = "#10b981"  # emerald green
+BG_DARK = "#0b1721"
+TEXT_LIGHT = "#f3f4f6"
+
+st.markdown(f"""
 <style>
-.app-header {padding:8px 0 6px 0;border-bottom:1px solid #e6e6e6;}
-.app-title {font-size:26px;font-weight:700;letter-spacing:.2px;}
-.app-subtitle {color:#666;font-size:14px;}
-h2,h3{margin-top:.6rem;margin-bottom:.4rem;}
-.stButton>button{border-radius:6px;}
-.small-note{color:#777;font-size:12px;margin-top:-6px}
-.badge{display:inline-block;padding:2px 8px;border-radius:10px;background:#eef;color:#334;font-size:12px;margin-left:6px}
+/* App header */
+.app-header {{padding:10px 0 10px 0;border-bottom:1px solid #e6e6e6;}}
+.app-title {{font-size:28px;font-weight:700;letter-spacing:.2px;}}
+.app-subtitle {{color:#666;font-size:14px;margin-top:2px;}}
+
+/* Sidebar styling */
+[data-testid="stSidebar"] > div:first-child {{
+  background: linear-gradient(180deg, {EMERALD} 0%, #059669 100%);
+  color: {TEXT_LIGHT};
+}}
+[data-testid="stSidebar"] .css-1d391kg, [data-testid="stSidebar"] p, [data-testid="stSidebar"] label {{
+  color: {TEXT_LIGHT} !important;
+}}
+[data-testid="stSidebar"] .stMetric label, [data-testid="stSidebar"] .stMetric span {{
+  color: {TEXT_LIGHT} !important;
+}}
+/* Buttons */
+.stButton>button {{
+  border-radius:8px;
+  border:1px solid #e5e7eb;
+}}
+/* Cards */
+.card {{
+  border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fff;
+}}
+.small-note {{color:#777;font-size:12px;margin-top:-6px}}
+
+/* Tabs spacing */
+.block-container {{padding-top: 12px;}}
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 <div class="app-header">
-  <div class="app-title">🧭 Product Mapping Dashboard <span class="badge">Batch + Memory</span></div>
-  <div class="app-subtitle">Images → Titles → Arabic → Categorization → Export</div>
+  <div class="app-title">🧭 Product Mapping Dashboard</div>
+  <div class="app-subtitle">Images → English Title → Arabic → Categorization → Export</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -78,7 +106,6 @@ except Exception:
     openai_client = None
     openai_active = False
 
-# Sidebar API status
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
@@ -168,9 +195,6 @@ def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
         }
         r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
         r.raise_for_status()
-        content_length = r.headers.get("Content-Length")
-        if content_length and int(content_length) > max_bytes:
-            return None
         data = r.content if r.content else r.raw.read(max_bytes + 1)
         if len(data) > max_bytes:
             return None
@@ -206,7 +230,6 @@ def fetch_image_as_data_url(url: str, timeout=10, max_bytes=8_000_000) -> str:
         data = r.content if r.content else r.raw.read(max_bytes + 1)
         if len(data) > max_bytes:
             return ""
-        # detect format
         try:
             fmt = Image.open(BytesIO(data)).format or "JPEG"
         except Exception:
@@ -221,7 +244,6 @@ def fetch_image_as_data_url(url: str, timeout=10, max_bytes=8_000_000) -> str:
 def openai_title_from_image(url: str, max_chars: int) -> str:
     if not openai_active:
         return ""
-    # convert to data URL to bypass sites that block OpenAI fetch
     data_url = fetch_image_as_data_url(url)
     if not data_url:
         return ""
@@ -247,138 +269,162 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
         content = getattr(choice.message, "content", "") if hasattr(choice, "message") else ""
         title = (content or "").strip()
         return tidy_title(title, max_chars) if title else ""
-    except Exception as e:
-        st.warning(f"OpenAI error: {e}")
+    except Exception:
         return ""
 
 def deepl_batch_en2ar(texts: List[str]) -> List[str]:
     if not translator: return list(texts)
     try:
-        res=translator.translate_text(texts, source_lang="EN", target_lang="AR")
-        return [r.text for r in (res if isinstance(res,list) else [res])]
+        res = translator.translate_text(texts, source_lang="EN", target_lang="AR")
+        return [r.text for r in (res if isinstance(res, list) else [res])]
     except Exception:
         return texts
 
 def openai_translate_batch_en2ar(texts: List[str]) -> List[str]:
     if not openai_active or not texts: return list(texts)
-    sys="Translate e-commerce product titles into natural, concise Arabic."
-    usr="Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
+    sys = "Translate e-commerce product titles into natural, concise Arabic."
+    usr = "Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
     try:
-        resp=openai_client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
             temperature=0,
         )
-        lines=(resp.choices[0].message.content or "").splitlines()
+        lines = (resp.choices[0].message.content or "").splitlines()
         return [l.strip() for l in lines if l.strip()] or texts
-    except Exception as e:
-        st.warning(f"OpenAI translation error: {e}")
+    except Exception:
         return texts
 
 def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> pd.Series:
-    texts=titles_en.fillna("").astype(str).tolist()
-    if engine=="DeepL" and deepl_active: return pd.Series(deepl_batch_en2ar(texts), index=titles_en.index)
-    if engine=="OpenAI":
-        out_all=[]
-        for s in range(0,len(texts),max(1,batch_size)):
-            chunk=texts[s:s+batch_size]
+    texts = titles_en.fillna("").astype(str).tolist()
+    if engine == "DeepL" and deepl_active:
+        return pd.Series(deepl_batch_en2ar(texts), index=titles_en.index)
+    if engine == "OpenAI":
+        out_all = []
+        for s in range(0, len(texts), max(1, batch_size)):
+            chunk = texts[s:s+batch_size]
             out_all.extend(openai_translate_batch_en2ar(chunk))
-            time.sleep(0.2)
-        return pd.Series(out_all,index=titles_en.index)
+            time.sleep(0.15)
+        return pd.Series(out_all, index=titles_en.index)
     return titles_en.copy()
 
 # ============================== MAPPING LOOKUPS ===========================
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
-        if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
-    main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
-    pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
-    sub_no={(r["category_id"],r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
-    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r["sub_sub_category_id NO"] for _,r in map_df.iterrows()}
-    return {
-        "main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
-        "main_to_subnames": main_to_sub,
-        "pair_to_subsubnames": pair_to_subsub,
-        "sub_name_to_no_by_main": sub_no,
-        "ssub_name_to_no_by_main_sub": ssub_no
-    }
-def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
-def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
+        if c in map_df.columns: map_df[c] = map_df[c].astype(str).str.strip()
+    main_to_sub = {str(mc): sorted(g["sub_category_id"].dropna().unique().tolist())
+                   for mc,g in map_df.groupby("category_id", dropna=True)}
+    pair_to_subsub = {(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist())
+                      for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"], dropna=True)}
+    sub_no = {(r["category_id"], r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
+    ssub_no = {(r["category_id"], r["sub_category_id"], r["sub_sub_category_id"]): r["sub_sub_category_id NO"] for _,r in map_df.iterrows()}
+    return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
+            "main_to_subnames": main_to_sub,
+            "pair_to_subsubnames": pair_to_subsub,
+            "sub_name_to_no_by_main": sub_no,
+            "ssub_name_to_no_by_main_sub": ssub_no}
+
+def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main, sub), "")
+def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main, sub, ssub), "")
 
 # ============================== DOWNLOAD ==================================
 def to_excel_download(df, sheet_name="Products"):
-    buf=io.BytesIO()
+    buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
-    buf.seek(0); return buf
+    buf.seek(0)
+    return buf
 
 # ============================== UPLOAD ====================================
-c1,c2=st.columns(2)
+c1, c2 = st.columns(2)
 with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
 with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
 
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"Product List")
-        and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
+if not (prod_df is not None and validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List")
+        and map_df is not None and validate_columns(map_df, ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"], "Category Mapping")):
     st.stop()
 
-# ------------- Per-file memory: initialize/reset on file change -----------
+# ------------- Per-file memory & audit -----------
 st.session_state.setdefault("file_hash", None)
 st.session_state.setdefault("proc_cache", {})   # {sku: {"name": EN, "name_ar": AR}}
+st.session_state.setdefault("audit_rows", [])   # list of dicts for failures or skips
 current_hash = hash_uploaded_file(product_file)
 
 if st.session_state.file_hash != current_hash:
     st.session_state.work = prod_df.copy()
     st.session_state.proc_cache = {}
+    st.session_state.audit_rows = []
     st.session_state.file_hash = current_hash
 
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
-# ============================== SIDEBAR ANALYTICS =========================
+# ============================== UTIL: mapped/unmapped masks ===============
+def is_nonempty_series(s: pd.Series) -> pd.Series:
+    return s.notna() & s.astype(str).str.strip().ne("")
+
+def mapped_mask_fn(df: pd.DataFrame) -> pd.Series:
+    return is_nonempty_series(df["sub_category_id"].fillna("")) & is_nonempty_series(df["sub_sub_category_id"].fillna(""))
+
+def unmapped_mask_fn(df: pd.DataFrame) -> pd.Series:
+    # unmapped if either sub or sub-sub is empty or NaN
+    sub_ok  = is_nonempty_series(df["sub_category_id"].fillna(""))
+    ssub_ok = is_nonempty_series(df["sub_sub_category_id"].fillna(""))
+    return ~(sub_ok & ssub_ok)
+
+# ============================== OVERVIEW TAB FIRST ========================
+tab_overview, tab_filter, tab_titles, tab_group, tab_sheet, tab_dl, tab_settings = st.tabs(
+    ["📊 Overview", "🔎 Filter", "🖼️ Titles & Translate", "🧩 Grouping", "📑 Sheet", "⬇️ Downloads", "⚙️ Settings"]
+)
+
 def mapping_stats(df: pd.DataFrame):
-    mapped_mask = df["sub_category_id"].astype(str).str.strip().ne("") & df["sub_sub_category_id"].astype(str).str.strip().ne("")
+    mapped_mask = mapped_mask_fn(df)
     total=len(df); mapped=int(mapped_mask.sum()); unmapped=total-mapped
     pct=0 if total==0 else round(mapped*100/total,1)
-    named=int(df["name"].astype(str).str.strip().ne("").sum())
+    named=int(is_nonempty_series(df["name"].fillna("")).sum())
     titled_pct=0 if total==0 else round(named*100/total,1)
-    return total,mapped,unmapped,pct,named,titled_pct,mapped_mask
+    en_missing = int((~is_nonempty_series(df["name"].fillna(""))).sum())
+    ar_missing = int((~is_nonempty_series(df["name_ar"].fillna(""))).sum())
+    return total,mapped,unmapped,pct,named,titled_pct,en_missing,ar_missing,mapped_mask
 
-total,mapped,unmapped,pct,named,titled_pct,mapped_mask = mapping_stats(work)
+with tab_overview:
+    st.subheader("Overview")
+    total,mapped,unmapped,pct,named,titled_pct,en_missing,ar_missing,global_mmask = mapping_stats(work)
+    k1,k2,k3,k4 = st.columns(4)
+    with k1: st.metric("Total rows", total)
+    with k2: st.metric("Mapped rows", mapped, f"{pct}%")
+    with k3: st.metric("EN titled", named, f"{titled_pct}%")
+    with k4: st.metric("Unmapped rows", unmapped)
 
-with st.sidebar:
-    st.markdown("### 📊 Overview")
-    st.metric("Total rows", total)
-    st.metric("Mapped rows", mapped, f"{pct}%")
-    st.metric("Unmapped rows", unmapped)
-    st.metric("Titled rows (EN)", named, f"{titled_pct}%")
-    st.progress(pct/100 if pct else 0.0)
+    cA,cB = st.columns(2)
+    with cA:
+        st.markdown("**Mapped vs Unmapped**")
+        st.bar_chart(pd.DataFrame({"count":[mapped, unmapped]}, index=["Mapped","Unmapped"]))
+    with cB:
+        st.markdown("**Missing coverage**")
+        st.bar_chart(pd.DataFrame({"count":[en_missing, ar_missing]}, index=["Missing EN","Missing AR"]))
 
-    st.markdown("#### Mapped vs Unmapped")
-    st.bar_chart(pd.DataFrame({"count":[mapped, unmapped]}, index=["Mapped","Unmapped"]))
-
-    st.markdown("#### Cache")
-    st.caption(f"Cached SKUs: {len(st.session_state.proc_cache)}")
-
-# ============================== SESSION STATE =============================
-st.session_state.setdefault("keyword_library", [])
-st.session_state.setdefault("page_size", 200)
-st.session_state.setdefault("page_num", 1)
-st.session_state.setdefault("search_q", "")
-st.session_state.setdefault("show_unmapped", False)
-
-# ============================== TABS ======================================
-tab_filter, tab_titles, tab_group, tab_sheet, tab_dl, tab_settings = st.tabs(
-    ["🔎 Filter", "🖼️ Titles & Translate", "🧩 Grouping", "📑 Sheet", "⬇️ Downloads", "⚙️ Settings"]
-)
+    # Top tokens among unmapped
+    st.markdown("**Top tokens in Unmapped**")
+    unm_df = work[~global_mmask].copy()
+    counts = Counter()
+    for _, r in unm_df.iterrows():
+        counts.update(tokenize(r.get("name","")))
+        counts.update(tokenize(r.get("name_ar","")))
+    top = pd.DataFrame(counts.most_common(12), columns=["token","count"])
+    if len(top)>0:
+        st.dataframe(top, use_container_width=True, height=280)
+    else:
+        st.caption("No tokens found.")
 
 # ------------------------------ FILTER TAB --------------------------------
 with tab_filter:
     st.subheader("Filter view")
 
-    q = st.text_input("Search", value=st.session_state["search_q"], placeholder="e.g., dishwashing / صابون / SKU123")
+    q = st.text_input("Search", value=st.session_state.get("search_q",""), placeholder="e.g., dishwashing / صابون / SKU123")
     st.session_state["search_q"] = q
 
     with st.expander("Advanced search", expanded=False):
@@ -393,7 +439,7 @@ with tab_filter:
 
     cE, cF, cG = st.columns([2,2,2])
     with cE:
-        unmapped_only = st.checkbox("Show Unmapped Only", value=st.session_state["show_unmapped"])
+        unmapped_only = st.checkbox("Show Unmapped Only", value=st.session_state.get("show_unmapped", False))
         st.session_state["show_unmapped"] = unmapped_only
     with cF:
         if st.button("Clear filters"):
@@ -426,9 +472,8 @@ with tab_filter:
             base = parts[0] if parts else pd.Series(True, index=df.index)
             for p in parts[1:]:
                 base = (base & p) if mode == "AND" else (base | p)
-        if unmapped_only:
-            unmapped_mask = (df["sub_category_id"].astype(str).str.strip()=="") | (df["sub_sub_category_id"].astype(str).str.strip()=="")
-            base = base & unmapped_mask
+        if st.session_state["show_unmapped"]:
+            base = base & unmapped_mask_fn(df)
         return base
 
     fields = locals().get("fields", ["name","name_ar"])
@@ -452,16 +497,23 @@ with tab_titles:
     with c3: only_empty = st.checkbox("Run only on empty EN titles", value=True)
     with c4: force_refresh = st.checkbox("Force overwrite", value=False)
 
-    scope = st.radio("Scope for processing", ["All rows", "Current filtered view"], horizontal=True)
+    scope = st.radio("Scope", ["All rows", "Current filtered view"], horizontal=True)
+    base_scope = work if scope=="All rows" else filtered
 
     c5,c6 = st.columns(2)
-    with c5: fetch_batch = st.number_input("Batch size (image→EN title)", min_value=10, max_value=300, value=80, step=10)
-    with c6: trans_batch = st.number_input("Batch size (EN→AR)", min_value=10, max_value=300, value=120, step=10)
+    with c5: fetch_batch = st.number_input("Batch size (image→EN title)", min_value=10, max_value=300, value=100, step=10)
+    with c6: trans_batch = st.number_input("Batch size (EN→AR)", min_value=10, max_value=300, value=150, step=10)
 
-    st.caption("Manual image preview")
+    # Coverage
+    if st.button("Scan coverage in scope"):
+        sc = base_scope.copy()
+        en_missing = int((~is_nonempty_series(sc["name"].fillna(""))).sum())
+        ar_missing = int((~is_nonempty_series(sc["name_ar"].fillna(""))).sum())
+        st.info(f"Scope rows: {len(sc)} | Missing EN: {en_missing} | Missing AR: {ar_missing}")
+
+    # Preview
     if st.button("Preview first 24 images in scope"):
-        base = work if scope=="All rows" else filtered
-        view=base.head(24).copy()
+        view=base_scope.head(24).copy()
         if "thumbnail" in view.columns and len(view)>0:
             cols=st.columns(6)
             for j,(i,row) in enumerate(view.iterrows()):
@@ -472,104 +524,117 @@ with tab_titles:
         else:
             st.info("No thumbnails in scope.")
 
-    def iter_indices_for_scope():
-        base = work if scope=="All rows" else filtered
-        return base.index.tolist()
+    def indices_for_scope(df: pd.DataFrame) -> List[int]:
+        return df.index.tolist()
 
+    # Workers
+    def run_titles_on_indices(idx_list: List[int]):
+        updated_en = 0; skipped_en = 0; failed_en = 0
+        prog = st.progress(0.0, text="Generating English titles from images…")
+        for s in range(0, len(idx_list), fetch_batch):
+            chunk = idx_list[s:s+fetch_batch]
+            for i in chunk:
+                sku = str(work.at[i,"merchant_sku"])
+                cached = st.session_state.proc_cache.get(sku, {})
+                current_en = str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else ""
+                current_en = current_en.strip()
+                url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+
+                if not force_refresh and cached.get("name"):
+                    work.at[i,"name"] = cached["name"]
+                    skipped_en += 1
+                    continue
+                if only_empty and current_en and not force_refresh:
+                    skipped_en += 1
+                    st.session_state.proc_cache.setdefault(sku, {})["name"] = current_en
+                    continue
+
+                title = openai_title_from_image(url, max_len) if url else ""
+                if title:
+                    work.at[i,"name"] = title
+                    st.session_state.proc_cache.setdefault(sku, {})["name"] = title
+                    updated_en += 1
+                else:
+                    failed_en += 1
+                    st.session_state.audit_rows.append({"sku": sku, "phase": "EN title", "reason": "no title or fetch failed", "url": url})
+            prog.progress(min((s+len(chunk))/len(idx_list), 1.0))
+            time.sleep(0.02)
+        st.success(f"EN titles → updated: {updated_en}, skipped: {skipped_en}, failed: {failed_en}")
+
+    def run_translations_on_indices(idx_list: List[int]):
+        if engine not in ("DeepL","OpenAI"):
+            st.info("Translation engine set to None. Skipped EN→AR.")
+            return
+        to_translate_idx, to_translate_texts = [], []
+        for i in idx_list:
+            sku = str(work.at[i,"merchant_sku"])
+            cached = st.session_state.proc_cache.get(sku, {})
+            current_ar = str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else ""
+            current_ar = current_ar.strip()
+            en = str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else ""
+            en = en.strip()
+
+            if not en:
+                st.session_state.audit_rows.append({"sku": sku, "phase": "AR translate", "reason": "missing EN", "url": str(work.at[i,"thumbnail"])})
+                continue
+            if not force_refresh and cached.get("name_ar"):
+                work.at[i,"name_ar"] = cached["name_ar"]
+                continue
+            if force_refresh or not current_ar:
+                to_translate_idx.append(i)
+                to_translate_texts.append(en)
+
+        updated_ar = 0; failed_ar = 0
+        if to_translate_texts:
+            prog2 = st.progress(0.0, text="Translating EN → AR…")
+            out_all = []
+            for s in range(0, len(to_translate_texts), trans_batch):
+                chunk = to_translate_texts[s:s+trans_batch]
+                trans = translate_en_titles(pd.Series(chunk), engine, batch_size=trans_batch)
+                out_all.extend(trans.tolist())
+                prog2.progress(min((s+len(chunk))/len(to_translate_texts), 1.0))
+                time.sleep(0.02)
+            for j, i in enumerate(to_translate_idx):
+                ar = out_all[j] if j < len(out_all) else ""
+                if ar:
+                    work.at[i,"name_ar"] = ar
+                    sku = str(work.at[i,"merchant_sku"])
+                    st.session_state.proc_cache.setdefault(sku, {})["name_ar"] = ar
+                    updated_ar += 1
+                else:
+                    failed_ar += 1
+                    st.session_state.audit_rows.append({"sku": str(work.at[i,"merchant_sku"]), "phase": "AR translate", "reason": "model returned empty", "url": str(work.at[i,"thumbnail"])})
+        st.success(f"AR translations → updated: {updated_ar}, failed: {failed_ar}")
+
+    # Buttons
     if st.button("Run FULL pipeline on scope (Image→EN, then EN→AR)"):
-        idx_list = iter_indices_for_scope()
-        if not idx_list:
-            st.info("No rows in scope.")
+        ids = indices_for_scope(base_scope)
+        if not ids: st.info("No rows in scope.")
         else:
-            # A) Image→EN titles (batched)
-            updated_en = 0; skipped_en = 0
-            prog = st.progress(0.0, text="Generating English titles from images…")
-            for s in range(0, len(idx_list), fetch_batch):
-                chunk = idx_list[s:s+fetch_batch]
-                for i in chunk:
-                    sku = str(work.at[i,"merchant_sku"])
-                    cached = st.session_state.proc_cache.get(sku, {})
-                    current_en = str(work.at[i,"name"]).strip()
-                    url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+            run_titles_on_indices(ids)
+            run_translations_on_indices(ids)
 
-                    if not force_refresh and cached.get("name"):
-                        work.at[i,"name"] = cached["name"]
-                        skipped_en += 1
-                        continue
-                    if only_empty and current_en and not force_refresh:
-                        skipped_en += 1
-                        st.session_state.proc_cache.setdefault(sku, {})["name"] = current_en
-                        continue
+    colm1, colm2 = st.columns(2)
+    with colm1:
+        if st.button("Run ONLY for MISSING EN in scope"):
+            ids = indices_for_scope(base_scope[~is_nonempty_series(base_scope["name"].fillna(""))])
+            if not ids: st.info("Nothing missing for EN in scope.")
+            else: run_titles_on_indices(ids)
+    with colm2:
+        if st.button("Run ONLY for MISSING AR in scope"):
+            ids = indices_for_scope(base_scope[~is_nonempty_series(base_scope["name_ar"].fillna(""))])
+            if not ids: st.info("Nothing missing for AR in scope.")
+            else: run_translations_on_indices(ids)
 
-                    title = openai_title_from_image(url, max_len) if url else ""
-                    if title:
-                        work.at[i,"name"] = title
-                        st.session_state.proc_cache.setdefault(sku, {})["name"] = title
-                        updated_en += 1
-                prog.progress(min((s+len(chunk))/len(idx_list), 1.0))
-                time.sleep(0.05)
-            st.success(f"EN titles: {updated_en} updated, {skipped_en} skipped.")
-
-            # B) EN→AR translate (batched)
-            if engine in ("DeepL","OpenAI"):
-                idx_list = iter_indices_for_scope()
-                texts = []
-                final_idx = []
-                for i in idx_list:
-                    sku = str(work.at[i,"merchant_sku"])
-                    cached = st.session_state.proc_cache.get(sku, {})
-                    current_ar = str(work.at[i,"name_ar"]).strip()
-                    en = str(work.at[i,"name"]).strip()
-                    if not force_refresh and cached.get("name_ar"):
-                        work.at[i,"name_ar"] = cached["name_ar"]
-                        continue
-                    if en and (force_refresh or not current_ar):
-                        texts.append(en)
-                        final_idx.append(i)
-
-                updated_ar = 0
-                if texts:
-                    prog2 = st.progress(0.0, text="Translating EN → AR…")
-                    out_all = []
-                    for s in range(0, len(texts), trans_batch):
-                        chunk = texts[s:s+trans_batch]
-                        trans = translate_en_titles(pd.Series(chunk), engine, batch_size=trans_batch)
-                        out_all.extend(trans.tolist())
-                        prog2.progress(min((s+len(chunk))/len(texts), 1.0))
-                        time.sleep(0.05)
-                    for j, i in enumerate(final_idx):
-                        ar = out_all[j] if j < len(out_all) else ""
-                        if ar:
-                            work.at[i,"name_ar"] = ar
-                            sku = str(work.at[i,"merchant_sku"])
-                            st.session_state.proc_cache.setdefault(sku, {})["name_ar"] = ar
-                            updated_ar += 1
-                st.success(f"AR translations: {updated_ar} updated.")
-            else:
-                st.info("Translation engine set to None. Skipped EN→AR.")
-
-    # Optional: per-selection preview
-    st.markdown("#### Optional: per-selection preview")
-    base = work if scope=="All rows" else filtered
-    sku_opts=base["merchant_sku"].astype(str).tolist()
-    sel_skus=st.multiselect("Select SKUs to preview", options=sku_opts, default=sku_opts[:50])
-
-    if st.button("Preview EN titles (before → after) for selected"):
-        idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
-        previews=[]
-        for i in idx:
-            current_en = str(work.at[i,"name"]).strip()
-            url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
-            new= openai_title_from_image(url,max_len) if url else ""
-            previews.append({"merchant_sku": work.at[i,"merchant_sku"], "EN_before": current_en, "EN_after_preview": new})
-        if previews:
-            st.dataframe(pd.DataFrame(previews), use_container_width=True, height=320)
-        else:
-            st.info("Nothing to preview.")
+    if st.session_state.audit_rows:
+        audit_df = pd.DataFrame(st.session_state.audit_rows)
+        st.download_button("⬇️ Download audit log CSV", data=audit_df.to_csv(index=False).encode("utf-8"),
+                           file_name="audit_log.csv", mime="text/csv")
 
 # ------------------------------- GROUPING ---------------------------------
 with tab_group:
     st.subheader("Grouping via keywords")
+    st.session_state.setdefault("keyword_library", [])
     left,right = st.columns([1,2])
 
     with left:
@@ -595,13 +660,13 @@ with tab_group:
     with right:
         st.markdown("**Select keywords/tokens to group and map**")
         scope_filtered_only = st.checkbox("Scope = CURRENT filtered view", value=True)
-        base_df = filtered if scope_filtered_only else work
-
+        base_df = (work[unmapped_mask_fn(work)] if scope_filtered_only else work)
+        # Auto tokens
         tok_counts = Counter()
         for _, r in base_df.iterrows():
             tok_counts.update(tokenize(r.get("name","")))
             tok_counts.update(tokenize(r.get("name_ar","")))
-        auto_candidates = [t for t,c in tok_counts.most_common() if c>=3][:50]
+        auto_candidates = [t for t,c in tok_counts.most_common() if c>=3][:60]
 
         def hit_count(df: pd.DataFrame, term: str) -> int:
             term_l = term.lower()
@@ -659,12 +724,15 @@ with tab_sheet:
 
     view_mode = st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True)
     base_df = work.copy()
-    mapped_mask_v = base_df["sub_category_id"].astype(str).str.strip().ne("") & base_df["sub_sub_category_id"].astype(str).str.strip().ne("")
+    mapped_mask_v = mapped_mask_fn(base_df)
     if view_mode == "Mapped only":
         base_df = base_df[mapped_mask_v]
     elif view_mode == "Unmapped only":
         base_df = base_df[~mapped_mask_v]
 
+    # Pagination
+    st.session_state.setdefault("page_size", 200)
+    st.session_state.setdefault("page_num", 1)
     st.session_state.page_size = st.number_input("Rows per page", min_value=50, max_value=5000, value=st.session_state.page_size, step=50)
     total_rows = base_df.shape[0]
     total_pages = max(1, math.ceil(total_rows / st.session_state.page_size))
@@ -675,8 +743,10 @@ with tab_sheet:
     st.caption(f"Showing rows {start+1}–{min(end,total_rows)} of {total_rows}")
 
     def style_map(row):
-        is_mapped = str(row.get("sub_category_id","")).strip() != "" and str(row.get("sub_sub_category_id","")).strip() != ""
-        color = "background-color: rgba(0,200,130,0.08)" if is_mapped else "background-color: rgba(255,215,0,0.18)"
+        sub_ok  = str(row.get("sub_category_id","") or "").strip() != ""
+        ssub_ok = str(row.get("sub_sub_category_id","") or "").strip() != ""
+        is_mapped = sub_ok and ssub_ok
+        color = "background-color: rgba(16,185,129,0.10)" if is_mapped else "background-color: rgba(234,179,8,0.18)"
         return [color for _ in row]
 
     term = st.session_state.get("search_q","").strip().lower()
@@ -690,7 +760,7 @@ with tab_sheet:
 
     if len(page_df) > 0:
         styler = page_df.style.apply(style_map, axis=1).applymap(cell_highlight, subset=["name","name_ar"])
-        st.dataframe(styler, use_container_width=True, height=420)
+        st.dataframe(styler, use_container_width=True, height=440)
     else:
         st.info("No rows to display.")
 
@@ -699,15 +769,22 @@ with tab_dl:
     st.subheader("Download")
     st.download_button("⬇️ Download FULL Excel", to_excel_download(work), file_name="products_mapped.xlsx")
     st.download_button("⬇️ Download CURRENT VIEW Excel", to_excel_download(page_df), file_name="products_view.xlsx")
+    if st.session_state.audit_rows:
+        audit_df = pd.DataFrame(st.session_state.audit_rows)
+        st.download_button("⬇️ Download audit log CSV", data=audit_df.to_csv(index=False).encode("utf-8"),
+                           file_name="audit_log.csv", mime="text/csv")
 
 # ------------------------------- SETTINGS ---------------------------------
 with tab_settings:
     st.subheader("Diagnostics")
-    if st.button("Show 10 sample normalized thumbnail URLs"):
-        sample = work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
-        for u in sample:
-            norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
-
-    if st.button("Clear cache for THIS file"):
-        st.session_state.proc_cache = {}
-        st.success("Cleared per-file cache.")
+    c1,c2 = st.columns(2)
+    with c1:
+        if st.button("Show 10 sample normalized thumbnail URLs"):
+            sample = work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
+            for u in sample:
+                norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
+    with c2:
+        if st.button("Clear cache for THIS file"):
+            st.session_state.proc_cache = {}
+            st.session_state.audit_rows = []
+            st.success("Cleared per-file cache.")
