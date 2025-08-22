@@ -1,4 +1,4 @@
-# Product Mapping Dashboard – redesigned workflow
+# Product Mapping Dashboard – redesigned workflow (fixed fetch_thumb syntax)
 # - Cleaner tabs
 # - Collapsible advanced filter
 # - Keyword Library drives grouping directly
@@ -147,23 +147,36 @@ def _normalize_url(u: str) -> str:
 
 def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
     try:
-        if not is_valid_url(url): return None
+        if not is_valid_url(url):
+            return None
         url = _normalize_url(url)
         origin = urlsplit(url).netloc
-        headers={"User-Agent":"Mozilla/5.0","Accept":"image/avif,image/webp,image/apng,image/*,*/*;q=0.8","Referer":f"https://{origin}"}
-        r=requests.get(url,timeout=timeout,headers=headers,allow_redirects=True,stream=True)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": f"https://{origin}"
+        }
+        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
         r.raise_for_status()
-        content_length=r.headers.get("Content-Length")
-        if content_length and int(content_length)>max_bytes: return None
-        data=r.content if r.content else r.raw.read(max_bytes+1)
-        if len(data)>max_bytes: return None
-        img=Image.open(BytesIO(data)).convert("RGB"); img.thumbnail((256,256)); return img
+        content_length = r.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
+            return None
+        data = r.content if r.content else r.raw.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        img = Image.open(BytesIO(data)).convert("RGB")
+        img.thumbnail((256, 256))
+        return img
     except Exception:
         try:
-            r=requests.get(url,timeout=timeout,headers={"User-Agent":"Mozilla/5.0"},allow_redirects=True)
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
             r.raise_for_status()
-            data=r.content[:max_bytes+1]; if len(data)>max_bytes: return None
-            img=Image.open(BytesIO(data)).convert("RGB"); img.thumbnail((256,256)); return img
+            data = r.content[:max_bytes + 1]
+            if len(data) > max_bytes:
+                return None
+            img = Image.open(BytesIO(data)).convert("RGB")
+            img.thumbnail((256, 256))
+            return img
         except Exception:
             return None
 
@@ -403,7 +416,6 @@ with tab_titles:
     sku_opts=filtered["merchant_sku"].astype(str).tolist()
     sel_skus=st.multiselect("Select SKUs to process", options=sku_opts, default=sku_opts)
 
-    # Preview before/after
     if st.button("Preview EN titles (before → after)"):
         idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
         previews=[]
@@ -424,7 +436,7 @@ with tab_titles:
             updated=0
             prog=st.progress(0.0)
             for k,i in enumerate(idx,1):
-                if only_empty and str(work.at[i,"name"]).strip(): 
+                if only_empty and str(work.at[i,"name"]).strip():
                     prog.progress(k/len(idx)); continue
                 url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
                 title=openai_title_from_image(url,max_len) if url else ""
@@ -544,11 +556,11 @@ with tab_sheet:
     # Quick view toggles
     view_mode = st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True)
     base_df = work.copy()
-    mapped_mask = base_df["sub_category_id"].astype(str).str.strip().ne("") & base_df["sub_sub_category_id"].astype(str).str.strip().ne("")
+    mapped_mask_v = base_df["sub_category_id"].astype(str).str.strip().ne("") & base_df["sub_sub_category_id"].astype(str).str.strip().ne("")
     if view_mode == "Mapped only":
-        base_df = base_df[mapped_mask]
+        base_df = base_df[mapped_mask_v]
     elif view_mode == "Unmapped only":
-        base_df = base_df[~mapped_mask]
+        base_df = base_df[~mapped_mask_v]
 
     # Pagination
     st.session_state.page_size = st.number_input("Rows per page", min_value=50, max_value=5000, value=st.session_state.page_size, step=50)
@@ -566,7 +578,7 @@ with tab_sheet:
         color = "background-color: rgba(0,200,130,0.08)" if is_mapped else "background-color: rgba(255,215,0,0.18)"
         return [color for _ in row]
 
-    # Term highlight on name fields (color whole cell if matches)
+    # Term highlight on name fields
     term = st.session_state.get("search_q","").strip().lower()
     def cell_highlight(v):
         if not term: return ""
