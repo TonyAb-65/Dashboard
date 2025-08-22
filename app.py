@@ -3,6 +3,7 @@
 # - Scope: All rows or Current filtered view
 # - Caching: remembers results per file hash so re-uploads skip processed rows
 # - New file: cache resets automatically
+# - Vision fix: fetch image bytes locally and send as data URL to OpenAI (works when site blocks hotlinking)
 # - No auto-fetch on upload; explicit Run buttons
 # - Grouping via Keyword Library; Sheet preview with pagination
 
@@ -11,6 +12,7 @@ import re
 import time
 import math
 import hashlib
+import base64
 from typing import List, Iterable, Dict, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -98,14 +100,12 @@ def validate_columns(df, required_cols: Iterable[str], label: str) -> bool:
     return True
 
 def hash_uploaded_file(uploaded_file) -> str:
-    """Stable file signature to decide cache reuse."""
     try:
         uploaded_file.seek(0)
         data = uploaded_file.read()
         uploaded_file.seek(0)
         return hashlib.sha256(data).hexdigest()
     except Exception:
-        # Fallback to name + size if stream not readable twice
         return hashlib.sha256(str(uploaded_file.name).encode()).hexdigest()
 
 # ============================== HELPERS ===================================
@@ -190,9 +190,40 @@ def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
         except Exception:
             return None
 
+def fetch_image_as_data_url(url: str, timeout=10, max_bytes=8_000_000) -> str:
+    """Download image and return data URL to avoid remote hotlink issues."""
+    try:
+        if not is_valid_url(url):
+            return ""
+        url = _normalize_url(url)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": f"https://{urlsplit(url).netloc}"
+        }
+        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        data = r.content if r.content else r.raw.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return ""
+        # detect format
+        try:
+            fmt = Image.open(BytesIO(data)).format or "JPEG"
+        except Exception:
+            fmt = "JPEG"
+        mime = "image/jpeg" if fmt.upper() in ("JPG","JPEG") else f"image/{fmt.lower()}"
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return ""
+
 # ============================== OPENAI & TRANSLATION ======================
 def openai_title_from_image(url: str, max_chars: int) -> str:
-    if not openai_active or not is_valid_url(url):
+    if not openai_active:
+        return ""
+    # convert to data URL to bypass sites that block OpenAI fetch
+    data_url = fetch_image_as_data_url(url)
+    if not data_url:
         return ""
     prompt = (
         "Look at the product photo and return ONE short English title only. "
@@ -206,7 +237,7 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
                 {"role": "system", "content": "You are a precise e-commerce title writer."},
                 {"role": "user", "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": _normalize_url(url)}},
+                    {"type": "image_url", "image_url": {"url": data_url}},
                 ]},
             ],
             temperature=0,
@@ -299,7 +330,6 @@ st.session_state.setdefault("proc_cache", {})   # {sku: {"name": EN, "name_ar": 
 current_hash = hash_uploaded_file(product_file)
 
 if st.session_state.file_hash != current_hash:
-    # New file uploaded → reset working copy and cache
     st.session_state.work = prod_df.copy()
     st.session_state.proc_cache = {}
     st.session_state.file_hash = current_hash
@@ -442,7 +472,6 @@ with tab_titles:
         else:
             st.info("No thumbnails in scope.")
 
-    # ----- Batch pipeline: titles for all in scope, then translate all -----
     def iter_indices_for_scope():
         base = work if scope=="All rows" else filtered
         return base.index.tolist()
@@ -463,20 +492,15 @@ with tab_titles:
                     current_en = str(work.at[i,"name"]).strip()
                     url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
 
-                    # Skip if cached and not forcing overwrite
                     if not force_refresh and cached.get("name"):
                         work.at[i,"name"] = cached["name"]
                         skipped_en += 1
                         continue
-
-                    # Skip if only_empty and title already exists and not forcing overwrite
                     if only_empty and current_en and not force_refresh:
                         skipped_en += 1
-                        # write to cache for future
                         st.session_state.proc_cache.setdefault(sku, {})["name"] = current_en
                         continue
 
-                    # Generate title
                     title = openai_title_from_image(url, max_len) if url else ""
                     if title:
                         work.at[i,"name"] = title
@@ -486,7 +510,7 @@ with tab_titles:
                 time.sleep(0.05)
             st.success(f"EN titles: {updated_en} updated, {skipped_en} skipped.")
 
-            # B) EN→AR translate for all in scope (batched)
+            # B) EN→AR translate (batched)
             if engine in ("DeepL","OpenAI"):
                 idx_list = iter_indices_for_scope()
                 texts = []
@@ -496,13 +520,9 @@ with tab_titles:
                     cached = st.session_state.proc_cache.get(sku, {})
                     current_ar = str(work.at[i,"name_ar"]).strip()
                     en = str(work.at[i,"name"]).strip()
-
-                    # Skip if cached AR and not forcing overwrite
                     if not force_refresh and cached.get("name_ar"):
                         work.at[i,"name_ar"] = cached["name_ar"]
                         continue
-
-                    # Build list to translate:
                     if en and (force_refresh or not current_ar):
                         texts.append(en)
                         final_idx.append(i)
@@ -528,11 +548,11 @@ with tab_titles:
             else:
                 st.info("Translation engine set to None. Skipped EN→AR.")
 
-    # Optional: per-selection preview and manual apply remain useful
-    st.markdown("#### Optional: per-selection preview/apply")
+    # Optional: per-selection preview
+    st.markdown("#### Optional: per-selection preview")
     base = work if scope=="All rows" else filtered
     sku_opts=base["merchant_sku"].astype(str).tolist()
-    sel_skus=st.multiselect("Select SKUs to preview/apply", options=sku_opts, default=sku_opts[:50])
+    sel_skus=st.multiselect("Select SKUs to preview", options=sku_opts, default=sku_opts[:50])
 
     if st.button("Preview EN titles (before → after) for selected"):
         idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
@@ -552,7 +572,6 @@ with tab_group:
     st.subheader("Grouping via keywords")
     left,right = st.columns([1,2])
 
-    # LEFT: Manage library
     with left:
         st.markdown("**Keyword Library**")
         new_kws_text = st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndishwashing\nlemon")
@@ -573,13 +592,11 @@ with tab_group:
             else:
                 st.info("No selection.")
 
-    # RIGHT: Select keywords/tokens to group
     with right:
         st.markdown("**Select keywords/tokens to group and map**")
         scope_filtered_only = st.checkbox("Scope = CURRENT filtered view", value=True)
         base_df = filtered if scope_filtered_only else work
 
-        # Auto tokens from base_df
         tok_counts = Counter()
         for _, r in base_df.iterrows():
             tok_counts.update(tokenize(r.get("name","")))
