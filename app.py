@@ -1,10 +1,10 @@
 # Product Mapping Dashboard – redesigned workflow (no matplotlib)
-# - Cleaner tabs
-# - Collapsible advanced filter
+# - Clear skip messaging for "only empty" runs
+# - Robust OpenAI image→title call and diagnostics
+# - Cleaner tabs, collapsible advanced filter
 # - Keyword Library drives grouping directly
-# - Combined "Saved + Auto" keywords with live hit counts
+# - Combined Saved + Auto keywords with hit counts
 # - Batch mapping for multiple selected keywords/tokens
-# - Titles: run on empty only vs force refresh + before/after preview
 # - Sheet tab with pagination and row coloring + quick view toggles
 # - Sidebar analytics: key status, KPIs, bar chart, top unmapped tokens
 
@@ -185,9 +185,8 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
         return ""
     prompt = (
         "Look at the product photo and return ONE short English title only. "
-        "Keep it 6–8 words, ≤70 characters. "
-        "Include brand if visible and size/count if obvious. "
-        "Output ONLY the title, nothing else."
+        "Keep it 6–8 words, ≤70 characters. Include brand if visible and "
+        "size/count if obvious. Output ONLY the title."
     )
     try:
         resp = openai_client.chat.completions.create(
@@ -203,16 +202,16 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
                 },
             ],
             temperature=0,
-            max_tokens=100,
+            max_tokens=96,
         )
-        title = resp.choices[0].message.get("content", "")
-        if not title:
-            return ""
-        return tidy_title(title, max_chars)
+        # Defensive parsing
+        choice = resp.choices[0]
+        content = getattr(choice.message, "content", "") if hasattr(choice, "message") else ""
+        title = (content or "").strip()
+        return tidy_title(title, max_chars) if title else ""
     except Exception as e:
         st.warning(f"OpenAI error: {e}")
         return ""
-
 
 def deepl_batch_en2ar(texts: List[str]) -> List[str]:
     if not translator: return list(texts)
@@ -234,7 +233,8 @@ def openai_translate_batch_en2ar(texts: List[str]) -> List[str]:
         )
         lines=(resp.choices[0].message.content or "").splitlines()
         return [l.strip() for l in lines if l.strip()] or texts
-    except Exception:
+    except Exception as e:
+        st.warning(f"OpenAI translation error: {e}")
         return texts
 
 def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> pd.Series:
@@ -242,8 +242,10 @@ def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> p
     if engine=="DeepL" and deepl_active: return pd.Series(deepl_batch_en2ar(texts), index=titles_en.index)
     if engine=="OpenAI":
         out_all=[]
-        for s in range(0,len(texts),batch_size):
-            chunk=texts[s:s+batch_size]; out_all.extend(openai_translate_batch_en2ar(chunk)); time.sleep(0.25)
+        for s in range(0,len(texts),max(1,batch_size)):
+            chunk=texts[s:s+batch_size]
+            out_all.extend(openai_translate_batch_en2ar(chunk))
+            time.sleep(0.2)
         return pd.Series(out_all,index=titles_en.index)
     return titles_en.copy()
 
@@ -442,23 +444,34 @@ with tab_titles:
             st.info("Nothing to preview with current selection.")
 
     if st.button("Apply EN titles for selected"):
-        if not openai_active: st.error("OpenAI client inactive. Add OPENAI_API_KEY in secrets.")
+        if not openai_active:
+            st.error("OpenAI client inactive. Add OPENAI_API_KEY in secrets.")
         else:
             idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
-            updated=0
+            updated=0; skipped_nonempty=0; failed=0
             prog=st.progress(0.0)
+            total=len(idx)
             for k,i in enumerate(idx,1):
                 if only_empty and str(work.at[i,"name"]).strip():
-                    prog.progress(k/len(idx)); continue
+                    skipped_nonempty += 1
+                    prog.progress(k/max(1,total)); continue
                 url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
                 title=openai_title_from_image(url,max_len) if url else ""
                 if title:
                     work.at[i,"name"]=title; updated+=1
-                prog.progress(k/len(idx)); time.sleep(0.02)
-            st.success(f"Applied EN titles to {updated} row(s).")
+                else:
+                    failed += 1
+                prog.progress(k/max(1,total)); time.sleep(0.02)
+            if updated:
+                st.success(f"Applied EN titles to {updated} row(s).")
+            if skipped_nonempty:
+                st.info(f"Skipped {skipped_nonempty} row(s) because 'Run only on empty EN titles' is enabled.")
+            if failed and not updated:
+                st.warning("No titles returned by the model for selected rows. Check images/URLs or uncheck the 'only empty' toggle to overwrite.")
 
     if st.button("Translate selected rows EN → AR"):
-        if engine=="None": st.info("Translation engine set to None.")
+        if engine=="None":
+            st.info("Translation engine set to None.")
         else:
             idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
             titles_en = work.loc[idx,"name"].fillna("").astype(str)
