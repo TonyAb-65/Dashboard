@@ -1,17 +1,16 @@
-# Product Mapping Dashboard – redesigned workflow (no matplotlib)
-# - Clear skip messaging for "only empty" runs
-# - Robust OpenAI image→title call and diagnostics
-# - Cleaner tabs, collapsible advanced filter
-# - Keyword Library drives grouping directly
-# - Combined Saved + Auto keywords with hit counts
-# - Batch mapping for multiple selected keywords/tokens
-# - Sheet tab with pagination and row coloring + quick view toggles
-# - Sidebar analytics: key status, KPIs, bar chart, top unmapped tokens
+# Product Mapping Dashboard – batch pipeline + per-file memory
+# - Batch: image→EN titles for all, then EN→AR for all
+# - Scope: All rows or Current filtered view
+# - Caching: remembers results per file hash so re-uploads skip processed rows
+# - New file: cache resets automatically
+# - No auto-fetch on upload; explicit Run buttons
+# - Grouping via Keyword Library; Sheet preview with pagination
 
 import io
 import re
 import time
 import math
+import hashlib
 from typing import List, Iterable, Dict, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -32,11 +31,12 @@ st.markdown("""
 h2,h3{margin-top:.6rem;margin-bottom:.4rem;}
 .stButton>button{border-radius:6px;}
 .small-note{color:#777;font-size:12px;margin-top:-6px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;background:#eef;color:#334;font-size:12px;margin-left:6px}
 </style>
 """, unsafe_allow_html=True)
 st.markdown("""
 <div class="app-header">
-  <div class="app-title">🧭 Product Mapping Dashboard</div>
+  <div class="app-title">🧭 Product Mapping Dashboard <span class="badge">Batch + Memory</span></div>
   <div class="app-subtitle">Images → Titles → Arabic → Categorization → Export</div>
 </div>
 """, unsafe_allow_html=True)
@@ -96,6 +96,17 @@ def validate_columns(df, required_cols: Iterable[str], label: str) -> bool:
         st.error(f"{label}: missing required columns: {missing}")
         return False
     return True
+
+def hash_uploaded_file(uploaded_file) -> str:
+    """Stable file signature to decide cache reuse."""
+    try:
+        uploaded_file.seek(0)
+        data = uploaded_file.read()
+        uploaded_file.seek(0)
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        # Fallback to name + size if stream not readable twice
+        return hashlib.sha256(str(uploaded_file.name).encode()).hexdigest()
 
 # ============================== HELPERS ===================================
 STOP = {"the","and","for","with","of","to","in","on","by","a","an","&","-",
@@ -193,18 +204,14 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a precise e-commerce title writer."},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": _normalize_url(url)}},
-                    ],
-                },
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": _normalize_url(url)}},
+                ]},
             ],
             temperature=0,
             max_tokens=96,
         )
-        # Defensive parsing
         choice = resp.choices[0]
         content = getattr(choice.message, "content", "") if hasattr(choice, "message") else ""
         title = (content or "").strip()
@@ -286,7 +293,17 @@ if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"
         and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
     st.stop()
 
-if "work" not in st.session_state: st.session_state.work = prod_df.copy()
+# ------------- Per-file memory: initialize/reset on file change -----------
+st.session_state.setdefault("file_hash", None)
+st.session_state.setdefault("proc_cache", {})   # {sku: {"name": EN, "name_ar": AR}}
+current_hash = hash_uploaded_file(product_file)
+
+if st.session_state.file_hash != current_hash:
+    # New file uploaded → reset working copy and cache
+    st.session_state.work = prod_df.copy()
+    st.session_state.proc_cache = {}
+    st.session_state.file_hash = current_hash
+
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
@@ -309,22 +326,11 @@ with st.sidebar:
     st.metric("Titled rows (EN)", named, f"{titled_pct}%")
     st.progress(pct/100 if pct else 0.0)
 
-    # Pie-like bar chart using Streamlit native charting
     st.markdown("#### Mapped vs Unmapped")
     st.bar_chart(pd.DataFrame({"count":[mapped, unmapped]}, index=["Mapped","Unmapped"]))
 
-    # Top unmapped tokens
-    st.markdown("#### Top tokens in Unmapped")
-    unmapped_df = work[~mapped_mask].copy()
-    counts = Counter()
-    for _, r in unmapped_df.iterrows():
-        counts.update(tokenize(r.get("name","")))
-        counts.update(tokenize(r.get("name_ar","")))
-    top = pd.DataFrame(counts.most_common(5), columns=["token","count"])
-    if len(top)>0:
-        st.table(top)
-    else:
-        st.caption("No tokens found.")
+    st.markdown("#### Cache")
+    st.caption(f"Cached SKUs: {len(st.session_state.proc_cache)}")
 
 # ============================== SESSION STATE =============================
 st.session_state.setdefault("keyword_library", [])
@@ -409,14 +415,23 @@ with tab_filter:
 # --------------------------- TITLES & TRANSLATE ---------------------------
 with tab_titles:
     st.subheader("Titles from images, then Arabic")
-    c1,c2,c3 = st.columns([2,2,2])
+
+    c1,c2,c3,c4 = st.columns([2,2,2,2])
     with c1: max_len = st.slider("Max English title length", 50, 90, 70, 5)
     with c2: engine  = st.selectbox("Arabic translation engine", ["DeepL","OpenAI","None"])
     with c3: only_empty = st.checkbox("Run only on empty EN titles", value=True)
+    with c4: force_refresh = st.checkbox("Force overwrite", value=False)
 
-    st.caption("Manual preview. Nothing auto-fetches.")
-    if st.button("Preview first 24 images in CURRENT filtered view"):
-        view=filtered.head(24).copy()
+    scope = st.radio("Scope for processing", ["All rows", "Current filtered view"], horizontal=True)
+
+    c5,c6 = st.columns(2)
+    with c5: fetch_batch = st.number_input("Batch size (image→EN title)", min_value=10, max_value=300, value=80, step=10)
+    with c6: trans_batch = st.number_input("Batch size (EN→AR)", min_value=10, max_value=300, value=120, step=10)
+
+    st.caption("Manual image preview")
+    if st.button("Preview first 24 images in scope"):
+        base = work if scope=="All rows" else filtered
+        view=base.head(24).copy()
         if "thumbnail" in view.columns and len(view)>0:
             cols=st.columns(6)
             for j,(i,row) in enumerate(view.iterrows()):
@@ -425,59 +440,112 @@ with tab_titles:
                     if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
                     else: st.write("No image / bad URL")
         else:
-            st.info("No thumbnails in current filtered view.")
+            st.info("No thumbnails in scope.")
 
-    sku_opts=filtered["merchant_sku"].astype(str).tolist()
-    sel_skus=st.multiselect("Select SKUs to process", options=sku_opts, default=sku_opts)
+    # ----- Batch pipeline: titles for all in scope, then translate all -----
+    def iter_indices_for_scope():
+        base = work if scope=="All rows" else filtered
+        return base.index.tolist()
 
-    if st.button("Preview EN titles (before → after)"):
+    if st.button("Run FULL pipeline on scope (Image→EN, then EN→AR)"):
+        idx_list = iter_indices_for_scope()
+        if not idx_list:
+            st.info("No rows in scope.")
+        else:
+            # A) Image→EN titles (batched)
+            updated_en = 0; skipped_en = 0
+            prog = st.progress(0.0, text="Generating English titles from images…")
+            for s in range(0, len(idx_list), fetch_batch):
+                chunk = idx_list[s:s+fetch_batch]
+                for i in chunk:
+                    sku = str(work.at[i,"merchant_sku"])
+                    cached = st.session_state.proc_cache.get(sku, {})
+                    current_en = str(work.at[i,"name"]).strip()
+                    url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+
+                    # Skip if cached and not forcing overwrite
+                    if not force_refresh and cached.get("name"):
+                        work.at[i,"name"] = cached["name"]
+                        skipped_en += 1
+                        continue
+
+                    # Skip if only_empty and title already exists and not forcing overwrite
+                    if only_empty and current_en and not force_refresh:
+                        skipped_en += 1
+                        # write to cache for future
+                        st.session_state.proc_cache.setdefault(sku, {})["name"] = current_en
+                        continue
+
+                    # Generate title
+                    title = openai_title_from_image(url, max_len) if url else ""
+                    if title:
+                        work.at[i,"name"] = title
+                        st.session_state.proc_cache.setdefault(sku, {})["name"] = title
+                        updated_en += 1
+                prog.progress(min((s+len(chunk))/len(idx_list), 1.0))
+                time.sleep(0.05)
+            st.success(f"EN titles: {updated_en} updated, {skipped_en} skipped.")
+
+            # B) EN→AR translate for all in scope (batched)
+            if engine in ("DeepL","OpenAI"):
+                idx_list = iter_indices_for_scope()
+                texts = []
+                final_idx = []
+                for i in idx_list:
+                    sku = str(work.at[i,"merchant_sku"])
+                    cached = st.session_state.proc_cache.get(sku, {})
+                    current_ar = str(work.at[i,"name_ar"]).strip()
+                    en = str(work.at[i,"name"]).strip()
+
+                    # Skip if cached AR and not forcing overwrite
+                    if not force_refresh and cached.get("name_ar"):
+                        work.at[i,"name_ar"] = cached["name_ar"]
+                        continue
+
+                    # Build list to translate:
+                    if en and (force_refresh or not current_ar):
+                        texts.append(en)
+                        final_idx.append(i)
+
+                updated_ar = 0
+                if texts:
+                    prog2 = st.progress(0.0, text="Translating EN → AR…")
+                    out_all = []
+                    for s in range(0, len(texts), trans_batch):
+                        chunk = texts[s:s+trans_batch]
+                        trans = translate_en_titles(pd.Series(chunk), engine, batch_size=trans_batch)
+                        out_all.extend(trans.tolist())
+                        prog2.progress(min((s+len(chunk))/len(texts), 1.0))
+                        time.sleep(0.05)
+                    for j, i in enumerate(final_idx):
+                        ar = out_all[j] if j < len(out_all) else ""
+                        if ar:
+                            work.at[i,"name_ar"] = ar
+                            sku = str(work.at[i,"merchant_sku"])
+                            st.session_state.proc_cache.setdefault(sku, {})["name_ar"] = ar
+                            updated_ar += 1
+                st.success(f"AR translations: {updated_ar} updated.")
+            else:
+                st.info("Translation engine set to None. Skipped EN→AR.")
+
+    # Optional: per-selection preview and manual apply remain useful
+    st.markdown("#### Optional: per-selection preview/apply")
+    base = work if scope=="All rows" else filtered
+    sku_opts=base["merchant_sku"].astype(str).tolist()
+    sel_skus=st.multiselect("Select SKUs to preview/apply", options=sku_opts, default=sku_opts[:50])
+
+    if st.button("Preview EN titles (before → after) for selected"):
         idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
         previews=[]
         for i in idx:
-            if only_empty and str(work.at[i,"name"]).strip(): continue
+            current_en = str(work.at[i,"name"]).strip()
             url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
             new= openai_title_from_image(url,max_len) if url else ""
-            previews.append({"merchant_sku": work.at[i,"merchant_sku"], "EN_before": work.at[i,"name"], "EN_after_preview": new})
+            previews.append({"merchant_sku": work.at[i,"merchant_sku"], "EN_before": current_en, "EN_after_preview": new})
         if previews:
             st.dataframe(pd.DataFrame(previews), use_container_width=True, height=320)
         else:
-            st.info("Nothing to preview with current selection.")
-
-    if st.button("Apply EN titles for selected"):
-        if not openai_active:
-            st.error("OpenAI client inactive. Add OPENAI_API_KEY in secrets.")
-        else:
-            idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
-            updated=0; skipped_nonempty=0; failed=0
-            prog=st.progress(0.0)
-            total=len(idx)
-            for k,i in enumerate(idx,1):
-                if only_empty and str(work.at[i,"name"]).strip():
-                    skipped_nonempty += 1
-                    prog.progress(k/max(1,total)); continue
-                url=str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
-                title=openai_title_from_image(url,max_len) if url else ""
-                if title:
-                    work.at[i,"name"]=title; updated+=1
-                else:
-                    failed += 1
-                prog.progress(k/max(1,total)); time.sleep(0.02)
-            if updated:
-                st.success(f"Applied EN titles to {updated} row(s).")
-            if skipped_nonempty:
-                st.info(f"Skipped {skipped_nonempty} row(s) because 'Run only on empty EN titles' is enabled.")
-            if failed and not updated:
-                st.warning("No titles returned by the model for selected rows. Check images/URLs or uncheck the 'only empty' toggle to overwrite.")
-
-    if st.button("Translate selected rows EN → AR"):
-        if engine=="None":
-            st.info("Translation engine set to None.")
-        else:
-            idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
-            titles_en = work.loc[idx,"name"].fillna("").astype(str)
-            trans = translate_en_titles(titles_en, engine, batch_size=max(20, len(idx)//2 or 20))
-            work.loc[idx,"name_ar"]=trans
-            st.success(f"Translated {len(idx)} row(s).")
+            st.info("Nothing to preview.")
 
 # ------------------------------- GROUPING ---------------------------------
 with tab_group:
@@ -516,9 +584,8 @@ with tab_group:
         for _, r in base_df.iterrows():
             tok_counts.update(tokenize(r.get("name","")))
             tok_counts.update(tokenize(r.get("name_ar","")))
-        auto_candidates = [t for t,c in tok_counts.most_common() if c>=3][:50]  # top autos
+        auto_candidates = [t for t,c in tok_counts.most_common() if c>=3][:50]
 
-        # Build option list with hit counts
         def hit_count(df: pd.DataFrame, term: str) -> int:
             term_l = term.lower()
             m = df["name"].astype(str).str.lower().str.contains(term_l, na=False) | \
@@ -526,23 +593,18 @@ with tab_group:
             return int(m.sum())
 
         options_display = []
-        display_to_key: Dict[str, Tuple[str,str]] = {}  # display -> (kind, term)
-        # Saved
+        display_to_key: Dict[str, Tuple[str,str]] = {}
         for kw in st.session_state.keyword_library:
             cnt = hit_count(base_df, kw)
             disp = f"{kw} ({cnt}) [Saved]"
-            options_display.append(disp)
-            display_to_key[disp] = ("lib", kw)
-        # Auto
+            options_display.append(disp); display_to_key[disp] = ("lib", kw)
         for tok in auto_candidates:
             cnt = hit_count(base_df, tok)
             disp = f"{tok} ({cnt}) [Auto]"
-            options_display.append(disp)
-            display_to_key[disp] = ("auto", tok)
+            options_display.append(disp); display_to_key[disp] = ("auto", tok)
 
         picked = st.multiselect("Pick one or more keywords/tokens", options=options_display, default=[])
 
-        # Build union mask of all picked
         if picked:
             union_mask = pd.Series(False, index=base_df.index)
             for disp in picked:
@@ -578,7 +640,6 @@ with tab_group:
 with tab_sheet:
     st.subheader("Full sheet preview")
 
-    # Quick view toggles
     view_mode = st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True)
     base_df = work.copy()
     mapped_mask_v = base_df["sub_category_id"].astype(str).str.strip().ne("") & base_df["sub_sub_category_id"].astype(str).str.strip().ne("")
@@ -587,7 +648,6 @@ with tab_sheet:
     elif view_mode == "Unmapped only":
         base_df = base_df[~mapped_mask_v]
 
-    # Pagination
     st.session_state.page_size = st.number_input("Rows per page", min_value=50, max_value=5000, value=st.session_state.page_size, step=50)
     total_rows = base_df.shape[0]
     total_pages = max(1, math.ceil(total_rows / st.session_state.page_size))
@@ -597,13 +657,11 @@ with tab_sheet:
     page_df = base_df.iloc[start:end].copy()
     st.caption(f"Showing rows {start+1}–{min(end,total_rows)} of {total_rows}")
 
-    # Row coloring: mapped vs unmapped
     def style_map(row):
         is_mapped = str(row.get("sub_category_id","")).strip() != "" and str(row.get("sub_sub_category_id","")).strip() != ""
         color = "background-color: rgba(0,200,130,0.08)" if is_mapped else "background-color: rgba(255,215,0,0.18)"
         return [color for _ in row]
 
-    # Term highlight on name fields
     term = st.session_state.get("search_q","").strip().lower()
     def cell_highlight(v):
         if not term: return ""
@@ -632,3 +690,7 @@ with tab_settings:
         sample = work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
         for u in sample:
             norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
+
+    if st.button("Clear cache for THIS file"):
+        st.session_state.proc_cache = {}
+        st.success("Cleared per-file cache.")
