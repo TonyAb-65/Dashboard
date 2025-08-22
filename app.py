@@ -196,7 +196,7 @@ def to_excel_download(df, sheet_name="Products"):
     buf.seek(0)
     return buf
 
-# ---------- Batched titles ----------
+# ---------- Batched titles (kept for reuse if needed) ----------
 def titles_from_images_batched(df, row_index, max_chars, batch_size):
     titles_en = pd.Series([""]*len(row_index), index=row_index, dtype="object")
     prog = st.progress(0)
@@ -233,44 +233,31 @@ if "work" not in st.session_state:
 work = st.session_state.work
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---------- 1) Titles from Images (FIRST STEP) ----------
-st.header("1) Generate English titles from images, then translate to Arabic")
-max_len=st.slider("Max title length",50,90,70,5)
-batch_size=st.slider("Batch size (image→title)",25,120,60,5)
-engine=st.selectbox("Arabic translation engine",["DeepL","OpenAI","None"])
+# ---------- 1) Manual: fetch image → generate English title → optional Arabic ----------
+st.header("1) Manual: fetch image → generate English title → optional Arabic")
 
-scope=st.selectbox("Scope",["All rows","Only rows with empty English title"])
-if st.button("Generate Titles & Translations (recommended to run before grouping)"):
-    if scope == "All rows":
-        idx_list = work.index.tolist()
-    else:
-        idx_list = work[work["name"].astype(str).str.strip().eq("")].index.tolist()
-        if len(idx_list) == 0:
-            st.info("No rows with empty English title. Nothing to do.")
+max_len = st.slider("Max title length", 50, 90, 70, 5)
+engine  = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"])
+st.caption("Flow: 1) Preview images. 2) Select rows. 3) Generate titles. 4) Optional translate.")
 
-    if len(idx_list) > 0:
-        titles_en=titles_from_images_batched(work,idx_list,max_len,batch_size)
-        work.loc[idx_list,"name"]=titles_en.loc[idx_list]
-        if engine in ("DeepL","OpenAI"):
-            work.loc[idx_list,"name_ar"]=translate_en_titles(titles_en.loc[idx_list],engine,batch_size=max(20, batch_size//2))
-        st.success(f"Updated titles for {len(idx_list)} rows.")
+# A) Preview images for current filtered view only (no automation here)
+# We will define filtered soon after search inputs. For initial load, default to first 24 rows of full sheet.
+_preview_df = work.head(24).copy()
 
-# Thumbnails quick preview for current top rows
-st.subheader("Quick image preview (first 24 rows in current sheet)")
-if "thumbnail" in work.columns:
-    urls = work["thumbnail"].fillna("").astype(str).tolist()
-    show_n = min(24, len(urls))
+st.subheader("A) Preview images")
+if "thumbnail" in _preview_df.columns and len(_preview_df) > 0:
     cols = st.columns(6)
-    for i, url in enumerate(urls[:show_n]):
-        with cols[i % 6]:
-            img = fetch_thumb(url)
+    for j, (i, row) in enumerate(_preview_df.iterrows()):
+        with cols[j % 6]:
+            img = fetch_thumb(str(row.get("thumbnail","")))
             if img:
-                st.image(img, caption=f"Row {work.index[i]}", use_container_width=True)
+                st.image(img, caption=f"Row {i}", use_container_width=True)
             else:
                 st.write("No image / bad URL")
 else:
-    st.warning("No 'thumbnail' column found; make sure column W is named 'thumbnail'.")
+    st.info("No thumbnails to preview.")
 
+# B) We will select rows after search/filter section to align with user’s filtered view.
 
 # ---------- 2) Quick Search & Filtering BEFORE grouping ----------
 st.header("2) Filter view")
@@ -305,6 +292,42 @@ else:
 
 filtered = work[mask].copy()
 st.caption(f"Rows in current filtered view: {filtered.shape[0]}")
+
+# B) Select rows to process manually, now that filtered is defined
+st.subheader("B) Pick rows to generate titles from image")
+sku_opts = filtered["merchant_sku"].astype(str).tolist()
+sel_skus = st.multiselect("Select SKUs to process", options=sku_opts, default=sku_opts)
+
+# C) Generate titles ONLY for selected rows
+if st.button("Generate EN titles for selected rows (from image)"):
+    if not openai_active:
+        st.error("OpenAI client inactive. Add OPENAI_API_KEY in secrets.")
+    elif not sel_skus:
+        st.info("No SKUs selected.")
+    else:
+        idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
+        updated = 0
+        prog = st.progress(0.0)
+        for k, i in enumerate(idx, 1):
+            url = str(work.at[i, "thumbnail"]) if "thumbnail" in work.columns else ""
+            title = openai_title_from_image(url, max_len) if url else ""
+            if title:
+                work.at[i, "name"] = title
+                updated += 1
+            prog.progress(k / len(idx))
+            time.sleep(0.05)
+        st.success(f"Generated titles for {updated} row(s).")
+
+# D) Optional translate ONLY for selected rows
+if st.button("Translate selected rows' EN titles → AR"):
+    if engine == "None":
+        st.info("Translation engine set to None.")
+    else:
+        idx = work[work["merchant_sku"].astype(str).isin(sel_skus)].index
+        titles_en = work.loc[idx, "name"].fillna("").astype(str)
+        trans = translate_en_titles(titles_en, engine, batch_size=max(20, len(idx)//2 or 20))
+        work.loc[idx, "name_ar"] = trans
+        st.success(f"Translated {len(idx)} row(s) to Arabic.")
 
 # Show filtered table
 st.dataframe(
@@ -365,7 +388,6 @@ if st.session_state.keyword_rules:
         if hits_df.shape[0] > 0:
             # Show table to review & deselect
             hits_df["__select__"] = True  # default select all
-            # Display without the helper column first
             st.dataframe(hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]], use_container_width=True, height=280)
 
             # Build multiselect for explicit control
@@ -447,7 +469,6 @@ if st.button("Apply IDs to all rows in current filtered view"):
     if sel_sub:  work.loc[mask,"sub_category_id"]=get_sub_no(lookups,sel_main,sel_sub)
     if sel_ssub: work.loc[mask,"sub_sub_category_id"]=get_ssub_no(lookups,sel_main,sel_sub,sel_ssub)
     st.success("Applied IDs to current view.")
-
 
 # ---------- 4) Full & Filtered Excel views + Downloads ----------
 st.header("4) Review & Download")
