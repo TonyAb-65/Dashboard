@@ -3,7 +3,7 @@ import re
 import time
 import math
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote
 from collections import Counter
 
 import pandas as pd
@@ -90,25 +90,70 @@ def tidy_title(s: str, max_chars: int = 70) -> str:
     return cut
 
 def is_valid_url(u: str) -> bool:
+    if not isinstance(u, str): return False
+    u = u.strip().strip('"').strip("'")
     try:
-        p = urlparse(u)
+        p = urlsplit(u)
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
 
-def fetch_thumb(url: str, timeout=7):
+def _normalize_url(u: str) -> str:
+    u = (u or "").strip().strip('"').strip("'")
+    p = urlsplit(u)
+    path = quote(p.path, safe="/:%@&?=#,+!$;'()*[]")
+    # Re-encode query safely
+    if p.query:
+        parts = []
+        for kv in p.query.split("&"):
+            if kv == "": continue
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                parts.append(f"{quote(k, safe=':/@')}={quote(v, safe=':/@')}")
+            else:
+                parts.append(quote(kv, safe=":/@"))
+        query = "&".join(parts)
+    else:
+        query = ""
+    return urlunsplit((p.scheme, p.netloc, path, query, p.fragment))
+
+def fetch_thumb(url: str, timeout=10, max_bytes=8_000_000):
     try:
         if not is_valid_url(url): return None
-        headers = {"User-Agent": "Mozilla/5.0"}
+        url = _normalize_url(url)
+
+        origin = urlsplit(url).netloc
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": f"https://{origin}",
+        }
+
         r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
         r.raise_for_status()
-        if "image" not in r.headers.get("Content-Type", "").lower() and not url.lower().endswith((".jpg",".jpeg",".png",".webp",".gif")):
+
+        content_length = r.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
             return None
-        img = Image.open(BytesIO(r.content)).convert("RGB")
+
+        data = r.content if r.content else r.raw.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+
+        img = Image.open(BytesIO(data)).convert("RGB")
         img.thumbnail((256, 256))
         return img
     except Exception:
-        return None
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True)
+            r.raise_for_status()
+            data = r.content[:max_bytes+1]
+            if len(data) > max_bytes: return None
+            img = Image.open(BytesIO(data)).convert("RGB")
+            img.thumbnail((256, 256))
+            return img
+        except Exception:
+            return None
 
 # ---------- OpenAI: image → EN short title ----------
 def openai_title_from_image(url: str, max_chars: int) -> str:
@@ -123,7 +168,7 @@ def openai_title_from_image(url: str, max_chars: int) -> str:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system","content":"You are a precise e-commerce title writer. Output one short title only."},
-                {"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":url}}]},
+                {"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":_normalize_url(url)}}]},
             ],
             temperature=0.2,
         )
@@ -240,25 +285,6 @@ max_len = st.slider("Max title length", 50, 90, 70, 5)
 engine  = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"])
 st.caption("Flow: 1) Preview images. 2) Select rows. 3) Generate titles. 4) Optional translate.")
 
-# A) Preview images for current filtered view only (no automation here)
-# We will define filtered soon after search inputs. For initial load, default to first 24 rows of full sheet.
-_preview_df = work.head(24).copy()
-
-st.subheader("A) Preview images")
-if "thumbnail" in _preview_df.columns and len(_preview_df) > 0:
-    cols = st.columns(6)
-    for j, (i, row) in enumerate(_preview_df.iterrows()):
-        with cols[j % 6]:
-            img = fetch_thumb(str(row.get("thumbnail","")))
-            if img:
-                st.image(img, caption=f"Row {i}", use_container_width=True)
-            else:
-                st.write("No image / bad URL")
-else:
-    st.info("No thumbnails to preview.")
-
-# B) We will select rows after search/filter section to align with user’s filtered view.
-
 # ---------- 2) Quick Search & Filtering BEFORE grouping ----------
 st.header("2) Filter view")
 st.session_state.setdefault("search_q","")
@@ -293,7 +319,24 @@ else:
 filtered = work[mask].copy()
 st.caption(f"Rows in current filtered view: {filtered.shape[0]}")
 
-# B) Select rows to process manually, now that filtered is defined
+# A) Preview images (manual trigger, no auto-fetch)
+st.subheader("A) Preview images (manual)")
+st.caption("Click to fetch thumbnails. Nothing loads automatically.")
+if st.button("Preview first 24 images in CURRENT filtered view"):
+    view = filtered.head(24).copy()
+    if "thumbnail" in view.columns and len(view) > 0:
+        cols = st.columns(6)
+        for j, (i, row) in enumerate(view.iterrows()):
+            with cols[j % 6]:
+                img = fetch_thumb(str(row.get("thumbnail", "")))
+                if img:
+                    st.image(img, caption=f"Row {i}", use_container_width=True)
+                else:
+                    st.write("No image / bad URL")
+    else:
+        st.info("No thumbnails in current filtered view.")
+
+# B) Pick rows to generate titles from image
 st.subheader("B) Pick rows to generate titles from image")
 sku_opts = filtered["merchant_sku"].astype(str).tolist()
 sel_skus = st.multiselect("Select SKUs to process", options=sku_opts, default=sku_opts)
@@ -335,47 +378,75 @@ st.dataframe(
     use_container_width=True, height=320
 )
 
-# ---------- 3) Grouping Methods ----------
+# ---------- 3) Grouping & bulk apply ----------
 st.header("3) Grouping & bulk apply")
 
-# ----- 3A. Keyword Groups (with visible table + deselection) -----
-st.subheader("3A) Keyword groups (add many keywords; preview table; deselect; apply)")
+# Session stores
 st.session_state.setdefault("keyword_rules", [])
+st.session_state.setdefault("keyword_library", [])
 
-with st.expander("➕ Add keyword(s) and mapping"):
-    colkw, colm, cols, colss = st.columns([3,2,2,2])
-    with colkw:
-        kws_text = st.text_area("Keywords (one per line)", placeholder="soap\nshampoo\ndetergent gel\ndishwashing")
-    with colm:
+# ----- 3A. Keyword Groups with library -----
+st.subheader("3A) Keyword groups (add once, reuse from dropdown)")
+
+with st.expander("➕ Add or reuse keyword(s) and mapping"):
+    lib_col, map_col = st.columns([3,4])
+
+    with lib_col:
+        st.markdown("**Keyword library**")
+        new_kws_text = st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndetergent gel\ndishwashing")
+        if st.button("Add to library"):
+            fresh = [k.strip() for k in new_kws_text.splitlines() if k.strip()]
+            if fresh:
+                existing = set(st.session_state.keyword_library)
+                st.session_state.keyword_library.extend([k for k in fresh if k not in existing])
+                st.success(f"Added {len(fresh)} keyword(s) to library.")
+            else:
+                st.info("Nothing to add.")
+
+        lib_selected = st.multiselect(
+            "Pick keywords from library",
+            options=st.session_state.keyword_library,
+            default=st.session_state.keyword_library,
+            key="lib_pick_for_rule"
+        )
+
+        to_remove = st.multiselect("Remove from library", options=st.session_state.keyword_library, key="lib_remove")
+        if st.button("🗑️ Remove selected from library"):
+            if to_remove:
+                st.session_state.keyword_library = [k for k in st.session_state.keyword_library if k not in set(to_remove)]
+                st.success(f"Removed {len(to_remove)} keyword(s).")
+            else:
+                st.info("No keywords selected to remove.")
+
+    with map_col:
+        st.markdown("**Mapping for selected keywords**")
         k_main = st.selectbox("Main", [""] + lookups["main_names"], key="kmain")
-    subs_for_main = lookups["main_to_subnames"].get(k_main, []) if k_main else []
-    with cols:
+        subs_for_main = lookups["main_to_subnames"].get(k_main, []) if k_main else []
         k_sub = st.selectbox("Sub", [""] + subs_for_main, key="ksub")
-    ssubs_for_pair = lookups["pair_to_subsubnames"].get((k_main, k_sub), []) if (k_main and k_sub) else []
-    with colss:
+        ssubs_for_pair = lookups["pair_to_subsubnames"].get((k_main, k_sub), []) if (k_main and k_sub) else []
         k_ssub = st.selectbox("Sub-Sub", [""] + ssubs_for_pair, key="kssub")
 
-    if st.button("Add keywords"):
-        kw_list = [k.strip() for k in kws_text.splitlines() if k.strip()]
-        if not kw_list:
-            st.warning("Enter at least one keyword.")
-        elif not (k_main and k_sub and k_ssub):
-            st.warning("Please pick Main, Sub, and Sub-Sub.")
-        else:
-            st.session_state.keyword_rules.append({
-                "keywords": kw_list,
-                "main": k_main,
-                "sub": k_sub,
-                "subsub": k_ssub
-            })
-            st.success(f"Added {len(kw_list)} keyword(s).")
+        if st.button("Add keywords as a new rule"):
+            chosen_kws = lib_selected or [k.strip() for k in new_kws_text.splitlines() if k.strip()]
+            if not chosen_kws:
+                st.warning("Select keywords from library or add some in the textarea.")
+            elif not (k_main and k_sub and k_ssub):
+                st.warning("Pick Main, Sub, and Sub-Sub.")
+            else:
+                st.session_state.keyword_rules.append({
+                    "keywords": chosen_kws,
+                    "main": k_main,
+                    "sub": k_sub,
+                    "subsub": k_ssub
+                })
+                st.success(f"Added rule with {len(chosen_kws)} keyword(s).")
 
+# Render rules and apply
 if st.session_state.keyword_rules:
     for idx_rule, rule in enumerate(st.session_state.keyword_rules):
         st.markdown(f"**Rule #{idx_rule+1}** — Main: `{rule['main']}` / Sub: `{rule['sub']}` / Sub-Sub: `{rule['subsub']}`")
         st.caption(f"Keywords: {', '.join(rule['keywords'])}")
 
-        # Build mask for ALL rows (not only filtered) so nothing is missed
         m = pd.Series(False, index=work.index)
         for kw in rule["keywords"]:
             kw_l = kw.lower()
@@ -386,11 +457,8 @@ if st.session_state.keyword_rules:
         st.write(f"Matches found: {hits_df.shape[0]}")
 
         if hits_df.shape[0] > 0:
-            # Show table to review & deselect
-            hits_df["__select__"] = True  # default select all
             st.dataframe(hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]], use_container_width=True, height=280)
 
-            # Build multiselect for explicit control
             default_skus = hits_df["merchant_sku"].astype(str).tolist()
             chosen_skus = st.multiselect(
                 f"Select SKUs to APPLY for Rule #{idx_rule+1}",
@@ -435,17 +503,14 @@ if candidates:
         group_idx=[i for i,toks in row_tokens.items() if chosen_token in toks]
         group_df=source_df.loc[group_idx].copy()
         st.write(f"Group **'{chosen_token}'** — {group_df.shape[0]} rows")
-        # Show table
         st.dataframe(
             group_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
             use_container_width=True, height=280
         )
-        # Select SKUs
         preselect=group_df["merchant_sku"].astype(str).tolist()
         picked=st.multiselect("Select SKUs to apply mapping",options=preselect,default=preselect,key=f"tok_pick_{chosen_token}")
         apply_idx=group_df[group_df["merchant_sku"].astype(str).isin(picked)].index
 
-        # Mapping pickers
         gm1,gm2,gm3=st.columns(3)
         g_main=gm1.selectbox("Main",[""]+lookups["main_names"], key=f"t_main_{chosen_token}")
         g_sub =gm2.selectbox("Sub",[""]+lookups["main_to_subnames"].get(g_main,[]), key=f"t_sub_{chosen_token}")
