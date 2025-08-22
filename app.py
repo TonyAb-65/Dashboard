@@ -11,16 +11,17 @@ import requests
 from PIL import Image
 from io import BytesIO
 
-# ============== PAGE =================
+# ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
 
+# ===== UI THEME & HEADER =====
 EMERALD = "#10b981"
 EMERALD_DARK = "#059669"
 TEXT_LIGHT = "#f8fafc"
 
 st.markdown(f"""
 <style>
-/* Header */
+/* Sticky header */
 .app-header {{
   padding: 8px 0 8px 0;
   border-bottom: 1px solid #e5e7eb;
@@ -29,24 +30,22 @@ st.markdown(f"""
 }}
 .app-title {{ font-size: 22px; font-weight: 800; color:#111827; }}
 .app-sub {{ color:#6b7280; font-size:12px; }}
-/* Sidebar */
+
+/* Sidebar emerald theme */
 [data-testid="stSidebar"] > div:first-child {{
   background: linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%);
   color: {TEXT_LIGHT};
 }}
-[data-testid="stSidebar"] .stRadio label {{
-  color: {TEXT_LIGHT} !important;
-}}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
 [data-testid="stSidebar"] .stRadio > div > label {{
   margin-bottom: 6px; padding: 6px 10px; border-radius: 8px;
   background: rgba(255,255,255,0.08);
 }}
-[data-testid="stSidebar"] .stMarkdown p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span {{
-  color:{TEXT_LIGHT} !important;
-}}
-/* Buttons */
+
+/* Buttons and cards */
 .stButton>button {{ border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }}
-/* Cards */
 .card {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fff; }}
 .small-note {{ color:#6b7280; font-size:12px; margin-top:-6px; }}
 .block-container {{ padding-top: 6px; }}
