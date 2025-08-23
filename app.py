@@ -12,22 +12,27 @@ import requests
 from PIL import Image
 from io import BytesIO
 
-# ---------- Page ----------
-st.set_page_config(
-    page_title="Product Mapper: Images → Titles → Groups",
-    layout="wide",
-)
+# ------------------------------ Page ------------------------------
+st.set_page_config(page_title="Product List: Mapping + Title Assistant", layout="wide")
+st.title("🛒 Product List Translator & Category Mapper")
 
-# ---------- Expected Product List columns ----------
+# ------------------------------ Requirements ------------------------------
 REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
-    # Column W must be named exactly:
-    "thumbnail",
+    "thumbnail",  # Column W – we will also auto-map from common alternates below
 ]
 
-# ---------- API clients ----------
+REQUIRED_MAP_COLS = [
+    "category_id",
+    "sub_category_id",
+    "sub_category_id NO",
+    "sub_sub_category_id",
+    "sub_sub_category_id NO",
+]
+
+# ------------------------------ Optional APIs ------------------------------
 # DeepL
 translator = None
 deepl_active = False
@@ -54,8 +59,7 @@ except Exception:
     openai_client = None
     openai_active = False
 
-
-# ---------- File IO ----------
+# ------------------------------ File IO ------------------------------
 def read_any_table(uploaded_file):
     if uploaded_file is None:
         return None
@@ -66,7 +70,6 @@ def read_any_table(uploaded_file):
         return pd.read_csv(uploaded_file)
     raise ValueError("Please upload .xlsx, .xls, or .csv")
 
-
 def validate_columns(df, required_cols, label):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -74,8 +77,7 @@ def validate_columns(df, required_cols, label):
         return False
     return True
 
-
-# ---------- Helpers ----------
+# ------------------------------ Helpers ------------------------------
 def strip_markdown(s: str) -> str:
     if not isinstance(s, str): return ""
     s = re.sub(r"[*_`]+", "", s)
@@ -85,116 +87,20 @@ def strip_markdown(s: str) -> str:
 def tidy_title(s: str, max_chars: int = 65) -> str:
     s = strip_markdown(s)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    # Capitalize major words lightly
-    words = s.split()
-    if words:
-        words[0] = words[0].capitalize()
-        s = " ".join(words)
-    if len(s) <= max_chars: return s
+    if len(s) <= max_chars:
+        return s
     cut = s[:max_chars].rstrip()
     if " " in cut: cut = cut[: cut.rfind(" ")]
     return cut
 
-def is_valid_url(u: str) -> bool:
-    try:
-        p = urlparse(u)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
+def to_excel_download(df, sheet_name="Products"):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buf.seek(0)
+    return buf
 
-def fetch_thumb(url: str, timeout=7):
-    try:
-        if not is_valid_url(url): return None
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
-        r.raise_for_status()
-        if "image" not in r.headers.get("Content-Type", "").lower() and not url.lower().endswith((".jpg",".jpeg",".png",".webp",".gif")):
-            return None
-        img = Image.open(BytesIO(r.content)).convert("RGB")
-        img.thumbnail((256, 256))
-        return img
-    except Exception:
-        return None
-
-# ---------- OpenAI: image → EN short title (strict prompt + fallback) ----------
-STRICT_PROMPT = (
-    "You write short e-commerce TITLES for product cards. Return ONE title only.\n"
-    "Rules:\n"
-    "• 6–8 words, max 65 characters.\n"
-    "• Include BRAND if visible; otherwise omit brand.\n"
-    "• Include SIZE/COUNT only if clearly visible (e.g., 500ml, 12pcs, 1L, 2kg).\n"
-    "• If variant/scent/flavor is obvious, include it.\n"
-    "• No punctuation except spaces & hyphens; no emojis; no bullets; no quotes.\n"
-    "• Title case lightly: capitalize the first word and proper names only.\n"
-    "• Examples:\n"
-    "  - Omo Laundry Detergent Liquid 2L\n"
-    "  - Fairy Dishwashing Liquid Lemon 650ml\n"
-    "  - Dove Beauty Cream Bar 4pcs\n"
-    "Output ONE line only with the title."
-)
-
-def openai_title_from_image(url: str, max_chars: int, fallback_hint: str = "") -> str:
-    if not openai_active or not is_valid_url(url):
-        return tidy_title(fallback_hint or "", max_chars)
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system","content":"You are a precise e-commerce title writer. Output one short title only."},
-                {"role":"user","content":[
-                    {"type":"text","text":STRICT_PROMPT},
-                    {"type":"image_url","image_url":{"url":url}}
-                ]},
-            ],
-            temperature=0.15,
-        )
-        title = (resp.choices[0].message.content or "").strip()
-        if not title or len(title) < 3:
-            # fallback to hint/sku
-            return tidy_title(fallback_hint or "", max_chars)
-        return tidy_title(title, max_chars)
-    except Exception:
-        return tidy_title(fallback_hint or "", max_chars)
-
-# ---------- Translation ----------
-def deepl_batch_en2ar(texts: List[str]) -> List[str]:
-    if not translator: return list(texts)
-    try:
-        res = translator.translate_text(texts, source_lang="EN", target_lang="AR")
-        return [r.text for r in (res if isinstance(res, list) else [res])]
-    except Exception:
-        return texts
-
-def openai_translate_batch_en2ar(texts: List[str]) -> List[str]:
-    if not openai_active or not texts: return list(texts)
-    sys = "Translate e-commerce product titles into natural, concise Arabic suitable for product cards."
-    usr = "Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
-            temperature=0,
-        )
-        lines = (resp.choices[0].message.content or "").splitlines()
-        out = [l.strip() for l in lines if l.strip()]
-        return out if len(out) == len(texts) else texts
-    except Exception:
-        return texts
-
-def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int) -> pd.Series:
-    texts = titles_en.fillna("").astype(str).tolist()
-    if engine == "DeepL" and deepl_active:
-        return pd.Series(deepl_batch_en2ar(texts), index=titles_en.index)
-    if engine == "OpenAI":
-        out_all = []
-        for s in range(0, len(texts), batch_size):
-            chunk = texts[s:s+batch_size]
-            out_all.extend(openai_translate_batch_en2ar(chunk))
-            time.sleep(0.25)
-        return pd.Series(out_all, index=titles_en.index)
-    return titles_en.copy()
-
-# ---------- Mapping ----------
+# ------------------------------ Mapping lookups ------------------------------
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
         if c in map_df.columns: map_df[c] = map_df[c].astype(str).str.strip()
@@ -213,15 +119,77 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main, sub), "")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main, sub, ssub), "")
 
-# ---------- Excel download ----------
-def to_excel_download(df, sheet_name="Products"):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    buf.seek(0)
-    return buf
+# ------------------------------ Image & AI title helpers ------------------------------
+def is_valid_url(u: str) -> bool:
+    try:
+        p = urlparse(str(u))
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
 
-# ---------- Batched titles ----------
+def fetch_thumb(url: str, timeout=7):
+    try:
+        if not is_valid_url(url): return None
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        img.thumbnail((256, 256))
+        return img
+    except Exception:
+        return None
+
+STRICT_PROMPT = (
+    "Return ONE short e-commerce TITLE only (6–8 words, max 65 characters). "
+    "Include BRAND if visible and SIZE/COUNT only if obvious (e.g., 500ml, 12pcs). "
+    "No emojis, no quotes, no bullets. Title case lightly."
+)
+
+def openai_title_from_image(url: str, fallback_hint: str, max_chars: int) -> str:
+    if not openai_active or not is_valid_url(url):
+        return tidy_title(fallback_hint or "", max_chars)
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":"You output one short product title only."},
+                {"role":"user","content":[
+                    {"type":"text","text":STRICT_PROMPT},
+                    {"type":"image_url","image_url":{"url":url}}
+                ]}
+            ],
+            temperature=0.15,
+        )
+        title = (resp.choices[0].message.content or "").strip()
+        if not title:
+            return tidy_title(fallback_hint or "", max_chars)
+        return tidy_title(title, max_chars)
+    except Exception:
+        return tidy_title(fallback_hint or "", max_chars)
+
+def translate_en_to_ar(texts: List[str], engine: str) -> List[str]:
+    if engine == "DeepL" and deepl_active and translator:
+        try:
+            res = translator.translate_text(texts, source_lang="EN", target_lang="AR")
+            return [r.text for r in (res if isinstance(res, list) else [res])]
+        except Exception:
+            return texts
+    if engine == "OpenAI" and openai_active:
+        sys = "Translate e-commerce product titles into natural, concise Arabic suitable for product cards."
+        usr = "Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
+        try:
+            resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
+                temperature=0,
+            )
+            lines = (resp.choices[0].message.content or "").splitlines()
+            out = [l.strip() for l in lines if l.strip()]
+            return out if len(out) == len(texts) else texts
+        except Exception:
+            return texts
+    return texts
+
 def titles_from_images_batched(df, row_index, max_chars, batch_size, force_regen=False):
     titles_en = pd.Series([""]*len(row_index), index=row_index, dtype="object")
     prog = st.progress(0)
@@ -229,102 +197,114 @@ def titles_from_images_batched(df, row_index, max_chars, batch_size, force_regen
     for step, start in enumerate(range(0,len(row_index),batch_size),1):
         chunk_idx = row_index[start:start+batch_size]
         for i in chunk_idx:
-            cur_name = str(df.loc[i,"name"]) if "name" in df.columns else ""
-            if cur_name.strip() and not force_regen:
-                # keep existing
-                titles_en.loc[i] = cur_name
+            cur_en = str(df.loc[i,"name"]) if "name" in df.columns else ""
+            if cur_en.strip() and not force_regen:
+                titles_en.loc[i] = cur_en
                 continue
             url = str(df.loc[i,"thumbnail"]) if "thumbnail" in df.columns else ""
-            # build a fallback hint from SKU or previous name
-            sku = str(df.loc[i,"merchant_sku"]) if "merchant_sku" in df.columns else ""
-            hint = cur_name if cur_name.strip() else (sku if sku.strip() else "")
-            title = openai_title_from_image(url, max_chars, fallback_hint=hint)
-            # Final fallback: if still empty, try a generic from SKU
-            if not title.strip() and sku:
-                title = f"Product {sku}"
+            fallback = cur_en.strip() or str(df.loc[i,"merchant_sku"])
+            title = openai_title_from_image(url, fallback, max_chars)
+            if not title and str(df.loc[i,"merchant_sku"]).strip():
+                title = f"Product {df.loc[i,'merchant_sku']}"
             titles_en.loc[i] = title
         prog.progress(min(step/steps,1.0))
-        time.sleep(0.15)
+        time.sleep(0.1)
     return titles_en
 
-
-# ---------- UI ----------
-st.title("🛒 Product Mapper: Images → EN Title → AR → Grouping")
-
-# Upload files
-c1,c2 = st.columns(2)
-with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes column W named 'thumbnail')", type=["xlsx","xls","csv"])
-with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
+# ------------------------------ Upload ------------------------------
+c1, c2 = st.columns(2)
+with c1:
+    product_file = st.file_uploader("Product List (.xlsx/.csv) — must include column W named 'thumbnail'", type=["xlsx","xls","csv"])
+with c2:
+    mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
 
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"Product List")
-        and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
+if not product_file or prod_df is None:
     st.stop()
 
+# Normalize/alias the thumbnail column BEFORE validation (accept common alternates)
+if "thumbnail" not in prod_df.columns:
+    for alt in ["Thumbnail","image_url","ImageURL","image","img","Image Url","ImageURL"]:
+        if alt in prod_df.columns:
+            prod_df["thumbnail"] = prod_df[alt]
+            break
+
+if not validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List"):
+    st.stop()
+
+if not mapping_file or map_df is None or not validate_columns(map_df, REQUIRED_MAP_COLS, "Category Mapping"):
+    st.stop()
+
+# Session state DF (working copy)
 if "work" not in st.session_state:
     st.session_state.work = prod_df.copy()
 
-work = st.session_state.work
+work = st.session_state.work.copy()  # local view; write back at end
 lookups = build_mapping_struct_fixed(map_df)
 
-# ---------- 1) Titles from Images (FIRST STEP) ----------
-st.header("1) Generate English titles from images, then translate to Arabic")
-max_len=st.slider("Max title length",50,90,65,5)
-batch_size=st.slider("Batch size (image→title)",25,120,60,5)
-engine=st.selectbox("Arabic translation engine",["DeepL","OpenAI","None"])
-force_regen = st.checkbox("Regenerate even if English title is not empty", value=False)
+# ------------------------------ Sidebar: Title Assistant ------------------------------
+with st.sidebar:
+    st.header("🖼️ Title Assistant")
+    st.caption("Generate **EN** from images (W: `thumbnail`) → translate to **AR**.")
 
-scope=st.selectbox("Scope",["All rows","Only rows with empty English title"])
-if st.button("Generate Titles & Translations"):
-    if scope == "All rows":
-        idx_list = work.index.tolist()
+    max_len = st.slider("Max title length", 50, 90, 65, 5)
+    engine = st.selectbox("Arabic translation engine", ["DeepL", "OpenAI", "None"], index=0)
+    scope = st.selectbox("Scope", ["Only empty EN", "All rows"], index=0)
+    force_regen = st.checkbox("Regenerate even if EN not empty", value=False)
+    run_titles = st.button("Generate Titles & Translate")
+
+    # Tiny preview
+    if st.checkbox("Show 12 thumbnails preview", value=False):
+        if "thumbnail" in work.columns:
+            urls = work["thumbnail"].fillna("").astype(str).tolist()
+            show_n = min(12, len(urls))
+            cols = st.columns(3)
+            for i in range(show_n):
+                img = fetch_thumb(urls[i])
+                with cols[i % 3]:
+                    if img: st.image(img, use_container_width=True)
+                    else:   st.write("No image")
+
+if run_titles:
+    if scope == "Only empty EN" and not force_regen:
+        idx = work[work["name"].astype(str).str.strip().eq("")].index
     else:
-        idx_list = work[work["name"].astype(str).str.strip().eq("")].index.tolist()
-        if len(idx_list) == 0 and not force_regen:
-            st.info("No rows with empty English title. Nothing to do.")
-    if scope == "Only rows with empty English title" and force_regen:
-        # Overwrite only those empty, but checkbox is true – clarify behavior
-        st.caption("Regenerate applies only to selected scope; with this scope it affects only empty titles.")
+        idx = work.index
 
-    if scope == "All rows" or len(idx_list) > 0:
-        targets = work.index.tolist() if scope == "All rows" else idx_list
-        titles_en=titles_from_images_batched(work,targets,max_len,batch_size,force_regen=force_regen)
-        work.loc[targets,"name"]=titles_en.loc[targets]
-        if engine in ("DeepL","OpenAI"):
-            work.loc[targets,"name_ar"]=translate_en_titles(titles_en.loc[targets],engine,batch_size=max(20, batch_size//2))
-        st.success(f"Updated titles for {len(targets)} rows.")
+    if len(idx) == 0:
+        st.info("No target rows to process.")
+    else:
+        titles_en = titles_from_images_batched(work, idx, max_len, batch_size=60, force_regen=force_regen)
+        work.loc[idx, "name"] = titles_en.loc[idx]
+        if engine != "None":
+            # translate in reasonably sized chunks
+            out_all = []
+            en_all = titles_en.loc[idx].astype(str).tolist()
+            for s in range(0, len(en_all), 60):
+                chunk = en_all[s:s+60]
+                out_all.extend(translate_en_to_ar(chunk, engine))
+                time.sleep(0.1)
+            work.loc[idx, "name_ar"] = pd.Series(out_all, index=idx)
+        st.success(f"Updated titles for {len(idx)} rows.")
 
-# Thumbnails quick preview for current top rows
-st.subheader("Quick image preview (first 24 rows in current sheet)")
-if "thumbnail" in work.columns:
-    urls = work["thumbnail"].fillna("").astype(str).tolist()
-    show_n = min(24, len(urls))
-    cols = st.columns(6)
-    for i, url in enumerate(urls[:show_n]):
-        with cols[i % 6]:
-            img = fetch_thumb(url)
-            if img:
-                st.image(img, caption=f"Row {work.index[i]}", use_container_width=True)
-            else:
-                st.write("No image / bad URL")
-else:
-    st.warning("No 'thumbnail' column found; make sure column W is named 'thumbnail'.")
+# Persist updates to session
+st.session_state.work = work
 
+# ------------------------------ 1) Filter view ------------------------------
+st.header("Find products & bulk-assign category IDs")
 
-# ---------- 2) Filter view ----------
-st.header("2) Filter view")
-st.session_state.setdefault("search_q","")
-st.session_state.setdefault("show_unmapped",False)
+st.session_state.setdefault("search_q", "")
+st.session_state.setdefault("show_unmapped", False)
 
 def clear_filters():
     st.session_state["search_q"] = ""
     st.session_state["show_unmapped"] = False
 
-f1,f2,f3 = st.columns([3,1,1])
+f1, f2, f3 = st.columns([3,1,1])
 with f1:
-    st.text_input("Search by 'name' or 'name_ar':", key="search_q", placeholder="e.g., dishwashing / صابون")
+    st.text_input("Search by 'name' or 'name_ar' (e.g., Dishwashing / سائل):", key="search_q", placeholder="")
 with f2:
     st.button("Show all", on_click=clear_filters)
 with f3:
@@ -332,9 +312,9 @@ with f3:
 
 q = st.session_state["search_q"].strip().lower()
 base_mask = (
-    work["name"].astype(str).str.lower().str.contains(q,na=False) |
-    work["name_ar"].astype(str).str.lower().str.contains(q,na=False)
-) if q else pd.Series(True,index=work.index)
+    work["name"].astype(str).str.lower().str.contains(q, na=False) |
+    work["name_ar"].astype(str).str.lower().str.contains(q, na=False)
+) if q else pd.Series(True, index=work.index)
 
 if st.session_state["show_unmapped"]:
     mask = base_mask & (
@@ -345,22 +325,21 @@ else:
     mask = base_mask
 
 filtered = work[mask].copy()
-st.caption(f"Rows in current filtered view: {filtered.shape[0]}")
+st.caption(f"Matched rows: {filtered.shape[0]}")
 
-# Show filtered table
 st.dataframe(
     filtered[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
     use_container_width=True, height=320
 )
 
-# ---------- 3) Grouping Methods ----------
-st.header("3) Grouping & bulk apply")
+# ------------------------------ 2) Grouping & bulk apply ------------------------------
+st.header("Grouping & Bulk Apply")
 
-# ----- 3A. Keyword Groups (with visible table + deselection) -----
-st.subheader("3A) Keyword groups (add many keywords; preview table; deselect; apply)")
+# 2A. Keyword groups (many keywords, preview table, deselect, apply)
+st.subheader("2A) Keyword groups")
 st.session_state.setdefault("keyword_rules", [])
 
-with st.expander("➕ Add keyword(s) and mapping"):
+with st.expander("➕ Add keyword(s) + mapping"):
     colkw, colm, cols, colss = st.columns([3,2,2,2])
     with colkw:
         kws_text = st.text_area("Keywords (one per line)", placeholder="soap\nshampoo\ndetergent gel\ndishwashing")
@@ -393,7 +372,6 @@ if st.session_state.keyword_rules:
         st.markdown(f"**Rule #{idx_rule+1}** — Main: `{rule['main']}` / Sub: `{rule['sub']}` / Sub-Sub: `{rule['subsub']}`")
         st.caption(f"Keywords: {', '.join(rule['keywords'])}")
 
-        # Build mask for ALL rows (not only filtered)
         m = pd.Series(False, index=work.index)
         for kw in rule["keywords"]:
             kw_l = kw.lower()
@@ -402,7 +380,6 @@ if st.session_state.keyword_rules:
 
         hits_df = work[m].copy()
         st.write(f"Matches found: {hits_df.shape[0]}")
-
         if hits_df.shape[0] > 0:
             st.dataframe(hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
                          use_container_width=True, height=280)
@@ -432,8 +409,8 @@ if st.session_state.keyword_rules:
 else:
     st.info("Add keyword groups above to map big buckets fast.")
 
-# ----- 3B. Auto-Groups by feature tokens (also shows table) -----
-st.subheader("3B) Auto-Groups by feature tokens (plastic, sensitive, lemon, baby, etc.)")
+# 2B. Auto-Groups by feature tokens
+st.subheader("2B) Auto-Groups by feature tokens (plastic, sensitive, lemon, baby, etc.)")
 STOP={"the","and","for","with","of","to","in","on","by","a","an","&","-","ml","g","kg","l","oz","pcs","pc","pack","pkt","ct","size","new","extra","x"}
 def tokenize(name): return [t for t in re.split(r"[^A-Za-z0-9]+", str(name).lower()) if t and t not in STOP and len(t)>2 and not t.isdigit()]
 use_entire=st.checkbox("Build groups from ALL rows (not just filtered)",value=False)
@@ -471,8 +448,8 @@ if candidates:
 else:
     st.info("No frequent tokens found. Adjust threshold or dataset.")
 
-# ----- 3C. Manual one-shot apply on current filtered view -----
-st.subheader("3C) Manual apply to CURRENT filtered view")
+# 2C. Manual apply to CURRENT filtered view
+st.subheader("2C) Manual apply to CURRENT filtered view")
 sel_main = st.selectbox("Main Category", [""]+lookups["main_names"], key="manual_main")
 sel_sub  = st.selectbox("Sub Category", [""]+lookups["main_to_subnames"].get(sel_main,[]), key="manual_sub")
 sel_ssub = st.selectbox("Sub-Sub Category", [""]+lookups["pair_to_subsubnames"].get((sel_main,sel_sub),[]), key="manual_ssub")
@@ -482,9 +459,11 @@ if st.button("Apply IDs to all rows in current filtered view"):
     if sel_ssub: work.loc[mask,"sub_sub_category_id"]=get_ssub_no(lookups,sel_main,sel_sub,sel_ssub)
     st.success("Applied IDs to current view.")
 
+# Persist mapping changes
+st.session_state.work = work
 
-# ---------- 4) Review & Download ----------
-st.header("4) Review & Download")
+# ------------------------------ 3) Review & Download ------------------------------
+st.header("Review & Download")
 st.subheader("Filtered view (again)")
 st.dataframe(
     filtered[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
