@@ -155,21 +155,22 @@ def _openai_chat(messages, **kwargs):
         model="gpt-4o-mini", messages=messages, **kwargs))
 
 # ===== Structured extraction for titles =====
-STRUCT_PROMPT_JSON = (
-    "Look at the PHOTO and extract fields for an e-commerce title.\n"
-    "Return EXACTLY ONE LINE of STRICT JSON with keys:"
-    '{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,'
-    '"flavor_scent":string|null,"material":string|null,"size_value":string|null,'
-    '"size_unit":string|null,"count":string|null,"feature":string|null}\n"
-    "Rules:\n"
-    "- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').\n"
-    "- PRIORITIZE object_type over printed text when they disagree.\n"
-    "- NEVER output 'tea bag' unless an actual bag/sachet is visible.\n"
-    "- If brand not visible set brand=null. If product is unclear set product=null.\n"
-    "- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].\n"
-    "- feature is a short visible attribute (e.g., 'heat-resistant').\n"
-    "- Output JSON only."
-)
+STRUCT_PROMPT_JSON = """
+Look at the PHOTO and extract fields for an e-commerce title.
+Return EXACTLY ONE LINE of STRICT JSON with keys:
+{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
+"flavor_scent":string|null,"material":string|null,"size_value":string|null,
+"size_unit":string|null,"count":string|null,"feature":string|null}
+Rules:
+- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').
+- PRIORITIZE object_type over printed text when they disagree.
+- NEVER output 'tea bag' unless an actual bag/sachet is visible.
+- If brand not visible set brand=null. If product is unclear set product=null.
+- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
+- feature is a short visible attribute (e.g., 'heat-resistant').
+- Output JSON only.
+"""
+
 
 def assemble_title_from_fields(d: dict) -> str:
     brand = (d.get("brand") or "").strip()
