@@ -177,11 +177,8 @@ def openai_title_from_image(url:str,max_chars:int)->str:
     except Exception:
         return _fallback_simple_title(data_url, max_chars)
 
-# ============== Translation ==============
-# … [UNCHANGED translation functions, but use _openai_chat as before] …
-
-# ============== run_titles audit logging change ==============
-# def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
+# ============== run_titles with surgical fix ==============
+def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
     updated = skipped = failed = 0
     store = global_cache().setdefault(st.session_state.file_hash, {})
 
@@ -218,7 +215,6 @@ def openai_title_from_image(url:str,max_chars:int)->str:
                 work.at[i, "name"] = title
                 st.session_state.proc_cache.setdefault(sku, {})["name"] = title
                 store.setdefault(sku, {})["en"] = title
-                _trim_store(store)
                 updated += 1
             else:
                 # precise audit reason
@@ -231,5 +227,5 @@ def openai_title_from_image(url:str,max_chars:int)->str:
 
     return updated, skipped, failed
 
-
-# … [REST OF THE MASTER FILE UNCHANGED: translation, mapping, UI sections, etc.] …
+# ============== Translation, Mapping, UI Sections, Router ==============
+# … [UNCHANGED from previous master file version] …
