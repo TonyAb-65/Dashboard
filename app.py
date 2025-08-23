@@ -1,4 +1,4 @@
-# Product Mapping Dashboard — Master (object_type-aware titles, robust fetch, strict fallback, clean audit)
+# Product Mapping Dashboard — Master (object_type-aware titles, single-fetch vision, strict fallback, clean audit)
 
 import io, re, time, math, hashlib, base64, json
 from typing import List, Iterable, Dict, Tuple
@@ -150,6 +150,14 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
+def _ensure_http_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u: return ""
+    if u.startswith("//"): return "https:" + u
+    if not re.match(r"^https?://", u, flags=re.I):
+        return "https://" + u
+    return u
+
 # ---------- stronger fetch with streaming cap ----------
 def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     """Manual fetch → data URL. Resilient stream with size cap."""
@@ -264,10 +272,9 @@ def _fallback_simple_title(data_url: str, max_chars: int) -> str:
     except Exception:
         return ""
 
-def openai_title_from_image(url:str,max_chars:int)->str:
-    if not openai_active: return ""
-    data_url=fetch_image_as_data_url(url)
-    if not data_url: return ""
+# ---------- Vision on pre-fetched data_url ----------
+def openai_title_from_data(data_url: str, max_chars: int) -> str:
+    if not openai_active or not data_url: return ""
     try:
         resp=_openai_chat(
             [{"role":"system","content":"Extract concise, accurate product fields from the image."},
@@ -287,15 +294,15 @@ def openai_title_from_image(url:str,max_chars:int)->str:
 
         obj=(data.get("object_type") or "").strip().lower()
         prod=(data.get("product") or "").strip().lower()
-        invalid_tokens={"ml","l","g","kg","pcs","tabs","caps"}
-        if (not obj and not prod) or (prod in invalid_tokens):
+        invalid={"ml","l","g","kg","pcs","tabs","caps"}
+        if (not obj and not prod) or (prod in invalid):
             return _fallback_simple_title(data_url, max_chars)
         if (obj and "bag" in obj and "tea" in obj) or (prod and "tea bag" in prod):
             return _fallback_simple_title(data_url, max_chars)
 
         title=assemble_title_from_fields(data)
         if title and len(title)>=3:
-            return tidy_title(title,max_chars)
+            return tidy_title(title, max_chars)
         return _fallback_simple_title(data_url, max_chars)
     except Exception:
         return _fallback_simple_title(data_url, max_chars)
@@ -511,7 +518,7 @@ def sec_titles():
         if "thumbnail" in view.columns and len(view) > 0:
             cols = gallery.columns(6)
             for j, (i, row) in enumerate(view.iterrows()):
-                url = _normalize_url(str(row.get("thumbnail", "")))
+                url = _normalize_url(_ensure_http_url(str(row.get("thumbnail", ""))))
                 with cols[j % 6]:
                     if is_valid_url(url):
                         st.image(url, caption=f"Row {i}", use_container_width=True)
@@ -537,7 +544,8 @@ def sec_titles():
                 sku = str(work.at[i, "merchant_sku"])
                 cache_local = st.session_state.proc_cache.get(sku, {})
                 cur_en = (str(work.at[i, "name"]) if pd.notna(work.at[i, "name"]) else "").strip()
-                url = str(work.at[i, "thumbnail"]) if "thumbnail" in work.columns else ""
+                raw_url = str(work.at[i, "thumbnail"]) if "thumbnail" in work.columns else ""
+                norm_url = _normalize_url(_ensure_http_url(raw_url))
 
                 # prefer persistent store if not forcing
                 if not force_over and store.get(sku, {}).get("en"):
@@ -556,9 +564,16 @@ def sec_titles():
                     skipped += 1
                     continue
 
-                title = ""
-                if url:
-                    title = openai_title_from_image(url, max_len)
+                # fetch ONCE per row
+                data_url = fetch_image_as_data_url(norm_url) if norm_url else ""
+                if not data_url:
+                    st.session_state.audit_rows.append({
+                        "sku": sku, "phase": "EN title", "reason": "fetch_failed", "url": norm_url
+                    })
+                    failed += 1
+                    continue
+
+                title = openai_title_from_data(data_url, max_len)
 
                 if title:
                     work.at[i, "name"] = title
@@ -567,13 +582,8 @@ def sec_titles():
                     _trim_store(store)
                     updated += 1
                 else:
-                    # precise audit reason without double-fetch
-                    data_url_present = bool(is_valid_url(url))
                     st.session_state.audit_rows.append({
-                        "sku": sku,
-                        "phase": "EN title",
-                        "reason": "vision_empty_or_invalid" if data_url_present else "fetch_failed",
-                        "url": url
+                        "sku": sku, "phase": "EN title", "reason": "vision_empty_or_invalid", "url": norm_url
                     })
                     failed += 1
 
@@ -805,7 +815,7 @@ def sec_settings():
         if st.button("Show 10 normalized thumbnail URLs"):
             sample=work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
             for u in sample:
-                norm=_normalize_url(u); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
+                norm=_normalize_url(_ensure_http_url(u)); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
