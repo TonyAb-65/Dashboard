@@ -150,60 +150,80 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
+# ---------- PATCH: stronger fetch with streaming cap ----------
 def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
-    """Manual fetch → data URL. Not auto-run on upload."""
+    """Manual fetch → data URL. Resilient stream with size cap."""
     try:
         if not is_valid_url(url): return ""
         url=_normalize_url(url)
         headers={"User-Agent":"Mozilla/5.0",
                  "Accept":"image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                  "Referer":f"https://{urlsplit(url).netloc}"}
-        r=requests.get(url,timeout=timeout,headers=headers,allow_redirects=True,stream=True)
-        r.raise_for_status()
-        data=r.content if r.content else r.raw.read(max_bytes+1)
-        if len(data)>max_bytes: return ""
+        with requests.get(url,timeout=timeout,headers=headers,allow_redirects=True,stream=True) as r:
+            r.raise_for_status()
+            data=bytearray()
+            for chunk in r.iter_content(chunk_size=65536):
+                if not chunk: break
+                data.extend(chunk)
+                if len(data)>max_bytes: return ""
         try:
-            fmt=Image.open(BytesIO(data)).format or "JPEG"
+            fmt=Image.open(BytesIO(bytes(data))).format or "JPEG"
         except Exception:
             fmt="JPEG"
         mime="image/jpeg" if fmt.upper() in ("JPG","JPEG") else f"image/{fmt.lower()}"
-        b64=base64.b64encode(data).decode("ascii")
+        b64=base64.b64encode(bytes(data)).decode("ascii")
         return f"data:{mime};base64,{b64}"
     except Exception:
         return ""
 
-# ===== Structured extraction for titles (NEW — UI unchanged) =====
+# ---------- PATCH: tiny retry wrapper for OpenAI ----------
+def _retry(fn, attempts=4, base=0.5):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            time.sleep(base * (2 ** i))
+
+def _openai_chat(messages, **kwargs):
+    return _retry(lambda: openai_client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages, **kwargs))
+
+# ===== Structured extraction for titles (patched prompt) =====
 STRUCT_PROMPT_JSON = (
-    "You are extracting product info from an image for an e-commerce TITLE.\n"
-    "Return a SINGLE LINE of STRICT JSON with keys:"
-    '{"brand":string|null,"product":string,"variant":string|null,"flavor_scent":string|null,'
-    '"material":string|null,"size_value":string|null,"size_unit":string|null,"count":string|null}\n'
+    "You read ONLY the product label in the image and extract fields for a title.\n"
+    "Return EXACTLY ONE LINE of STRICT JSON with keys:"
+    '{"brand":string|null,"product":string,"variant":string|null,'
+    '"flavor_scent":string|null,"material":string|null,"size_value":string|null,'
+    '"size_unit":string|null,"count":string|null,"feature":string|null}\n'
     "Rules:\n"
-    "- Read label text only. If unknown, use null.\n"
-    "- size_value examples: '500','1','2.5' (numeric only)\n"
-    "- size_unit examples: 'ml','L','g','kg','pcs','tabs','caps'\n"
-    "- count is package count (e.g., '4','12').\n"
-    "- Output JSON only. No explanations."
+    "- If brand not visible, set brand=null.\n"
+    "- product must be a generic noun if unclear (e.g., 'glass teapot').\n"
+    "- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].\n"
+    "- count is pack count if shown.\n"
+    "- feature is a short key attribute on the label if present (e.g., 'heat-resistant').\n"
+    "- Output JSON only."
 )
 
 def assemble_title_from_fields(d: dict) -> str:
     brand = (d.get("brand") or "").strip()
     product = (d.get("product") or "").strip()
     variant = (d.get("variant") or "").strip()
-    flavor = (d.get("flavor_scent") or "").strip()
-    material = (d.get("material") or "").strip()
-    size_v = (d.get("size_value") or "").strip()
-    size_u = (d.get("size_unit") or "").strip().lower()
-    count  = (d.get("count") or "").strip()
+    flavor  = (d.get("flavor_scent") or "").strip()
+    material= (d.get("material") or "").strip()
+    feature = (d.get("feature") or "").strip()
+    size_v  = (d.get("size_value") or "").strip()
+    size_u  = (d.get("size_unit") or "").strip().lower()
+    count   = (d.get("count") or "").strip()
 
     parts=[]
-    if brand: parts.append(brand)
+    if brand:  parts.append(brand)
     if product: parts.append(product)
-    if variant: parts.append(variant)
-    elif flavor: parts.append(flavor)
-    elif material: parts.append(material)
 
-    # normalize unit
+    qual = variant or flavor or material or feature
+    if qual: parts.append(qual)
+
     unit=size_u
     if unit in ["milliliter","mls","ml."]: unit="ml"
     if unit in ["liter","litre","ltrs","ltr"]: unit="L"
@@ -218,22 +238,22 @@ def assemble_title_from_fields(d: dict) -> str:
 
     return tidy_title(" ".join(p for p in parts if p), 70)
 
+# ---------- PATCH: stricter fallback title writer ----------
 def _fallback_simple_title(data_url: str, max_chars: int) -> str:
-    """Prior behavior preserved as fallback."""
     if not openai_active or not data_url: return ""
-    prompt=("Return ONE short English product title only. 6–8 words, ≤70 chars. "
-            "Include brand if visible and size/count if obvious. Only the title.")
+    prompt = (
+        "Write ONE clean English e-commerce title ≤70 chars. "
+        "Order: Brand, Product, Variant/Flavor/Scent, Material, Size/Count. "
+        "Omit unknowns. No marketing words. One line."
+    )
     try:
-        resp=openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"You are a precise e-commerce title writer."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":data_url}}
-                ]},
-            ],
-            temperature=0, max_tokens=96,
+        resp=_openai_chat(
+            [{"role":"system","content":"You are a precise e-commerce title writer."},
+             {"role":"user","content":[
+                 {"type":"text","text":prompt},
+                 {"type":"image_url","image_url":{"url":data_url}}
+             ]}],
+            temperature=0, max_tokens=64
         )
         txt=(resp.choices[0].message.content or "").strip()
         return tidy_title(txt,max_chars) if txt else ""
@@ -241,30 +261,29 @@ def _fallback_simple_title(data_url: str, max_chars: int) -> str:
         return ""
 
 def openai_title_from_image(url:str,max_chars:int)->str:
-    """NEW: vision JSON extraction → assembled title; fallback to prior simple prompt."""
+    """Vision JSON extraction → assembled title; robust fallback to simple title."""
     if not openai_active: return ""
     data_url=fetch_image_as_data_url(url)
     if not data_url: return ""
     try:
-        resp=openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"Extract concise, accurate product fields from the image."},
-                {"role":"user","content":[
-                    {"type":"text","text":STRUCT_PROMPT_JSON},
-                    {"type":"image_url","image_url":{"url":data_url}}
-                ]}
-            ],
-            temperature=0.1, max_tokens=220,
+        resp=_openai_chat(
+            [{"role":"system","content":"Extract concise, accurate product fields from the image."},
+             {"role":"user","content":[
+                 {"type":"text","text":STRUCT_PROMPT_JSON},
+                 {"type":"image_url","image_url":{"url":data_url}}
+             ]}],
+            temperature=0.1, max_tokens=220
         )
         raw=(resp.choices[0].message.content or "").strip()
         m=re.search(r"\{.*\}", raw, re.S)
-        json_str=m.group(0) if m else raw
-        data=json.loads(json_str)
+        if not m: return _fallback_simple_title(data_url, max_chars)
+        try:
+            data=json.loads(m.group(0))
+        except Exception:
+            return _fallback_simple_title(data_url, max_chars)
         title=assemble_title_from_fields(data)
         if title and len(title)>=3:
             return tidy_title(title,max_chars)
-        # fallback to previous simple prompt
         return _fallback_simple_title(data_url, max_chars)
     except Exception:
         return _fallback_simple_title(data_url, max_chars)
@@ -283,10 +302,9 @@ def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     sys="Translate e-commerce product titles into natural, concise Arabic."
     usr="Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
     try:
-        resp=openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
-            temperature=0,
+        resp=_openai_chat(
+            [{"role":"system","content":sys},{"role":"user","content":usr}],
+            temperature=0
         )
         lines=(resp.choices[0].message.content or "").splitlines()
         return [l.strip() for l in lines if l.strip()] or texts
@@ -441,8 +459,9 @@ def sec_filter():
                         if f in df.columns: m|=df[f].astype(str).str.contains(pat, case=False, regex=True, na=False)
                 else:
                     m=pd.Series(False,index=df.index)
-                    for f in df.columns:
-                        if f in fields: m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                    for f in fields:
+                        if f in df.columns:
+                            m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
             for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
@@ -490,6 +509,12 @@ def sec_titles():
             st.info("No thumbnails found in current scope.")
 
     # ---------- Batched workers with persistent cache ----------
+    MAX_CACHE_PER_FILE = 20000
+    def _trim_store(store: dict):
+        if len(store) <= MAX_CACHE_PER_FILE: return
+        for k in list(store.keys())[: len(store)//2]:
+            store.pop(k, None)
+
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
         store = global_cache().setdefault(st.session_state.file_hash, {})
@@ -501,7 +526,6 @@ def sec_titles():
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
                 url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
 
-                # prefer persistent store if not forcing
                 if not force_over and store.get(sku, {}).get("en"):
                     work.at[i,"name"] = store[sku]["en"]
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = store[sku]["en"]
@@ -517,7 +541,8 @@ def sec_titles():
                 if title:
                     work.at[i,"name"] = title
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = title
-                    store.setdefault(sku, {})["en"] = title          # persist
+                    store.setdefault(sku, {})["en"] = title
+                    _trim_store(store)
                     updated += 1
                 else:
                     failed += 1
@@ -538,7 +563,6 @@ def sec_titles():
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
 
-            # prefer persistent store if not forcing
             if not force_over and store.get(sku, {}).get("ar"):
                 work.at[i,"name_ar"] = store[sku]["ar"]
                 st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]
@@ -560,7 +584,8 @@ def sec_titles():
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
                     st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
-                    store.setdefault(sku, {})["ar"] = ar            # persist
+                    store.setdefault(sku, {})["ar"] = ar
+                    _trim_store(store)
                     updated += 1
                 else:
                     failed += 1
@@ -582,7 +607,6 @@ def sec_titles():
             bar = st.progress(0.0, text="Starting…")
             en_up=en_skip=en_fail=ar_up=ar_fail=0
 
-            # Live job panel
             st.caption("Job panel")
             jp_cols = st.columns(5)
             c_total, c_done, c_en, c_ar, c_batch = jp_cols
