@@ -1,6 +1,6 @@
 # Product Mapping Dashboard — Master (UI intact, manual trigger, batched pipeline, persistent cache, clearer job panel)
 
-import io, re, time, math, hashlib, base64
+import io, re, time, math, hashlib, base64, json
 from typing import List, Iterable, Dict, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -172,11 +172,55 @@ def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     except Exception:
         return ""
 
-# ============== OpenAI + Translation ==============
-def openai_title_from_image(url:str,max_chars:int)->str:
-    if not openai_active: return ""
-    data_url=fetch_image_as_data_url(url)
-    if not data_url: return ""
+# ===== Structured extraction for titles (NEW — UI unchanged) =====
+STRUCT_PROMPT_JSON = (
+    "You are extracting product info from an image for an e-commerce TITLE.\n"
+    "Return a SINGLE LINE of STRICT JSON with keys:"
+    '{"brand":string|null,"product":string,"variant":string|null,"flavor_scent":string|null,'
+    '"material":string|null,"size_value":string|null,"size_unit":string|null,"count":string|null}\n'
+    "Rules:\n"
+    "- Read label text only. If unknown, use null.\n"
+    "- size_value examples: '500','1','2.5' (numeric only)\n"
+    "- size_unit examples: 'ml','L','g','kg','pcs','tabs','caps'\n"
+    "- count is package count (e.g., '4','12').\n"
+    "- Output JSON only. No explanations."
+)
+
+def assemble_title_from_fields(d: dict) -> str:
+    brand = (d.get("brand") or "").strip()
+    product = (d.get("product") or "").strip()
+    variant = (d.get("variant") or "").strip()
+    flavor = (d.get("flavor_scent") or "").strip()
+    material = (d.get("material") or "").strip()
+    size_v = (d.get("size_value") or "").strip()
+    size_u = (d.get("size_unit") or "").strip().lower()
+    count  = (d.get("count") or "").strip()
+
+    parts=[]
+    if brand: parts.append(brand)
+    if product: parts.append(product)
+    if variant: parts.append(variant)
+    elif flavor: parts.append(flavor)
+    elif material: parts.append(material)
+
+    # normalize unit
+    unit=size_u
+    if unit in ["milliliter","mls","ml."]: unit="ml"
+    if unit in ["liter","litre","ltrs","ltr"]: unit="L"
+    if unit in ["grams","gram","gr"]: unit="g"
+    if unit in ["kilogram","kilo","kgs"]: unit="kg"
+
+    size_str=""
+    if size_v and unit: size_str=f"{size_v}{unit}"
+    if count and not size_str: size_str=f"{count}pcs"
+    elif count and size_str: size_str=f"{size_str} {count}pcs"
+    if size_str: parts.append(size_str)
+
+    return tidy_title(" ".join(p for p in parts if p), 70)
+
+def _fallback_simple_title(data_url: str, max_chars: int) -> str:
+    """Prior behavior preserved as fallback."""
+    if not openai_active or not data_url: return ""
     prompt=("Return ONE short English product title only. 6–8 words, ≤70 chars. "
             "Include brand if visible and size/count if obvious. Only the title.")
     try:
@@ -196,6 +240,36 @@ def openai_title_from_image(url:str,max_chars:int)->str:
     except Exception:
         return ""
 
+def openai_title_from_image(url:str,max_chars:int)->str:
+    """NEW: vision JSON extraction → assembled title; fallback to prior simple prompt."""
+    if not openai_active: return ""
+    data_url=fetch_image_as_data_url(url)
+    if not data_url: return ""
+    try:
+        resp=openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":"Extract concise, accurate product fields from the image."},
+                {"role":"user","content":[
+                    {"type":"text","text":STRUCT_PROMPT_JSON},
+                    {"type":"image_url","image_url":{"url":data_url}}
+                ]}
+            ],
+            temperature=0.1, max_tokens=220,
+        )
+        raw=(resp.choices[0].message.content or "").strip()
+        m=re.search(r"\{.*\}", raw, re.S)
+        json_str=m.group(0) if m else raw
+        data=json.loads(json_str)
+        title=assemble_title_from_fields(data)
+        if title and len(title)>=3:
+            return tidy_title(title,max_chars)
+        # fallback to previous simple prompt
+        return _fallback_simple_title(data_url, max_chars)
+    except Exception:
+        return _fallback_simple_title(data_url, max_chars)
+
+# ============== Translation ==============
 def deepl_batch_en2ar(texts:List[str])->List[str]:
     if not translator: return list(texts)
     try:
@@ -367,8 +441,8 @@ def sec_filter():
                         if f in df.columns: m|=df[f].astype(str).str.contains(pat, case=False, regex=True, na=False)
                 else:
                     m=pd.Series(False,index=df.index)
-                    for f in fields:
-                        if f in df.columns: m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                    for f in df.columns:
+                        if f in fields: m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
             for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
