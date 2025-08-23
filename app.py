@@ -2,6 +2,7 @@ import io
 import re
 import time
 import math
+import json
 from typing import List
 from urllib.parse import urlparse
 from collections import Counter
@@ -21,7 +22,7 @@ REQUIRED_PRODUCT_COLS = [
     "name", "name_ar", "merchant_sku",
     "category_id", "category_id_ar",
     "sub_category_id", "sub_sub_category_id",
-    "thumbnail",  # Column W – we will also auto-map from common alternates below
+    "thumbnail",
 ]
 
 REQUIRED_MAP_COLS = [
@@ -85,7 +86,7 @@ def strip_markdown(s: str) -> str:
     return s
 
 def tidy_title(s: str, max_chars: int = 65) -> str:
-    s = strip_markdown(s)
+    s = strip_markdown(s or "")
     s = re.sub(r"\s{2,}", " ", s).strip()
     if len(s) <= max_chars:
         return s
@@ -139,29 +140,93 @@ def fetch_thumb(url: str, timeout=7):
     except Exception:
         return None
 
-STRICT_PROMPT = (
-    "Return ONE short e-commerce TITLE only (6–8 words, max 65 characters). "
-    "Include BRAND if visible and SIZE/COUNT only if obvious (e.g., 500ml, 12pcs). "
-    "No emojis, no quotes, no bullets. Title case lightly."
+# --- Structured vision prompt: extract fields then assemble title ---
+STRUCT_PROMPT_JSON = (
+    "You are extracting product info from an image for an e-commerce TITLE.\n"
+    "Return a SINGLE LINE of STRICT JSON with keys:\n"
+    '{'
+    '"brand": string|null, '
+    '"product": string, '
+    '"variant": string|null, '
+    '"flavor_scent": string|null, '
+    '"material": string|null, '
+    '"size_value": string|null, '
+    '"size_unit": string|null, '
+    '"count": string|null'
+    '}\n'
+    "Rules:\n"
+    "- Read visible label text. If unknown, use null.\n"
+    "- size_value examples: '500', '1', '2.5'  (numeric only)\n"
+    "- size_unit examples: 'ml','L','g','kg','pcs','tabs','caps'\n"
+    "- count is package count if shown (e.g., '4', '12').\n"
+    "- Do not add extra keys or commentary. JSON only.\n"
 )
 
+def assemble_title_from_fields(d: dict) -> str:
+    brand = (d.get("brand") or "").strip()
+    product = (d.get("product") or "").strip()
+    variant = (d.get("variant") or "").strip()
+    flavor = (d.get("flavor_scent") or "").strip()
+    material = (d.get("material") or "").strip()
+    size_v = (d.get("size_value") or "").strip()
+    size_u = (d.get("size_unit") or "").strip().lower()
+    count  = (d.get("count") or "").strip()
+
+    parts = []
+    if brand: parts.append(brand)
+    if product: parts.append(product)
+    # prefer variant -> flavor -> material
+    if variant: parts.append(variant)
+    elif flavor: parts.append(flavor)
+    elif material: parts.append(material)
+
+    # size or count
+    size_str = ""
+    if size_v and size_u:
+        # Normalize units
+        unit = size_u
+        if unit in ["milliliter","mls","ml."]: unit = "ml"
+        if unit in ["liter","litre","ltrs","ltr"]: unit = "L"
+        if unit in ["grams","gram","gr"]: unit = "g"
+        if unit in ["kilogram","kilo","kgs"]: unit = "kg"
+        size_str = f"{size_v}{unit}"
+    if count and not size_str:
+        # only count
+        size_str = f"{count}pcs"
+    elif count and size_str:
+        size_str = f"{size_str} {count}pcs"
+
+    if size_str:
+        parts.append(size_str)
+
+    title = " ".join(p for p in parts if p).strip()
+    return tidy_title(title, 65)
+
 def openai_title_from_image(url: str, fallback_hint: str, max_chars: int) -> str:
+    """Vision → JSON fields → assembled title; fallback to hint."""
     if not openai_active or not is_valid_url(url):
         return tidy_title(fallback_hint or "", max_chars)
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role":"system","content":"You output one short product title only."},
+                {"role":"system","content":"Extract concise, accurate product fields from the image."},
                 {"role":"user","content":[
-                    {"type":"text","text":STRICT_PROMPT},
+                    {"type":"text","text":STRUCT_PROMPT_JSON},
                     {"type":"image_url","image_url":{"url":url}}
                 ]}
             ],
-            temperature=0.15,
+            temperature=0.1,
         )
-        title = (resp.choices[0].message.content or "").strip()
-        if not title:
+        raw = (resp.choices[0].message.content or "").strip()
+        # Try to isolate JSON if model adds text
+        json_str = raw
+        m = re.search(r"\{.*\}", raw, re.S)
+        if m:
+            json_str = m.group(0)
+        data = json.loads(json_str)
+        title = assemble_title_from_fields(data)
+        if not title or len(title) < 3:
             return tidy_title(fallback_hint or "", max_chars)
         return tidy_title(title, max_chars)
     except Exception:
@@ -208,7 +273,7 @@ def titles_from_images_batched(df, row_index, max_chars, batch_size, force_regen
                 title = f"Product {df.loc[i,'merchant_sku']}"
             titles_en.loc[i] = title
         prog.progress(min(step/steps,1.0))
-        time.sleep(0.1)
+        time.sleep(0.05)
     return titles_en
 
 # ------------------------------ Upload ------------------------------
@@ -224,7 +289,7 @@ map_df  = read_any_table(mapping_file) if mapping_file else None
 if not product_file or prod_df is None:
     st.stop()
 
-# Normalize/alias the thumbnail column BEFORE validation (accept common alternates)
+# Normalize/alias the thumbnail column BEFORE validation
 if "thumbnail" not in prod_df.columns:
     for alt in ["Thumbnail","image_url","ImageURL","image","img","Image Url","ImageURL"]:
         if alt in prod_df.columns:
@@ -241,7 +306,7 @@ if not mapping_file or map_df is None or not validate_columns(map_df, REQUIRED_M
 if "work" not in st.session_state:
     st.session_state.work = prod_df.copy()
 
-work = st.session_state.work.copy()  # local view; write back at end
+work = st.session_state.work.copy()
 lookups = build_mapping_struct_fixed(map_df)
 
 # ------------------------------ Sidebar: Title Assistant ------------------------------
@@ -255,7 +320,6 @@ with st.sidebar:
     force_regen = st.checkbox("Regenerate even if EN not empty", value=False)
     run_titles = st.button("Generate Titles & Translate")
 
-    # Tiny preview
     if st.checkbox("Show 12 thumbnails preview", value=False):
         if "thumbnail" in work.columns:
             urls = work["thumbnail"].fillna("").astype(str).tolist()
@@ -279,18 +343,18 @@ if run_titles:
         titles_en = titles_from_images_batched(work, idx, max_len, batch_size=60, force_regen=force_regen)
         work.loc[idx, "name"] = titles_en.loc[idx]
         if engine != "None":
-            # translate in reasonably sized chunks
             out_all = []
             en_all = titles_en.loc[idx].astype(str).tolist()
             for s in range(0, len(en_all), 60):
                 chunk = en_all[s:s+60]
                 out_all.extend(translate_en_to_ar(chunk, engine))
-                time.sleep(0.1)
+                time.sleep(0.05)
             work.loc[idx, "name_ar"] = pd.Series(out_all, index=idx)
         st.success(f"Updated titles for {len(idx)} rows.")
 
 # Persist updates to session
 st.session_state.work = work
+work = st.session_state.work  # keep reference
 
 # ------------------------------ 1) Filter view ------------------------------
 st.header("Find products & bulk-assign category IDs")
@@ -335,7 +399,7 @@ st.dataframe(
 # ------------------------------ 2) Grouping & bulk apply ------------------------------
 st.header("Grouping & Bulk Apply")
 
-# 2A. Keyword groups (many keywords, preview table, deselect, apply)
+# 2A. Keyword groups
 st.subheader("2A) Keyword groups")
 st.session_state.setdefault("keyword_rules", [])
 
