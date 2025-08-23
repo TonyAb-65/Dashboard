@@ -181,10 +181,55 @@ def openai_title_from_image(url:str,max_chars:int)->str:
 # … [UNCHANGED translation functions, but use _openai_chat as before] …
 
 # ============== run_titles audit logging change ==============
-# Inside run_titles (replace the failure case):
-                else:
-                    reason = "fetch_failed" if not fetch_image_as_data_url(url) else "vision_empty_or_invalid"
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":reason,"url":url})
-                    failed += 1
+# def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
+    updated = skipped = failed = 0
+    store = global_cache().setdefault(st.session_state.file_hash, {})
+
+    for s in range(0, len(idx), fetch_batch):
+        chunk = idx[s:s+fetch_batch]
+        for i in chunk:
+            sku = str(work.at[i, "merchant_sku"])
+            cache_local = st.session_state.proc_cache.get(sku, {})
+            cur_en = (str(work.at[i, "name"]) if pd.notna(work.at[i, "name"]) else "").strip()
+            url = str(work.at[i, "thumbnail"]) if "thumbnail" in work.columns else ""
+
+            # prefer persistent store if not forcing
+            if not force_over and store.get(sku, {}).get("en"):
+                work.at[i, "name"] = store[sku]["en"]
+                st.session_state.proc_cache.setdefault(sku, {})["name"] = store[sku]["en"]
+                skipped += 1
+                continue
+
+            if not force_over and cache_local.get("name"):
+                work.at[i, "name"] = cache_local["name"]
+                skipped += 1
+                continue
+
+            if only_empty and cur_en and not force_over:
+                st.session_state.proc_cache.setdefault(sku, {})["name"] = cur_en
+                skipped += 1
+                continue
+
+            title = ""
+            if url:
+                title = openai_title_from_image(url, max_len)
+
+            if title:
+                work.at[i, "name"] = title
+                st.session_state.proc_cache.setdefault(sku, {})["name"] = title
+                store.setdefault(sku, {})["en"] = title
+                _trim_store(store)
+                updated += 1
+            else:
+                # precise audit reason
+                data_url = fetch_image_as_data_url(url) if url else ""
+                reason = "fetch_failed" if not data_url else "vision_empty_or_invalid"
+                st.session_state.audit_rows.append({
+                    "sku": sku, "phase": "EN title", "reason": reason, "url": url
+                })
+                failed += 1
+
+    return updated, skipped, failed
+
 
 # … [REST OF THE MASTER FILE UNCHANGED: translation, mapping, UI sections, etc.] …
