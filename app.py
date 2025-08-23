@@ -150,7 +150,7 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
-# ---------- PATCH: stronger fetch with streaming cap ----------
+# ---------- stronger fetch with streaming cap ----------
 def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     """Manual fetch → data URL. Resilient stream with size cap."""
     try:
@@ -176,7 +176,7 @@ def fetch_image_as_data_url(url:str, timeout=10, max_bytes=8_000_000)->str:
     except Exception:
         return ""
 
-# ---------- PATCH: tiny retry wrapper for OpenAI ----------
+# ---------- tiny retry wrapper for OpenAI ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
         try:
@@ -190,7 +190,7 @@ def _openai_chat(messages, **kwargs):
     return _retry(lambda: openai_client.chat.completions.create(
         model="gpt-4o-mini", messages=messages, **kwargs))
 
-# ===== Structured extraction for titles (patched prompt) =====
+# ===== Structured extraction for titles =====
 STRUCT_PROMPT_JSON = (
     "You read ONLY the product label in the image and extract fields for a title.\n"
     "Return EXACTLY ONE LINE of STRICT JSON with keys:"
@@ -238,7 +238,7 @@ def assemble_title_from_fields(d: dict) -> str:
 
     return tidy_title(" ".join(p for p in parts if p), 70)
 
-# ---------- PATCH: stricter fallback title writer ----------
+# ---------- stricter fallback title writer ----------
 def _fallback_simple_title(data_url: str, max_chars: int) -> str:
     if not openai_active or not data_url: return ""
     prompt = (
@@ -281,6 +281,12 @@ def openai_title_from_image(url:str,max_chars:int)->str:
             data=json.loads(m.group(0))
         except Exception:
             return _fallback_simple_title(data_url, max_chars)
+
+        # ---- HARD REQUIRE product noun (guard against '1 liter tea bag' types) ----
+        product = (data.get("product") or "").strip().lower()
+        if not product or product in {"ml","l","g","kg","pcs","tabs","caps"}:
+            return _fallback_simple_title(data_url, max_chars)
+
         title=assemble_title_from_fields(data)
         if title and len(title)>=3:
             return tidy_title(title,max_chars)
