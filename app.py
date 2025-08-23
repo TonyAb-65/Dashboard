@@ -1,6 +1,5 @@
 # Product Mapping Dashboard — Master
-# (Adds: Step1 prefetch images to cache → Step2 per-row title generation from cached data URLs.
-#  Keeps previous batch pipeline and direct-URL Vision. Py3.9-safe.)
+# (URL-only Vision: no Python image fetching. Py3.9-safe. Keeps prior UI and batch pipeline.)
 
 import io, re, time, math, hashlib, base64, json
 from typing import List, Iterable, Dict, Tuple, Optional
@@ -69,15 +68,10 @@ try:
 except Exception:
     openai_client=None; openai_active=False
 
-# -------- Persistent caches --------
+# -------- Persistent cache across reruns --------
 @st.cache_resource
 def global_cache() -> dict:
     # {file_hash: {sku: {"en": "...", "ar": "..."}}}
-    return {}
-
-@st.cache_resource
-def image_blob_cache() -> dict:
-    # {file_hash: {sku: "data:<mime>;base64,..."}}
     return {}
 
 # ============== FILE IO ==============
@@ -147,17 +141,6 @@ def _ensure_http_url(u: str) -> str:
     if not re.match(r"^https?://", u, flags=re.I): return "https://" + u
     return u
 
-def _http_head(url: str, timeout: float = 6.0) -> Tuple[bool, str]:
-    """Light reachability probe. Returns (ok, note)."""
-    try:
-        r = requests.head(url, timeout=timeout, allow_redirects=True,
-                          headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code in (200, 301, 302, 303, 307, 308):
-            return True, f"status={r.status_code}"
-        return False, f"status={r.status_code}"
-    except Exception as e:
-        return False, f"error={type(e).__name__}"
-
 # ---------- retry wrapper for OpenAI ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
@@ -177,7 +160,7 @@ STRUCT_PROMPT_JSON = (
     "Return EXACTLY ONE LINE of STRICT JSON with keys:"
     '{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,'
     '"flavor_scent":string|null,"material":string|null,"size_value":string|null,'
-    '"size_unit":string|null,"count":string|null,"feature":string|null}\n'
+    '"size_unit":string|null,"count":string|null,"feature":string|null}\n"
     "Rules:\n"
     "- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').\n"
     "- PRIORITIZE object_type over printed text when they disagree.\n"
@@ -204,6 +187,7 @@ def assemble_title_from_fields(d: dict) -> str:
     if brand: parts.append(brand)
     noun = object_type or product
     if noun: parts.append(noun)
+
     qual = variant or flavor or material or feature
     if qual: parts.append(qual)
 
@@ -218,11 +202,12 @@ def assemble_title_from_fields(d: dict) -> str:
     if count and not size_str: size_str=f"{count}pcs"
     elif count and size_str: size_str=f"{size_str} {count}pcs"
     if size_str: parts.append(size_str)
+
     return tidy_title(" ".join(p for p in parts if p), 70)
 
-# ---------- fallback title writer ----------
-def _fallback_simple_title_url(img_ref: str, max_chars: int) -> str:
-    if not openai_active or not img_ref: return ""
+# ---------- fallback title writer (still URL-based) ----------
+def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
+    if not openai_active or not img_url: return ""
     prompt = (
         "Write ONE clean English e-commerce title ≤70 chars.\n"
         "Describe the VISIBLE object first. Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count.\n"
@@ -233,7 +218,7 @@ def _fallback_simple_title_url(img_ref: str, max_chars: int) -> str:
             [{"role":"system","content":"You are a precise e-commerce title writer."},
              {"role":"user","content":[
                  {"type":"text","text":prompt},
-                 {"type":"image_url","image_url":{"url":img_ref}}
+                 {"type":"image_url","image_url":{"url":img_url}}
              ]}],
             temperature=0, max_tokens=64
         )
@@ -242,7 +227,7 @@ def _fallback_simple_title_url(img_ref: str, max_chars: int) -> str:
     except Exception:
         return ""
 
-# ---------- Vision on direct URL ----------
+# ---------- Vision on direct URL with error logging ----------
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
     if not openai_active or not img_url: return ""
     try:
@@ -258,7 +243,9 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         )
         raw = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\{.*\}", raw, re.S)
-        if not m: return _fallback_simple_title_url(img_url, max_chars)
+        if not m:
+            return _fallback_simple_title_url(img_url, max_chars)
+
         try:
             data = json.loads(m.group(0))
         except Exception:
@@ -267,7 +254,9 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         obj = (data.get("object_type") or "").strip().lower()
         prod = (data.get("product") or "").strip().lower()
         invalid = {"ml","l","g","kg","pcs","tabs","caps"}
-        if (not obj and not prod) or (prod in invalid) or (("bag" in obj and "tea" in obj) or ("tea bag" in prod)):
+        if (not obj and not prod) or (prod in invalid) or (
+            ("bag" in obj and "tea" in obj) or ("tea bag" in prod)
+        ):
             return _fallback_simple_title_url(img_url, max_chars)
 
         title = assemble_title_from_fields(data)
@@ -276,85 +265,10 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
     except Exception as e:
         try:
             st.session_state.audit_rows.append({
-                "sku": str(sku or ""), "phase": "EN title",
-                "reason": f"openai_error:{type(e).__name__}", "url": img_url
-            })
-        except Exception:
-            pass
-        return ""
-
-# ---------- Robust fetcher to DATA URL ----------
-def fetch_image_as_data_url(url:str, timeout=12, max_bytes=10_000_000, retries=3)->Tuple[str,str]:
-    if not is_valid_url(url): return "", "invalid_url"
-    url=_normalize_url(url); netloc=urlsplit(url).netloc
-    ua_pool=[
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/124.0"
-    ]
-    last="fetch_failed"
-    for t in range(retries):
-        try:
-            headers={
-                "User-Agent": ua_pool[t % len(ua_pool)],
-                "Accept":"image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                "Referer": f"https://{netloc}/",
-                "Accept-Language":"en-US,en;q=0.8",
-                "Connection":"keep-alive",
-            }
-            r=requests.get(url,timeout=timeout,headers=headers,allow_redirects=True,stream=True)
-            if r.status_code!=200:
-                last=f"status_{r.status_code}"; time.sleep(0.2*(t+1)); continue
-            data=r.content if r.content else r.raw.read(max_bytes+1)
-            if len(data)>max_bytes: return "", "too_large"
-            try:
-                fmt=Image.open(BytesIO(data)).format or "JPEG"
-            except Exception:
-                fmt="JPEG"
-            mime="image/jpeg" if fmt.upper() in ("JPG","JPEG") else f"image/{fmt.lower()}"
-            b64=base64.b64encode(data).decode("ascii")
-            return f"data:{mime};base64,{b64}", ""
-        except Exception as e:
-            last=f"error_{type(e).__name__}"
-            time.sleep(0.2*(t+1))
-    return "", last
-
-# ---------- Vision on DATA URL ----------
-def openai_title_from_dataurl(data_url: str, max_chars: int, sku: Optional[str]=None) -> str:
-    if not openai_active or not data_url: return ""
-    try:
-        resp = _openai_chat(
-            [
-                {"role":"system","content":"Extract concise, accurate product fields from the image."},
-                {"role":"user","content":[
-                    {"type":"text","text":STRUCT_PROMPT_JSON},
-                    {"type":"image_url","image_url":{"url": data_url}}
-                ]}
-            ],
-            temperature=0.1, max_tokens=220
-        )
-        raw=(resp.choices[0].message.content or "").strip()
-        m=re.search(r"\{.*\}", raw, re.S)
-        if not m: return _fallback_simple_title_url(data_url, max_chars)
-        try:
-            data=json.loads(m.group(0))
-        except Exception:
-            return _fallback_simple_title_url(data_url, max_chars)
-
-        obj=(data.get("object_type") or "").strip().lower()
-        prod=(data.get("product") or "").strip().lower()
-        invalid={"ml","l","g","kg","pcs","tabs","caps"}
-        if (not obj and not prod) or (prod in invalid) or (("bag" in obj and "tea" in obj) or ("tea bag" in prod)):
-            return _fallback_simple_title_url(data_url, max_chars)
-
-        title=assemble_title_from_fields(data)
-        return tidy_title(title, max_chars) if title else _fallback_simple_title_url(data_url, max_chars)
-
-    except Exception as e:
-        try:
-            st.session_state.audit_rows.append({
-                "sku": str(sku or ""), "phase":"EN title",
-                "reason": f"openai_error:{type(e).__name__}", "url":"dataurl"
+                "sku": str(sku or ""),
+                "phase": "EN title",
+                "reason": f"openai_error:{type(e).__name__}",
+                "url": img_url
             })
         except Exception:
             pass
@@ -532,7 +446,8 @@ def sec_filter():
                 else:
                     m=pd.Series(False,index=df.index)
                     for f in fields:
-                        if f in df.columns: m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                        if f in df.columns:
+                            m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
             for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
@@ -563,89 +478,7 @@ def sec_titles():
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10)
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
 
-    # ---------------- Two-step pipeline: prefetch -> per-row generation ----------------
-    pref_c1, pref_c2 = st.columns([1,1])
-    with pref_c1:
-        prefetch_batch = st.number_input("Prefetch batch size", 10, 500, 120, 10, key="pref_bs")
-    with pref_c2:
-        prefetch_timeout = st.number_input("Prefetch timeout (s)", 3, 30, 12, 1, key="pref_to")
-
-    if st.button("Step 1: Prefetch ALL images to cache"):
-        cache = image_blob_cache().setdefault(st.session_state.file_hash, {})
-        idx_all = base.index.tolist()
-        ok=fail=0
-        bar = st.progress(0.0, text="Prefetching…")
-        for p in range(0, len(idx_all), prefetch_batch):
-            chunk = idx_all[p:p+prefetch_batch]
-            for i in chunk:
-                sku = str(work.at[i,"merchant_sku"])
-                raw = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
-                norm = _normalize_url(_ensure_http_url(raw))
-                if not is_valid_url(norm):
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"prefetch","reason":"invalid_url","url":norm})
-                    fail+=1; continue
-                data_url, reason = fetch_image_as_data_url(norm, timeout=prefetch_timeout)
-                if data_url:
-                    cache[sku] = data_url
-                    ok += 1
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"prefetch","reason":"prefetch_ok","url":norm})
-                else:
-                    fail += 1
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"prefetch","reason":f"prefetch_fail:{reason}","url":norm})
-            bar.progress(min((p+len(chunk))/max(1,len(idx_all)),1.0), text=f"{p+len(chunk)}/{len(idx_all)} fetched")
-        st.success(f"Prefetch done. OK {ok}, fail {fail}")
-
-    # Forced sequential generation from cached images
-    seq_r1, seq_r2 = st.columns([1,1])
-    with seq_r1:
-        seq_retries = st.number_input("Retries per row", 0, 5, 2, 1, key="seq_retries2")
-    with seq_r2:
-        seq_delay = st.number_input("Delay between rows (ms)", 0, 2000, 100, 50, key="seq_delay2")
-
-    if st.button("Step 2: Generate titles sequentially from cache"):
-        cache = image_blob_cache().setdefault(st.session_state.file_hash, {})
-        idx_all = base.index.tolist()
-        if not idx_all:
-            st.info("No rows in scope.")
-        else:
-            en_up=en_fail=0
-            bar = st.progress(0.0, text="Generating…")
-            for pos,i in enumerate(idx_all, 1):
-                sku = str(work.at[i,"merchant_sku"])
-                data_url = cache.get(sku, "")
-                if not data_url:
-                    raw = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
-                    norm = _normalize_url(_ensure_http_url(raw))
-                    data_url, reason = fetch_image_as_data_url(norm)
-                    if data_url:
-                        cache[sku]=data_url
-                    else:
-                        st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":f"no_image:{reason}","url":norm})
-                        en_fail += 1
-                        bar.progress(pos/len(idx_all), text=f"{pos}/{len(idx_all)} fail no_image")
-                        if seq_delay: time.sleep(seq_delay/1000.0)
-                        continue
-
-                title=""
-                for a in range(seq_retries+1):
-                    title = openai_title_from_dataurl(data_url, max_len, sku)
-                    if title: break
-                    time.sleep(0.25*(a+1))
-
-                if title:
-                    work.at[i,"name"] = title
-                    global_cache().setdefault(st.session_state.file_hash, {}).setdefault(sku, {})["en"] = title
-                    st.session_state.proc_cache.setdefault(sku,{})["name"] = title
-                    en_up += 1
-                else:
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"vision_empty_or_invalid","url":"dataurl"})
-                    en_fail += 1
-
-                if seq_delay: time.sleep(seq_delay/1000.0)
-                bar.progress(pos/len(idx_all), text=f"{pos}/{len(idx_all)} processed")
-            st.success(f"Sequential generation done. EN updated {en_up}, failed {en_fail}")
-
-    # Preview 24 images (no processing)
+    # Preview 24 images (no processing) — browser fetches directly
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base.head(24)
@@ -661,7 +494,7 @@ def sec_titles():
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Existing batched workers with persistent cache ----------
+    # ---------- Existing batched workers (URL-only to OpenAI) ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -671,6 +504,7 @@ def sec_titles():
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated = skipped = failed = 0
         store = global_cache().setdefault(st.session_state.file_hash, {})
+
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
             for i in chunk:
@@ -682,25 +516,41 @@ def sec_titles():
 
                 if not force_over and store.get(sku, {}).get("en"):
                     work.at[i, "name"] = store[sku]["en"]
-                    st.session_state.proc_cache.setdefault(sku, {})["name"] = store[sku]["en"]; skipped += 1; continue
+                    st.session_state.proc_cache.setdefault(sku, {})["name"] = store[sku]["en"]
+                    skipped += 1
+                    continue
+
                 if not force_over and cache_local.get("name"):
-                    work.at[i, "name"] = cache_local["name"]; skipped += 1; continue
+                    work.at[i, "name"] = cache_local["name"]
+                    skipped += 1
+                    continue
+
                 if only_empty and cur_en and not force_over:
-                    st.session_state.proc_cache.setdefault(sku, {})["name"] = cur_en; skipped += 1; continue
+                    st.session_state.proc_cache.setdefault(sku, {})["name"] = cur_en
+                    skipped += 1
+                    continue
 
                 if not is_valid_url(norm_url):
-                    st.session_state.audit_rows.append({"sku": sku, "phase": "EN title", "reason": "url_invalid", "url": norm_url})
-                    failed += 1; continue
+                    st.session_state.audit_rows.append({
+                        "sku": sku, "phase": "EN title", "reason": "url_invalid", "url": norm_url
+                    })
+                    failed += 1
+                    continue
 
                 title = openai_title_from_url(norm_url, max_len, sku)
+
                 if title:
                     work.at[i, "name"] = title
                     st.session_state.proc_cache.setdefault(sku, {})["name"] = title
                     store.setdefault(sku, {})["en"] = title
-                    _trim_store(store); updated += 1
+                    _trim_store(store)
+                    updated += 1
                 else:
-                    st.session_state.audit_rows.append({"sku": sku, "phase": "EN title", "reason": "vision_empty_or_invalid", "url": norm_url})
+                    st.session_state.audit_rows.append({
+                        "sku": sku, "phase": "EN title", "reason": "vision_empty_or_invalid", "url": norm_url
+                    })
                     failed += 1
+
         return updated, skipped, failed
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
@@ -712,11 +562,16 @@ def sec_titles():
             cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
+
             if not force_over and store.get(sku, {}).get("ar"):
-                work.at[i,"name_ar"] = store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]; continue
+                work.at[i,"name_ar"] = store[sku]["ar"]
+                st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]
+                continue
+
             if not force_over and cache_local.get("name_ar"):
                 work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
@@ -727,25 +582,31 @@ def sec_titles():
             chunk = texts[s:s+trans_batch]
             outs = translate_en_titles(pd.Series(chunk), engine, trans_batch).tolist()
             for j, _ in enumerate(chunk):
-                i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
+                i = ids[s+j]
+                ar = outs[j] if j < len(outs) else ""
                 if ar:
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
                     st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
                     store.setdefault(sku, {})["ar"] = ar
-                    _trim_store(store); updated += 1
+                    _trim_store(store)
+                    updated += 1
                 else:
                     failed += 1
                     st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
         return updated, failed
 
-    # === Existing full auto-batched pipeline ===
+    # === FULL AUTOMATIC BATCHED PIPELINE (manual trigger only) ===
     if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
         idx_all = base.index.tolist()
         if not idx_all:
             st.info("No rows in scope.")
         else:
-            st.info(f"Scope: {scope} • Batch(image→EN)={fetch_batch} • Batch(EN→AR)={trans_batch} • Only empty EN={'Yes' if only_empty else 'No'} • Force overwrite={'Yes' if force_over else 'No'}")
+            st.info(
+                f"Scope: {scope} • Batch(image→EN)={fetch_batch} • Batch(EN→AR)={trans_batch} • "
+                f"Only empty EN={'Yes' if only_empty else 'No'} • Force overwrite={'Yes' if force_over else 'No'}"
+            )
+
             total = len(idx_all)
             bar = st.progress(0.0, text="Starting…")
             en_up=en_skip=en_fail=ar_up=ar_fail=0
@@ -754,7 +615,10 @@ def sec_titles():
             jp_cols = st.columns(5)
             c_total, c_done, c_en, c_ar, c_batch = jp_cols
             c_total.metric("Rows in scope", total)
-            done_placeholder = c_done.empty(); en_placeholder = c_en.empty(); ar_placeholder = c_ar.empty(); batch_placeholder= c_batch.empty()
+            done_placeholder = c_done.empty()
+            en_placeholder   = c_en.empty()
+            ar_placeholder   = c_ar.empty()
+            batch_placeholder= c_batch.empty()
 
             def update_panel(done, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches):
                 done_placeholder.metric("Rows processed", done)
@@ -762,17 +626,26 @@ def sec_titles():
                 ar_placeholder.metric("AR translated", f"✔ {ar_up}", f"fail {ar_fail}")
                 batch_placeholder.metric("Batch", f"{batch_no}/{total_batches}")
 
-            total_batches = math.ceil(total / fetch_batch); batch_no = 0
+            total_batches = math.ceil(total / fetch_batch)
+            batch_no = 0
             for s in range(0, total, fetch_batch):
                 batch_no += 1
                 batch_idx = idx_all[s:s+fetch_batch]
-                u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up += u; en_skip += k; en_fail += f
-                u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up += u2; ar_fail += f2
-                done_count = s + len(batch_idx)
-                bar.progress(min(done_count/total,1.0), text=f"Processed {done_count}/{total} rows")
-                update_panel(done_count, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches); time.sleep(0.15)
 
-            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
+                u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over)
+                en_up += u; en_skip += k; en_fail += f
+
+                u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over)
+                ar_up += u2; ar_fail += f2
+
+                done_count = s + len(batch_idx)
+                bar.progress(min(done_count/total,1.0),
+                             text=f"Processed {done_count}/{total} rows")
+                update_panel(done_count, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches)
+                time.sleep(0.15)
+
+            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | "
+                       f"AR updated {ar_up}, failed {ar_fail}")
 
     # Optional targeted runners
     cA,cB=st.columns(2)
@@ -913,9 +786,6 @@ def sec_settings():
             store = global_cache()
             if st.session_state.file_hash in store:
                 del store[st.session_state.file_hash]
-            img_store = image_blob_cache()
-            if st.session_state.file_hash in img_store:
-                del img_store[st.session_state.file_hash]
             st.success("Cleared.")
 
 # ============== Router ==============
