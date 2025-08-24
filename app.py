@@ -1,41 +1,31 @@
-# Product Mapping Dashboard — Master
-# (URL-only Vision: no Python image fetching. Py3.9-safe. Keeps prior UI and batch pipeline.)
+# Product Mapping Dashboard — Master (URL-only Vision + strict URL sanitization)
 
-import io, re, time, math, hashlib, base64, json
-from typing import List, Iterable, Dict, Tuple, Optional
+import io, re, time, math, hashlib, json
+from typing import List, Iterable, Tuple, Optional
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
 
 import pandas as pd
 import streamlit as st
-import requests
-from PIL import Image
-from io import BytesIO
 
 # ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
 st.set_option("client.showErrorDetails", True)
 
 # ===== UI THEME & HEADER =====
-EMERALD = "#10b981"
-EMERALD_DARK = "#059669"
-TEXT_LIGHT = "#f8fafc"
-
+EMERALD = "#10b981"; EMERALD_DARK = "#059669"; TEXT_LIGHT = "#f8fafc"
 st.markdown(f"""
 <style>
-.app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background: #fff; position: sticky; top: 0; z-index: 5; }}
-.app-title {{ font-size: 22px; font-weight: 800; color:#111827; }}
+.app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
+.app-title {{ font-size:22px; font-weight:800; color:#111827; }}
 .app-sub {{ color:#6b7280; font-size:12px; }}
-[data-testid="stSidebar"] > div:first-child {{ background: linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color: {TEXT_LIGHT}; }}
-[data-testid="stSidebar"] .stMarkdown p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
-[data-testid="stSidebar"] .stRadio > div > label {{ margin-bottom: 6px; padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.08); }}
+[data-testid="stSidebar"] > div:first-child {{ background:linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color:{TEXT_LIGHT}; }}
+[data-testid="stSidebar"] .stMarkdown p,[data-testid="stSidebar"] label,[data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
+[data-testid="stSidebar"] .stRadio > div > label {{ margin-bottom:6px; padding:6px 10px; border-radius:8px; background:rgba(255,255,255,0.08); }}
 .stButton>button {{ border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }}
-.card {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fff; }}
-.small-note {{ color:#6b7280; font-size:12px; margin-top:-6px; }}
-.block-container {{ padding-top: 6px; }}
+.block-container {{ padding-top:6px; }}
 </style>
 """, unsafe_allow_html=True)
-
 st.markdown("""
 <div class="app-header">
   <div class="app-title">🧭 Product Mapping Dashboard</div>
@@ -115,14 +105,18 @@ def tidy_title(s:str,max_chars:int=70)->str:
 
 def is_valid_url(u:str)->bool:
     if not isinstance(u,str): return False
-    u=u.strip().strip('"').strip("'")
+    u=u.strip()
     try:
         p=urlsplit(u); return p.scheme in ("http","https") and bool(p.netloc)
     except Exception: return False
 
 def _normalize_url(u:str)->str:
     u=(u or "").strip().strip('"').strip("'")
-    p=urlsplit(u); path=quote(p.path, safe="/:%@&?=#,+!$;'()*[]")
+    if not u: return ""
+    if u.startswith("//"): u="https:"+u
+    if not re.match(r"^https?://", u, flags=re.I): u="https://"+u
+    p=urlsplit(u)
+    path=quote(p.path, safe="/:%@&?=#,+!$;'()*[]")
     if p.query:
         parts=[]
         for kv in p.query.split("&"):
@@ -134,18 +128,17 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
-def _ensure_http_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u: return ""
-    if u.startswith("//"): return "https:" + u
-    if not re.match(r"^https?://", u, flags=re.I): return "https://" + u
-    return u
+def clean_url_for_vision(raw: str) -> str:
+    """Surgical sanitization before sending to OpenAI Vision."""
+    u = str(raw or "").strip().strip('"').strip("'")
+    u = re.sub(r"\s+", "", u)  # remove hidden spaces
+    u = _normalize_url(u)
+    return u if is_valid_url(u) else ""
 
-# ---------- retry wrapper for OpenAI ----------
+# ---------- retry wrapper ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
-        try:
-            return fn()
+        try: return fn()
         except Exception:
             if i == attempts - 1: raise
             time.sleep(base * (2 ** i))
@@ -171,7 +164,6 @@ Rules:
 - Output JSON only.
 """
 
-
 def assemble_title_from_fields(d: dict) -> str:
     brand = (d.get("brand") or "").strip()
     object_type = (d.get("object_type") or "").strip()
@@ -188,7 +180,6 @@ def assemble_title_from_fields(d: dict) -> str:
     if brand: parts.append(brand)
     noun = object_type or product
     if noun: parts.append(noun)
-
     qual = variant or flavor or material or feature
     if qual: parts.append(qual)
 
@@ -203,16 +194,13 @@ def assemble_title_from_fields(d: dict) -> str:
     if count and not size_str: size_str=f"{count}pcs"
     elif count and size_str: size_str=f"{size_str} {count}pcs"
     if size_str: parts.append(size_str)
-
     return tidy_title(" ".join(p for p in parts if p), 70)
 
-# ---------- fallback title writer (still URL-based) ----------
 def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     if not openai_active or not img_url: return ""
     prompt = (
-        "Write ONE clean English e-commerce title ≤70 chars.\n"
-        "Describe the VISIBLE object first. Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count.\n"
-        "No marketing words. One line."
+        "Write ONE clean English e-commerce title ≤70 chars. "
+        "Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count. No marketing words."
     )
     try:
         resp=_openai_chat(
@@ -228,7 +216,6 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     except Exception:
         return ""
 
-# ---------- Vision on direct URL with error logging ----------
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
     if not openai_active or not img_url: return ""
     try:
@@ -244,9 +231,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         )
         raw = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return _fallback_simple_title_url(img_url, max_chars)
-
+        if not m: return _fallback_simple_title_url(img_url, max_chars)
         try:
             data = json.loads(m.group(0))
         except Exception:
@@ -255,9 +240,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         obj = (data.get("object_type") or "").strip().lower()
         prod = (data.get("product") or "").strip().lower()
         invalid = {"ml","l","g","kg","pcs","tabs","caps"}
-        if (not obj and not prod) or (prod in invalid) or (
-            ("bag" in obj and "tea" in obj) or ("tea bag" in prod)
-        ):
+        if (not obj and not prod) or (prod in invalid) or (("bag" in obj and "tea" in obj) or ("tea bag" in prod)):
             return _fallback_simple_title_url(img_url, max_chars)
 
         title = assemble_title_from_fields(data)
@@ -447,8 +430,7 @@ def sec_filter():
                 else:
                     m=pd.Series(False,index=df.index)
                     for f in fields:
-                        if f in df.columns:
-                            m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                        if f in df.columns: m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
             for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
@@ -479,23 +461,21 @@ def sec_titles():
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10)
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
 
-    # Preview 24 images (no processing) — browser fetches directly
+    # Preview 24 images (browser fetch)
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base.head(24)
         if "thumbnail" in view.columns and len(view) > 0:
             cols = gallery.columns(6)
             for j, (i, row) in enumerate(view.iterrows()):
-                url = _normalize_url(_ensure_http_url(str(row.get("thumbnail", ""))))
+                url = clean_url_for_vision(str(row.get("thumbnail", "")))
                 with cols[j % 6]:
-                    if is_valid_url(url):
-                        st.image(url, caption=f"Row {i}", use_container_width=True)
-                    else:
-                        st.caption("Bad URL")
+                    if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
+                    else: st.caption("Bad URL")
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Existing batched workers (URL-only to OpenAI) ----------
+    # ---------- Workers (URL-only to OpenAI) ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -503,55 +483,36 @@ def sec_titles():
             store.pop(k, None)
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
-        updated = skipped = failed = 0
+        updated=skipped=failed=0
         store = global_cache().setdefault(st.session_state.file_hash, {})
 
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
             for i in chunk:
-                sku = str(work.at[i, "merchant_sku"])
+                sku = str(work.at[i,"merchant_sku"])
                 cache_local = st.session_state.proc_cache.get(sku, {})
-                cur_en = (str(work.at[i, "name"]) if pd.notna(work.at[i, "name"]) else "").strip()
-                raw_url = str(work.at[i, "thumbnail"]) if "thumbnail" in work.columns else ""
-                norm_url = _normalize_url(_ensure_http_url(raw_url))
+                cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+                norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
 
                 if not force_over and store.get(sku, {}).get("en"):
-                    work.at[i, "name"] = store[sku]["en"]
-                    st.session_state.proc_cache.setdefault(sku, {})["name"] = store[sku]["en"]
-                    skipped += 1
-                    continue
-
+                    work.at[i,"name"] = store[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=store[sku]["en"]; skipped+=1; continue
                 if not force_over and cache_local.get("name"):
-                    work.at[i, "name"] = cache_local["name"]
-                    skipped += 1
-                    continue
-
+                    work.at[i,"name"] = cache_local["name"]; skipped+=1; continue
                 if only_empty and cur_en and not force_over:
-                    st.session_state.proc_cache.setdefault(sku, {})["name"] = cur_en
-                    skipped += 1
-                    continue
-
+                    st.session_state.proc_cache.setdefault(sku,{})["name"]=cur_en; skipped+=1; continue
                 if not is_valid_url(norm_url):
-                    st.session_state.audit_rows.append({
-                        "sku": sku, "phase": "EN title", "reason": "url_invalid", "url": norm_url
-                    })
-                    failed += 1
-                    continue
+                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"url_invalid","url":norm_url}); failed+=1; continue
 
                 title = openai_title_from_url(norm_url, max_len, sku)
-
                 if title:
-                    work.at[i, "name"] = title
-                    st.session_state.proc_cache.setdefault(sku, {})["name"] = title
+                    work.at[i,"name"] = title
+                    st.session_state.proc_cache.setdefault(sku,{})["name"] = title
                     store.setdefault(sku, {})["en"] = title
                     _trim_store(store)
                     updated += 1
                 else:
-                    st.session_state.audit_rows.append({
-                        "sku": sku, "phase": "EN title", "reason": "vision_empty_or_invalid", "url": norm_url
-                    })
+                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"vision_empty_or_invalid","url":norm_url})
                     failed += 1
-
         return updated, skipped, failed
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
@@ -563,16 +524,11 @@ def sec_titles():
             cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
-
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
-
             if not force_over and store.get(sku, {}).get("ar"):
-                work.at[i,"name_ar"] = store[sku]["ar"]
-                st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]
-                continue
-
+                work.at[i,"name_ar"]=store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=store[sku]["ar"]; continue
             if not force_over and cache_local.get("name_ar"):
                 work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
@@ -583,8 +539,7 @@ def sec_titles():
             chunk = texts[s:s+trans_batch]
             outs = translate_en_titles(pd.Series(chunk), engine, trans_batch).tolist()
             for j, _ in enumerate(chunk):
-                i = ids[s+j]
-                ar = outs[j] if j < len(outs) else ""
+                i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
                 if ar:
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
@@ -597,7 +552,6 @@ def sec_titles():
                     st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
         return updated, failed
 
-    # === FULL AUTOMATIC BATCHED PIPELINE (manual trigger only) ===
     if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
         idx_all = base.index.tolist()
         if not idx_all:
@@ -607,48 +561,24 @@ def sec_titles():
                 f"Scope: {scope} • Batch(image→EN)={fetch_batch} • Batch(EN→AR)={trans_batch} • "
                 f"Only empty EN={'Yes' if only_empty else 'No'} • Force overwrite={'Yes' if force_over else 'No'}"
             )
-
-            total = len(idx_all)
-            bar = st.progress(0.0, text="Starting…")
+            total=len(idx_all); bar=st.progress(0.0, text="Starting…")
             en_up=en_skip=en_fail=ar_up=ar_fail=0
-
-            st.caption("Job panel")
-            jp_cols = st.columns(5)
-            c_total, c_done, c_en, c_ar, c_batch = jp_cols
-            c_total.metric("Rows in scope", total)
-            done_placeholder = c_done.empty()
-            en_placeholder   = c_en.empty()
-            ar_placeholder   = c_ar.empty()
-            batch_placeholder= c_batch.empty()
-
-            def update_panel(done, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches):
-                done_placeholder.metric("Rows processed", done)
-                en_placeholder.metric("EN titles", f"✔ {en_up}", f"skip {en_skip} / fail {en_fail}")
-                ar_placeholder.metric("AR translated", f"✔ {ar_up}", f"fail {ar_fail}")
-                batch_placeholder.metric("Batch", f"{batch_no}/{total_batches}")
-
-            total_batches = math.ceil(total / fetch_batch)
-            batch_no = 0
-            for s in range(0, total, fetch_batch):
-                batch_no += 1
-                batch_idx = idx_all[s:s+fetch_batch]
-
-                u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over)
-                en_up += u; en_skip += k; en_fail += f
-
-                u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over)
-                ar_up += u2; ar_fail += f2
-
-                done_count = s + len(batch_idx)
-                bar.progress(min(done_count/total,1.0),
-                             text=f"Processed {done_count}/{total} rows")
-                update_panel(done_count, en_up, en_skip, en_fail, ar_up, ar_fail, batch_no, total_batches)
+            st.caption("Job panel"); c_total,c_done,c_en,c_ar,c_batch=st.columns(5)
+            c_total.metric("Rows in scope", total); done_ph=c_done.empty(); en_ph=c_en.empty(); ar_ph=c_ar.empty(); batch_ph=c_batch.empty()
+            def upd(done, enu, enk, enf, aru, arf, b, tb):
+                done_ph.metric("Rows processed", done)
+                en_ph.metric("EN titles", f"✔ {enu}", f"skip {enk} / fail {enf}")
+                ar_ph.metric("AR translated", f"✔ {aru}", f"fail {arf}")
+                batch_ph.metric("Batch", f"{b}/{tb}")
+            total_batches=math.ceil(total/fetch_batch); bno=0
+            for s in range(0,total,fetch_batch):
+                bno+=1; batch_idx=idx_all[s:s+fetch_batch]
+                u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up+=u; en_skip+=k; en_fail+=f
+                u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up+=u2; ar_fail+=f2
+                done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,ar_up,ar_fail,bno,total_batches)
                 time.sleep(0.15)
+            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
-            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | "
-                       f"AR updated {ar_up}, failed {ar_fail}")
-
-    # Optional targeted runners
     cA,cB=st.columns(2)
     with cA:
         if st.button("Run ONLY missing EN"):
@@ -656,16 +586,14 @@ def sec_titles():
             if ids:
                 u,k,f = run_titles(ids, fetch_batch, max_len, only_empty, force_over)
                 st.success(f"EN → updated {u}, skipped {k}, failed {f}")
-            else:
-                st.info("No missing EN.")
+            else: st.info("No missing EN.")
     with cB:
         if st.button("Run ONLY missing AR"):
             ids=base[~is_nonempty_series(base["name_ar"].fillna(""))].index.tolist()
             if ids:
                 u2,f2 = run_trans(ids, trans_batch, engine, force_over)
                 st.success(f"AR → updated {u2}, failed {f2}")
-            else:
-                st.info("No missing AR.")
+            else: st.info("No missing AR.")
 
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
@@ -777,16 +705,15 @@ def sec_settings():
     st.subheader("Settings & Diagnostics")
     c1,c2=st.columns(2)
     with c1:
-        if st.button("Show 10 normalized thumbnail URLs"):
+        if st.button("Show 10 sanitized thumbnail URLs"):
             sample=work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
             for u in sample:
-                norm=_normalize_url(_ensure_http_url(u)); st.write({"raw":u,"normalized":norm,"valid":is_valid_url(norm)})
+                norm=clean_url_for_vision(u); st.write({"raw":u,"sanitized":norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
             store = global_cache()
-            if st.session_state.file_hash in store:
-                del store[st.session_state.file_hash]
+            if st.session_state.file_hash in store: del store[st.session_state.file_hash]
             st.success("Cleared.")
 
 # ============== Router ==============
