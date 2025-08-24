@@ -1,6 +1,6 @@
-# Product Mapping Dashboard — Master (URL-only Vision + strict URL sanitization)
+# Product Mapping Dashboard — Master (URL-only Vision + strict URL sanitization + DEBUG payload logging)
 
-import io, re, time, math, hashlib, json
+import io, re, time, math, hashlib, json, sys, traceback
 from typing import List, Iterable, Tuple, Optional
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -129,9 +129,9 @@ def _normalize_url(u:str)->str:
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
 def clean_url_for_vision(raw: str) -> str:
-    """Surgical sanitization before sending to OpenAI Vision."""
+    """Sanitize before sending to OpenAI Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
-    u = re.sub(r"\s+", "", u)  # remove hidden spaces
+    u = re.sub(r"\s+", "", u)
     u = _normalize_url(u)
     return u if is_valid_url(u) else ""
 
@@ -142,10 +142,6 @@ def _retry(fn, attempts=4, base=0.5):
         except Exception:
             if i == attempts - 1: raise
             time.sleep(base * (2 ** i))
-
-def _openai_chat(messages, **kwargs):
-    return _retry(lambda: openai_client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages, **kwargs))
 
 # ===== Structured extraction for titles =====
 STRUCT_PROMPT_JSON = """
@@ -164,6 +160,28 @@ Rules:
 - Output JSON only.
 """
 
+# ============== Sidebar NAV ==============
+with st.sidebar:
+    st.markdown("### 🔑 API Keys")
+    st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
+    st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
+    st.markdown("---")
+    DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
+    section = st.radio(
+        "Navigate",
+        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
+        index=0
+    )
+
+def debug_log(title: str, obj):
+    if DEBUG:
+        try:
+            msg = json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception:
+            msg = str(obj)
+        print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
+
+# ============== Title helpers ==============
 def assemble_title_from_fields(d: dict) -> str:
     brand = (d.get("brand") or "").strip()
     object_type = (d.get("object_type") or "").strip()
@@ -198,40 +216,49 @@ def assemble_title_from_fields(d: dict) -> str:
 
 def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     if not openai_active or not img_url: return ""
-    prompt = (
-        "Write ONE clean English e-commerce title ≤70 chars. "
-        "Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count. No marketing words."
-    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role":"system","content":"You are a precise e-commerce title writer."},
+            {"role":"user","content":[
+                {"type":"text","text":"Write ONE clean English e-commerce title ≤70 chars. Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count. No marketing words."},
+                {"type":"image_url","image_url":{"url":img_url}}
+            ]}
+        ],
+        "temperature": 0,
+        "max_tokens": 64
+    }
     try:
-        resp=_openai_chat(
-            [{"role":"system","content":"You are a precise e-commerce title writer."},
-             {"role":"user","content":[
-                 {"type":"text","text":prompt},
-                 {"type":"image_url","image_url":{"url":img_url}}
-             ]}],
-            temperature=0, max_tokens=64
-        )
+        debug_log("OpenAI Fallback Payload", payload)
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         txt=(resp.choices[0].message.content or "").strip()
         return tidy_title(txt,max_chars) if txt else ""
-    except Exception:
+    except Exception as e:
+        debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
         return ""
 
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
     if not openai_active or not img_url: return ""
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role":"system","content":"Extract concise, accurate product fields from the image."},
+            {"role":"user","content":[
+                {"type":"text","text":STRUCT_PROMPT_JSON},
+                {"type":"image_url","image_url":{"url":img_url}}
+            ]}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 220
+    }
     try:
-        resp = _openai_chat(
-            [
-                {"role": "system", "content": "Extract concise, accurate product fields from the image."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": STRUCT_PROMPT_JSON},
-                    {"type": "image_url", "image_url": {"url": img_url}}
-                ]}
-            ],
-            temperature=0.1, max_tokens=220
-        )
+        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
+        resp = _retry(lambda: openai_client.chat.completions.create(**payload))
         raw = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\{.*\}", raw, re.S)
-        if not m: return _fallback_simple_title_url(img_url, max_chars)
+        if not m:
+            return _fallback_simple_title_url(img_url, max_chars)
+
         try:
             data = json.loads(m.group(0))
         except Exception:
@@ -247,6 +274,9 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         return tidy_title(title, max_chars) if title else _fallback_simple_title_url(img_url, max_chars)
 
     except Exception as e:
+        debug_log("OpenAI Vision Exception", {
+            "sku": sku, "url": img_url, "error": str(e), "type": type(e).__name__, "trace": traceback.format_exc()
+        })
         try:
             st.session_state.audit_rows.append({
                 "sku": str(sku or ""),
@@ -269,16 +299,21 @@ def deepl_batch_en2ar(texts:List[str])->List[str]:
 
 def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     if not openai_active or not texts: return list(texts)
-    sys="Translate e-commerce product titles into natural, concise Arabic."
-    usr="Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
+            {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
+        ],
+        "temperature": 0
+    }
     try:
-        resp=_openai_chat(
-            [{"role":"system","content":sys},{"role":"user","content":usr}],
-            temperature=0
-        )
+        debug_log("OpenAI Translate Payload", payload)
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         lines=(resp.choices[0].message.content or "").splitlines()
         return [l.strip() for l in lines if l.strip()] or texts
-    except Exception:
+    except Exception as e:
+        debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
         return texts
 
 def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int)->pd.Series:
@@ -353,19 +388,7 @@ if file_store:
             if entry.get("en"): work.at[i, "name"] = entry["en"]
             if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
 
-# ============== Sidebar NAV ==============
-with st.sidebar:
-    st.markdown("### 🔑 API Keys")
-    st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
-    st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
-    st.markdown("---")
-    section = st.radio(
-        "Navigate",
-        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
-        index=0
-    )
-
-# ============== Shared utils ==============
+# ============== Sections ==============
 def is_nonempty_series(s: pd.Series) -> pd.Series:
     return s.notna() & s.astype(str).str.strip().ne("")
 
@@ -382,7 +405,6 @@ def mapping_stats(df: pd.DataFrame):
     en_ok=int(is_nonempty_series(df["name"].fillna("")).sum()); ar_ok=int(is_nonempty_series(df["name_ar"].fillna("")).sum())
     return total,mapped,unmapped,en_ok,ar_ok,mm
 
-# ============== Sections ==============
 def sec_overview():
     st.subheader("Overview")
     total,mapped,unmapped,en_ok,ar_ok,mm = mapping_stats(work)
