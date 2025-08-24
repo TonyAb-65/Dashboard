@@ -1,4 +1,6 @@
-# Product Mapping Dashboard — Master (URL-only Vision + strict URL sanitization + DEBUG payload logging)
+# Product Mapping Dashboard — Master
+# URL-only Vision + strict URL sanitization + DEBUG payload logging
+# + Manual tool: Rewrite Arabic -> clean Arabic -> English
 
 import io, re, time, math, hashlib, json, sys, traceback
 from typing import List, Iterable, Tuple, Optional
@@ -143,7 +145,7 @@ def _retry(fn, attempts=4, base=0.5):
             if i == attempts - 1: raise
             time.sleep(base * (2 ** i))
 
-# ===== Structured extraction for titles =====
+# ===== Structured extraction for titles (Vision) =====
 STRUCT_PROMPT_JSON = """
 Look at the PHOTO and extract fields for an e-commerce title.
 Return EXACTLY ONE LINE of STRICT JSON with keys:
@@ -181,7 +183,7 @@ def debug_log(title: str, obj):
             msg = str(obj)
         print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
 
-# ============== Title helpers ==============
+# ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
     brand = (d.get("brand") or "").strip()
     object_type = (d.get("object_type") or "").strip()
@@ -288,7 +290,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
             pass
         return ""
 
-# ============== Translation ==============
+# ============== Translation (EN->AR) ==============
 def deepl_batch_en2ar(texts:List[str])->List[str]:
     if not translator: return list(texts)
     try:
@@ -325,6 +327,67 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int)->pd.Se
             out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); time.sleep(0.1)
         return pd.Series(out, index=titles_en.index)
     return titles_en.copy()
+
+# ============== NEW: Rewrite Arabic -> clean Arabic -> English ==============
+AR_REWRITE_PROMPT = """
+أنت محرر عناوين تجارة إلكترونية ثنائي اللغة.
+أعد كتابة العنوان العربي بصيغة متجر احترافية مختصرة بالترتيب:
+العلامة التجارية، نوع المنتج، المتغيّر/الرائحة/الطعم، المادة، الحجم/العدد.
+ثم ترجم الناتج إلى الإنجليزية بصيغة تجارة إلكترونية مكافئة.
+أعد السطر بصيغة JSON على سطر واحد فقط بهذه المفاتيح:
+{"arabic": string, "english": string}
+من دون أي شرح إضافي.
+"""
+
+def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
+    """Returns (arabic_clean, english_title) or ("","") on failure."""
+    if not openai_active or not ar_title: return "",""
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role":"system","content":"You are a bilingual e-commerce content editor."},
+            {"role":"user","content":[
+                {"type":"text","text":AR_REWRITE_PROMPT.strip()},
+                {"type":"text","text":"العنوان:\n" + str(ar_title)}
+            ]}
+        ],
+        "temperature": 0
+    }
+    try:
+        debug_log("OpenAI AR Rewrite Payload", payload)
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+        raw=(resp.choices[0].message.content or "").strip()
+        m=re.search(r"\{.*\}", raw, re.S)
+        if not m: return "",""
+        data=json.loads(m.group(0))
+        ar_clean=(data.get("arabic") or "").strip()
+        en_clean=(data.get("english") or "").strip()
+        return ar_clean, tidy_title(en_clean, 70)
+    except Exception as e:
+        debug_log("OpenAI AR Rewrite Exception", {"error": str(e), "type": type(e).__name__})
+        return "",""
+
+def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[int,int,int]:
+    """Process rows by indices: rewrite Arabic then English. Returns (updated, skipped, failed)."""
+    updated=skipped=failed=0
+    for s in range(0, len(idx), max(1,batch_cap)):
+        chunk=idx[s:s+batch_cap]
+        for i in chunk:
+            sku=str(work.at[i,"merchant_sku"])
+            ar_raw=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
+            if not ar_raw:
+                skipped+=1
+                continue
+            ar_new, en_new = openai_rewrite_ar_to_en_one(ar_raw)
+            if ar_new or en_new:
+                if ar_new: work.at[i,"name_ar"]=ar_new
+                if en_new: work.at[i,"name"]=en_new
+                updated+=1
+            else:
+                failed+=1
+                st.session_state.audit_rows.append({"sku":sku,"phase":"AR rewrite→EN","reason":"rewrite_failed","url":str(work.at[i].get("thumbnail","")) if isinstance(work, pd.DataFrame) else ""})
+        time.sleep(0.05)
+    return updated, skipped, failed
 
 # ============== Mapping lookups ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
@@ -388,7 +451,7 @@ if file_store:
             if entry.get("en"): work.at[i, "name"] = entry["en"]
             if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
 
-# ============== Sections ==============
+# ============== Shared utils ==============
 def is_nonempty_series(s: pd.Series) -> pd.Series:
     return s.notna() & s.astype(str).str.strip().ne("")
 
@@ -405,6 +468,7 @@ def mapping_stats(df: pd.DataFrame):
     en_ok=int(is_nonempty_series(df["name"].fillna("")).sum()); ar_ok=int(is_nonempty_series(df["name_ar"].fillna("")).sum())
     return total,mapped,unmapped,en_ok,ar_ok,mm
 
+# ============== Sections ==============
 def sec_overview():
     st.subheader("Overview")
     total,mapped,unmapped,en_ok,ar_ok,mm = mapping_stats(work)
@@ -479,9 +543,10 @@ def sec_titles():
     elif scope=="Missing EN": base=work[~is_nonempty_series(work["name"].fillna(""))]
     else: base=work[~is_nonempty_series(work["name_ar"].fillna(""))]
 
-    b1,b2=st.columns(2)
+    b1,b2,b3=st.columns(3)
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10)
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
+    with b3: ar_rewrite_batch=st.number_input("Batch (AR rewrite→EN)",10,300,100,10)
 
     # Preview 24 images (browser fetch)
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
@@ -567,13 +632,13 @@ def sec_titles():
                     sku = str(work.at[i,"merchant_sku"])
                     st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
                     store.setdefault(sku, {})["ar"] = ar
-                    _trim_store(store)
                     updated += 1
                 else:
                     failed += 1
                     st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
         return updated, failed
 
+    # === FULL AUTOMATIC BATCHED PIPELINE (image→EN, then EN→AR) ===
     if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
         idx_all = base.index.tolist()
         if not idx_all:
@@ -601,21 +666,40 @@ def sec_titles():
                 time.sleep(0.15)
             st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
-    cA,cB=st.columns(2)
+    # === Optional targeted runners ===
+    cA,cB,cC=st.columns(3)
     with cA:
         if st.button("Run ONLY missing EN"):
             ids=base[~is_nonempty_series(base["name"].fillna(""))].index.tolist()
             if ids:
                 u,k,f = run_titles(ids, fetch_batch, max_len, only_empty, force_over)
                 st.success(f"EN → updated {u}, skipped {k}, failed {f}")
-            else: st.info("No missing EN.")
+            else:
+                st.info("No missing EN.")
     with cB:
         if st.button("Run ONLY missing AR"):
             ids=base[~is_nonempty_series(base["name_ar"].fillna(""))].index.tolist()
             if ids:
                 u2,f2 = run_trans(ids, trans_batch, engine, force_over)
                 st.success(f"AR → updated {u2}, failed {f2}")
-            else: st.info("No missing AR.")
+            else:
+                st.info("No missing AR.")
+    with cC:
+        if st.button("Rewrite Arabic → Clean AR + English (manual)"):
+            # On ALL rows that have Arabic title
+            ids = base[is_nonempty_series(base["name_ar"].fillna(""))].index.tolist()
+            if not ids:
+                st.info("No Arabic titles to rewrite.")
+            else:
+                total=len(ids); bar=st.progress(0.0, text="Rewriting Arabic…")
+                up=sk=fl=0
+                for s in range(0, total, ar_rewrite_batch):
+                    chunk=ids[s:s+ar_rewrite_batch]
+                    u,k,f = rewrite_ar_then_en_indices(chunk, ar_rewrite_batch)
+                    up+=u; sk+=k; fl+=f
+                    done=s+len(chunk)
+                    bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows")
+                st.success(f"Arabic rewrite → updated {up}, skipped {sk}, failed {fl}")
 
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
