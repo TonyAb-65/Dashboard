@@ -130,6 +130,20 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
+def _parse_glossary(txt: str) -> dict:
+    g = {}
+    for line in (txt or "").splitlines():
+        if "," in line:
+            src, tgt = line.split(",", 1)
+            src = src.strip(); tgt = tgt.strip()
+            if src and tgt:
+                g[src] = tgt
+    return g
+
+def _fix_len(seq, n: int):
+    seq = list(seq or [])
+    return seq[:n] if len(seq) >= n else seq + [""] * (n - len(seq))
+
 def _to_data_url_from_http(url: str, timeout: int = 12, max_bytes: int = 8_000_000) -> str:
     """Download an image and return as base64 data: URL so OpenAI Vision can read it even if it can't fetch the site."""
     try:
@@ -186,6 +200,12 @@ Rules:
 # ============== Sidebar NAV ==============
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
+  st.markdown("### 🧩 Translation options")
+USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
+GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
+                            placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
+CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
+
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
     st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
     st.markdown("---")
@@ -316,13 +336,21 @@ def openai_title_from_image(img_url: str, max_chars: int, sku: Optional[str] = N
     )
 
 # ============== Translation (EN->AR) ==============
-def deepl_batch_en2ar(texts:List[str])->List[str]:
-    if not translator: return list(texts)
+OPENAI_EN2AR_SYSTEM = (
+    "You are an e-commerce title translator. Order: Brand, Product, Variant/Fragrance, "
+    "Material, Size/Count. Keep brand spellings per glossary. One line out per line in."
+)
+
+def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
+    if not translator:
+        return list(texts)
     try:
-        res=translator.translate_text(texts, source_lang="EN", target_lang="AR")
-        return [r.text for r in (res if isinstance(res,list) else [res])]
+        if context_hint:
+            return [translator.translate_text(t, source_lang="EN", target_lang="AR", context=context_hint).text for t in texts]
+        return [translator.translate_text(t, source_lang="EN", target_lang="AR").text for t in texts]
     except Exception:
-        return texts
+        return list(texts)
+
 
 def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     if not openai_active or not texts: return list(texts)
