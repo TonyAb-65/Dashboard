@@ -575,7 +575,10 @@ def sec_overview():
         for _,r in unm.iterrows():
             counts.update(tokenize(r.get("name",""))); counts.update(tokenize(r.get("name_ar","")))
         top=pd.DataFrame(counts.most_common(12), columns=["token","count"])
-        st.dataframe(top, use_container_width=True, height=260) if len(top)>0 else st.caption("No tokens.")
+        if len(top)>0:
+            st.dataframe(top, width="stretch", height=260)
+        else:
+            st.caption("No tokens.")
     else:
         st.caption("No tokens.")
 
@@ -615,8 +618,10 @@ def sec_filter():
         return base
     filtered=work[mask(work)].copy()
     st.caption(f"{filtered.shape[0]} rows")
-    st.dataframe(filtered[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
-                 use_container_width=True, height=380)
+    st.dataframe(
+        filtered[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id","thumbnail"]],
+        width="stretch", height=380
+    )
 
 def sec_titles():
     st.subheader("Titles & Translate")
@@ -652,7 +657,7 @@ def sec_titles():
             for j, (i, row) in enumerate(view.iterrows()):
                 url = clean_url_for_vision(str(row.get("thumbnail", "")))
                 with cols[j % 6]:
-                    if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
+                    if is_valid_url(url): st.image(url, caption=f"Row {i}", width="stretch")
                     else: st.caption("Bad URL")
         else:
             st.info("No thumbnails found in current scope.")
@@ -685,7 +690,7 @@ def sec_titles():
                 if not is_valid_url(norm_url):
                     st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"url_invalid","url":norm_url}); failed+=1; continue
 
-                title = openai_title_from_url(norm_url, max_chars, sku)
+                title = openai_title_from_url(norm_url, max_len, sku)
                 if title:
                     work.at[i,"name"] = title
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = title
@@ -851,8 +856,10 @@ def sec_grouping():
                 mask|=base_df["name_ar"].astype(str).str.lower().str.contains(term,na=False)
             hits_df=base_df[mask].copy()
             st.write(f"Matches: {hits_df.shape[0]}")
-            st.dataframe(hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
-                         use_container_width=True, height=260)
+            st.dataframe(
+                hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
+                width="stretch", height=260
+            )
             skus=hits_df["merchant_sku"].astype(str).tolist()
             chosen=st.multiselect("Select SKUs", options=skus, default=skus)
             c1,c2,c3=st.columns(3)
@@ -900,9 +907,9 @@ def sec_sheet():
     if len(page)>0:
         try:
             styler=page.style.apply(style_map, axis=1).applymap(hi, subset=["name","name_ar"])
-            st.dataframe(styler, use_container_width=True, height=440)
+            st.dataframe(styler, width="stretch", height=440)
         except Exception:
-            st.dataframe(page, use_container_width=True, height=440)
+            st.dataframe(page, width="stretch", height=440)
     else: st.info("No rows.")
     return page
 
