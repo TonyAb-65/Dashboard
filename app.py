@@ -242,16 +242,23 @@ with st.sidebar:
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    brand = (d.get("brand") or "").strip()
-    object_type = (d.get("object_type") or "").strip()
-    product = (d.get("product") or "").strip()
-    variant = (d.get("variant") or "").strip()
-    flavor  = (d.get("flavor_scent") or "").strip()
-    material= (d.get("material") or "").strip()
-    feature = (d.get("feature") or "").strip()
-    size_v  = (d.get("size_value") or "").strip()
-    size_u  = (d.get("size_unit") or "").strip().lower()
-    count   = (d.get("count") or "").strip()
+    def _s(v):
+        return str(v).strip() if v is not None else ""
+    def _num(v):
+        s = _s(v)
+        m = re.search(r"\d+(?:\.\d+)?", s)
+        return m.group(0) if m else ""
+
+    brand = _s(d.get("brand"))
+    object_type = _s(d.get("object_type"))
+    product = _s(d.get("product"))
+    variant = _s(d.get("variant"))
+    flavor  = _s(d.get("flavor_scent"))
+    material= _s(d.get("material"))
+    feature = _s(d.get("feature"))
+    size_v  = _num(d.get("size_value"))
+    size_u  = _s(d.get("size_unit")).lower()
+    count   = _num(d.get("count"))
 
     parts=[]
     if brand: parts.append(brand)
