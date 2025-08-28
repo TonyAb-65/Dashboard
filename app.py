@@ -130,41 +130,6 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
-def _parse_glossary(txt: str) -> dict:
-    g = {}
-    for line in (txt or "").splitlines():
-        if "," in line:
-            src, tgt = line.split(",", 1)
-            src = src.strip(); tgt = tgt.strip()
-            if src and tgt:
-                g[src] = tgt
-    return g
-
-def _fix_len(seq, n: int):
-    seq = list(seq or [])
-    return seq[:n] if len(seq) >= n else seq + [""] * (n - len(seq))
-
-def _to_data_url_from_http(url: str, timeout: int = 12, max_bytes: int = 8_000_000) -> str:
-    """Download an image and return as base64 data: URL so OpenAI Vision can read it even if it can't fetch the site."""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Referer": f"https://{urlsplit(url).netloc}",
-        }
-        r = requests.get(url, headers=headers, timeout=timeout, stream=True)
-        r.raise_for_status()
-        data = r.content if r.content else r.raw.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            return ""
-        mime = r.headers.get("Content-Type", "").split(";")[0] or "image/jpeg"
-        if "/" not in mime:
-            mime = "image/jpeg"
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        return ""
-
 def clean_url_for_vision(raw: str) -> str:
     """Sanitize before sending to OpenAI Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
@@ -200,12 +165,6 @@ Rules:
 # ============== Sidebar NAV ==============
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
-  st.markdown("### 🧩 Translation options")
-USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
-GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
-                            placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
-CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
-
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
     st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
     st.markdown("---")
@@ -280,77 +239,65 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
         debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
         return ""
 
-def openai_title_from_image(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    if not openai_active or not img_url:
-        return ""
-
-    def _vision(payload):
-        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
-        return _retry(lambda: openai_client.chat.completions.create(**payload))
-
-    # 1) try direct URL first
+def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
+    if not openai_active or not img_url: return ""
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": "Extract concise, accurate product fields from the image."},
-            {"role": "user", "content": [
-                {"type": "text", "text": STRUCT_PROMPT_JSON},
-                {"type": "image_url", "image_url": {"url": img_url}}
+            {"role":"system","content":"Extract concise, accurate product fields from the image."},
+            {"role":"user","content":[
+                {"type":"text","text":STRUCT_PROMPT_JSON},
+                {"type":"image_url","image_url":{"url":img_url}}
             ]}
         ],
         "temperature": 0.1,
-        "max_tokens": 220,
+        "max_tokens": 220
     }
-
     try:
-        resp = _vision(payload)
+        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
+        resp = _retry(lambda: openai_client.chat.completions.create(**payload))
         raw = (resp.choices[0].message.content or "").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return _fallback_simple_title_url(img_url, max_chars)
+
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return _fallback_simple_title_url(img_url, max_chars)
+
+        obj = (data.get("object_type") or "").strip().lower()
+        prod = (data.get("product") or "").strip().lower()
+        invalid = {"ml","l","g","kg","pcs","tabs","caps"}
+        if (not obj and not prod) or (prod in invalid) or (("bag" in obj and "tea" in obj) or ("tea bag" in prod)):
+            return _fallback_simple_title_url(img_url, max_chars)
+
+        title = assemble_title_from_fields(data)
+        return tidy_title(title, max_chars) if title else _fallback_simple_title_url(img_url, max_chars)
+
     except Exception as e:
-        # 2) fallback to base64 data: URL if OpenAI can't fetch the site
-        data_url = _to_data_url_from_http(img_url)
-        if not data_url:
-            debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
-            return ""
-        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
-        resp = _vision(payload)
-        raw = (resp.choices[0].message.content or "").strip()
-
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        # fallback title writer using whichever image URL is in payload now
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
-
-    try:
-        data = json.loads(m.group(0))
-    except Exception:
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
-
-    obj = (data.get("object_type") or "").strip().lower()
-    prod = (data.get("product") or "").strip().lower()
-    if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
-
-    title = assemble_title_from_fields(data)
-    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(
-        payload["messages"][1]["content"][1]["image_url"]["url"], max_chars
-    )
+        debug_log("OpenAI Vision Exception", {
+            "sku": sku, "url": img_url, "error": str(e), "type": type(e).__name__, "trace": traceback.format_exc()
+        })
+        try:
+            st.session_state.audit_rows.append({
+                "sku": str(sku or ""),
+                "phase": "EN title",
+                "reason": f"openai_error:{type(e).__name__}",
+                "url": img_url
+            })
+        except Exception:
+            pass
+        return ""
 
 # ============== Translation (EN->AR) ==============
-OPENAI_EN2AR_SYSTEM = (
-    "You are an e-commerce title translator. Order: Brand, Product, Variant/Fragrance, "
-    "Material, Size/Count. Keep brand spellings per glossary. One line out per line in."
-)
-
-def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
-    if not translator:
-        return list(texts)
+def deepl_batch_en2ar(texts:List[str])->List[str]:
+    if not translator: return list(texts)
     try:
-        if context_hint:
-            return [translator.translate_text(t, source_lang="EN", target_lang="AR", context=context_hint).text for t in texts]
-        return [translator.translate_text(t, source_lang="EN", target_lang="AR").text for t in texts]
+        res=translator.translate_text(texts, source_lang="EN", target_lang="AR")
+        return [r.text for r in (res if isinstance(res,list) else [res])]
     except Exception:
-        return list(texts)
-
+        return texts
 
 def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     if not openai_active or not texts: return list(texts)
