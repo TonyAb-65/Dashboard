@@ -234,16 +234,29 @@ with st.sidebar:
 
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
+
+    NAV = [
+        ("📊 Overview", "overview"),
+        ("🔎 Filter", "filter"),
+        ("🖼️ Titles & Translate", "titles"),
+        ("🧩 Grouping", "grouping"),
+        ("📑 Sheet", "sheet"),
+        ("⬇️ Downloads", "downloads"),
+        ("⚙️ Settings", "settings"),
+    ]
+    st.session_state.setdefault("last_sheet_df", None)
+
     section = st.radio(
         "Navigate",
-        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
-        index=0
+        options=[k for _, k in NAV],
+        format_func=lambda k: next(lbl for lbl, kk in NAV if kk == k),
+        index=0,
+        key="nav_choice",
     )
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    def _s(v):
-        return str(v).strip() if v is not None else ""
+    def _s(v): return str(v).strip() if v is not None else ""
     def _num(v):
         s = _s(v)
         m = re.search(r"\d+(?:\.\d+)?", s)
@@ -664,7 +677,7 @@ def sec_titles():
             for j, (i, row) in enumerate(view.iterrows()):
                 url = clean_url_for_vision(str(row.get("thumbnail", "")))
                 with cols[j % 6]:
-                    if is_valid_url(url): st.image(url, caption=f"Row {i}", width="stretch")
+                    if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
                     else: st.caption("Bad URL")
         else:
             st.info("No thumbnails found in current scope.")
@@ -944,20 +957,31 @@ def sec_settings():
             if st.session_state.file_hash in store: del store[st.session_state.file_hash]
             st.success("Cleared.")
 
-# ============== Router ==============
-if section=="📊 Overview":
+# ============== Router (ID-based, robust) ==============
+if section == "overview":
     safe_section("Overview", sec_overview)
-elif section=="🔎 Filter":
+
+elif section == "filter":
     safe_section("Filter", sec_filter)
-elif section=="🖼️ Titles & Translate":
+
+elif section == "titles":
     safe_section("Titles & Translate", sec_titles)
-elif section=="🧩 Grouping":
+
+elif section == "grouping":
     safe_section("Grouping", sec_grouping)
-elif section=="📑 Sheet":
-    page_df = safe_section("Sheet", sec_sheet) or work.copy()
-elif section=="⬇️ Downloads":
-    try: page_df
-    except NameError: page_df=work.copy()
+
+elif section == "sheet":
+    tmp = safe_section("Sheet", sec_sheet)
+    if isinstance(tmp, pd.DataFrame):
+        st.session_state["last_sheet_df"] = tmp
+    elif st.session_state.get("last_sheet_df") is None:
+        st.session_state["last_sheet_df"] = work.copy()
+
+elif section == "downloads":
+    page_df = st.session_state.get("last_sheet_df")
+    if not isinstance(page_df, pd.DataFrame):
+        page_df = work.copy()
     safe_section("Downloads", lambda: sec_downloads(page_df))
+
 else:
     safe_section("Settings", sec_settings)
