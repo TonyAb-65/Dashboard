@@ -1,33 +1,63 @@
-# Product Mapping Dashboard — Master
-# URL-only Vision + strict URL sanitization + DEBUG payload logging
-# + Manual tool: Rewrite Arabic -> clean Arabic -> English
+# Product Mapping Dashboard — Master (merged with surgical fixes)
+# - Vision fallback: if OpenAI cannot fetch remote URL, download and send as base64 data URL
+# - Translation upgrade: glossary + context + length-safe batching
+# - Manual tool: Rewrite Arabic → clean Arabic → English
+# - Sidebar indentation fix and controls
+# Keep the rest intact.
 
-import io, re, time, math, hashlib, json, sys, traceback
-from typing import List, Iterable, Tuple, Optional
+import io, re, time, math, hashlib, json, sys, traceback, base64
+from typing import List, Iterable, Dict, Tuple, Optional
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
 
 import pandas as pd
 import streamlit as st
+import requests
+from PIL import Image
+from io import BytesIO
 
 # ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
 st.set_option("client.showErrorDetails", True)
 
 # ===== UI THEME & HEADER =====
-EMERALD = "#10b981"; EMERALD_DARK = "#059669"; TEXT_LIGHT = "#f8fafc"
+EMERALD = "#10b981"
+EMERALD_DARK = "#059669"
+TEXT_LIGHT = "#f8fafc"
+
 st.markdown(f"""
 <style>
-.app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
-.app-title {{ font-size:22px; font-weight:800; color:#111827; }}
+/* Sticky header */
+.app-header {{
+  padding: 8px 0 8px 0;
+  border-bottom: 1px solid #e5e7eb;
+  background: #ffffff;
+  position: sticky; top: 0; z-index: 5;
+}}
+.app-title {{ font-size: 22px; font-weight: 800; color:#111827; }}
 .app-sub {{ color:#6b7280; font-size:12px; }}
-[data-testid="stSidebar"] > div:first-child {{ background:linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color:{TEXT_LIGHT}; }}
-[data-testid="stSidebar"] .stMarkdown p,[data-testid="stSidebar"] label,[data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
-[data-testid="stSidebar"] .stRadio > div > label {{ margin-bottom:6px; padding:6px 10px; border-radius:8px; background:rgba(255,255,255,0.08); }}
+
+/* Sidebar emerald theme */
+[data-testid="stSidebar"] > div:first-child {{
+  background: linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%);
+  color: {TEXT_LIGHT};
+}}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
+[data-testid="stSidebar"] .stRadio > div > label {{
+  margin-bottom: 6px; padding: 6px 10px; border-radius: 8px;
+  background: rgba(255,255,255,0.08);
+}}
+
+/* Buttons and cards */
 .stButton>button {{ border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }}
-.block-container {{ padding-top:6px; }}
+.card {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fff; }}
+.small-note {{ color:#6b7280; font-size:12px; margin-top:-6px; }}
+.block-container {{ padding-top: 6px; }}
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 <div class="app-header">
   <div class="app-title">🧭 Product Mapping Dashboard</div>
@@ -60,7 +90,7 @@ try:
 except Exception:
     openai_client=None; openai_active=False
 
-# -------- Persistent cache across reruns --------
+# -------- Persistent cache across reruns (per server process) --------
 @st.cache_resource
 def global_cache() -> dict:
     # {file_hash: {sku: {"en": "...", "ar": "..."}}}
@@ -107,7 +137,7 @@ def tidy_title(s:str,max_chars:int=70)->str:
 
 def is_valid_url(u:str)->bool:
     if not isinstance(u,str): return False
-    u=u.strip()
+    u=u.strip().strip('"').strip("'")
     try:
         p=urlsplit(u); return p.scheme in ("http","https") and bool(p.netloc)
     except Exception: return False
@@ -130,8 +160,46 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
+# —— NEW: glossary + length helpers ——
+def _parse_glossary(txt: str) -> dict:
+    g = {}
+    for line in (txt or "").splitlines():
+        if "," in line:
+            src, tgt = line.split(",", 1)
+            src = src.strip(); tgt = tgt.strip()
+            if src and tgt:
+                g[src] = tgt
+    return g
+
+def _fix_len(seq, n: int):
+    seq = list(seq or [])
+    return seq[:n] if len(seq) >= n else seq + [""] * (n - len(seq))
+
+# —— NEW: data-URL fallback for Vision ——
+def _to_data_url_from_http(url: str, timeout: int = 12, max_bytes: int = 8_000_000) -> str:
+    """Download image and return as base64 data: URL."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": f"https://{urlsplit(url).netloc}",
+        }
+        r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        r.raise_for_status()
+        data = r.content if r.content else r.raw.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return ""
+        try:
+            fmt = Image.open(BytesIO(data)).format or "JPEG"
+        except Exception:
+            fmt = "JPEG"
+        mime = "image/jpeg" if fmt.upper() in ("JPG","JPEG") else f"image/{fmt.lower()}"
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return ""
+
 def clean_url_for_vision(raw: str) -> str:
-    """Sanitize before sending to OpenAI Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
     u = re.sub(r"\s+", "", u)
     u = _normalize_url(u)
@@ -145,22 +213,31 @@ def _retry(fn, attempts=4, base=0.5):
             if i == attempts - 1: raise
             time.sleep(base * (2 ** i))
 
+# ---------- debug logger ----------
+def debug_log(title: str, obj):
+    if DEBUG:
+        try:
+            msg = json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception:
+            msg = str(obj)
+        print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
+
 # ===== Structured extraction for titles (Vision) =====
-STRUCT_PROMPT_JSON = """
-Look at the PHOTO and extract fields for an e-commerce title.
-Return EXACTLY ONE LINE of STRICT JSON with keys:
-{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
-"flavor_scent":string|null,"material":string|null,"size_value":string|null,
-"size_unit":string|null,"count":string|null,"feature":string|null}
-Rules:
-- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').
-- PRIORITIZE object_type over printed text when they disagree.
-- NEVER output 'tea bag' unless an actual bag/sachet is visible.
-- If brand not visible set brand=null. If product is unclear set product=null.
-- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
-- feature is a short visible attribute (e.g., 'heat-resistant').
-- Output JSON only.
-"""
+STRUCT_PROMPT_JSON = (
+    "Look at the PHOTO and extract fields for an e-commerce title.\n"
+    "Return EXACTLY ONE LINE of STRICT JSON with keys:"
+    '{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,'
+    '"flavor_scent":string|null,"material":string|null,"size_value":string|null,'
+    '"size_unit":string|null,"count":string|null,"feature":string|null}\n'
+    "Rules:\n"
+    "- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').\n"
+    "- PRIORITIZE object_type over printed text when they disagree.\n"
+    "- NEVER output 'tea bag' unless an actual bag/sachet is visible.\n"
+    "- If brand not visible set brand=null. If product is unclear set product=null.\n"
+    "- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].\n"
+    "- feature is a short visible attribute (e.g., 'heat-resistant').\n"
+    "- Output JSON only."
+)
 
 # ============== Sidebar NAV ==============
 with st.sidebar:
@@ -169,19 +246,18 @@ with st.sidebar:
     st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
+
+    st.markdown("### 🧩 Translation options")
+    USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
+    GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
+                                placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
+    CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
+
     section = st.radio(
         "Navigate",
         ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
         index=0
     )
-
-def debug_log(title: str, obj):
-    if DEBUG:
-        try:
-            msg = json.dumps(obj, ensure_ascii=False, indent=2)
-        except Exception:
-            msg = str(obj)
-        print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
@@ -232,143 +308,172 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     }
     try:
         debug_log("OpenAI Fallback Payload", payload)
-        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+        resp=_retry(lambda: openai_client.chat_completions.create(**payload))  # fallback call path safety
+    except Exception:
+        try:
+            resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+        except Exception as e:
+            debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
+            return ""
+    try:
         txt=(resp.choices[0].message.content or "").strip()
         return tidy_title(txt,max_chars) if txt else ""
     except Exception as e:
-        debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
+        debug_log("OpenAI Fallback Parse", {"error": str(e)})
         return ""
 
-def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    if not openai_active or not img_url: return ""
+def openai_title_from_image(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
+    if not openai_active or not img_url:
+        return ""
+
+    def _vision(payload):
+        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
+        return _retry(lambda: openai_client.chat.completions.create(**payload))
+
+    # try direct URL
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role":"system","content":"Extract concise, accurate product fields from the image."},
-            {"role":"user","content":[
-                {"type":"text","text":STRUCT_PROMPT_JSON},
-                {"type":"image_url","image_url":{"url":img_url}}
+            {"role": "system", "content": "Extract concise, accurate product fields from the image."},
+            {"role": "user", "content": [
+                {"type": "text", "text": STRUCT_PROMPT_JSON},
+                {"type": "image_url", "image_url": {"url": img_url}}
             ]}
         ],
         "temperature": 0.1,
-        "max_tokens": 220
+        "max_tokens": 220,
+    }
+
+    try:
+        resp = _vision(payload)
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        # fallback to base64 data URL
+        data_url = _to_data_url_from_http(img_url)
+        if not data_url:
+            debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
+            return ""
+        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
+        resp = _vision(payload)
+        raw = (resp.choices[0].message.content or "").strip()
+
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+
+    obj = (data.get("object_type") or "").strip().lower()
+    prod = (data.get("product") or "").strip().lower()
+    if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+
+    title = assemble_title_from_fields(data)
+    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(
+        payload["messages"][1]["content"][1]["image_url"]["url"], max_chars
+    )
+
+# ============== Translation (EN->AR) with glossary/context ==============
+OPENAI_EN2AR_SYSTEM = (
+    "You are an e-commerce title translator. Order: Brand, Product, Variant/Fragrance, "
+    "Material, Size/Count. Keep brand spellings per glossary. One line out per line in."
+)
+
+def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
+    if not translator:
+        return list(texts)
+    try:
+        if context_hint:
+            return [translator.translate_text(t, source_lang="EN", target_lang="AR", context=context_hint).text for t in texts]
+        return [translator.translate_text(t, source_lang="EN", target_lang="AR").text for t in texts]
+    except Exception:
+        return list(texts)
+
+def openai_translate_batch_en2ar(texts: List[str], glossary: Optional[dict] = None, context_hint: str = "") -> List[str]:
+    if not openai_active or not texts:
+        return list(texts)
+    glossary_hint = ""
+    if glossary:
+        pairs = "; ".join([f"{k} → {v}" for k, v in glossary.items()])
+        glossary_hint = f"\nGlossary (do not deviate): {pairs}"
+    if context_hint:
+        glossary_hint += f"\nContext: {context_hint}"
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": OPENAI_EN2AR_SYSTEM + glossary_hint},
+            {"role": "user", "content": "Translate each line to Arabic e-commerce style. One output line per input line:\n\n" + "\n".join(texts)},
+        ],
+        "temperature": 0,
     }
     try:
-        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
+        debug_log("OpenAI Translate Payload", payload)
+        resp = _retry(lambda: openai_client.chat.completions.create(**payload))
+        raw = (resp.choices[0].message.content or "")
+        outs = raw.splitlines()  # keep blanks to preserve alignment
+        return _fix_len(outs, len(texts))
+    except Exception as e:
+        debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
+        return _fix_len(texts, len(texts))
+
+def translate_en_titles(titles_en: pd.Series, engine: str, batch_size: int,
+                        glossary: Optional[dict], context_hint: str) -> pd.Series:
+    texts = titles_en.fillna("").astype(str).tolist()
+    if engine == "DeepL" and deepl_active:
+        outs = deepl_batch_en2ar(texts, context_hint=context_hint)
+        return pd.Series(_fix_len(outs, len(texts)), index=titles_en.index)
+    if engine == "OpenAI":
+        out_all: List[str] = []
+        for s in range(0, len(texts), max(1, batch_size)):
+            chunk = texts[s:s + batch_size]
+            out_chunk = openai_translate_batch_en2ar(chunk, glossary=glossary, context_hint=context_hint)
+            out_all.extend(_fix_len(out_chunk, len(chunk)))
+            time.sleep(0.05)
+        return pd.Series(_fix_len(out_all, len(texts)), index=titles_en.index)
+    return pd.Series(texts, index=titles_en.index)
+
+# ============== Arabic rewrite → English (manual tool) ==============
+AR_REWRITE_PROMPT = """
+أنت محرر عناوين تجارة إلكترونية.
+أعد كتابة العنوان العربي بصيغة متجر مختصرة بالترتيب:
+العلامة التجارية، نوع المنتج، المتغيّر/الرائحة، المادة، الحجم/العدد.
+ثم ترجم الناتج إلى الإنجليزية بصيغة مكافئة.
+أعد سطر JSON واحداً بالمفاتيح:
+{"arabic": string, "english": string}
+بدون أي شرح آخر.
+""".strip()
+
+def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
+    if not openai_active or not ar_title:
+        return "", ""
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are a bilingual e-commerce content editor."},
+            {"role": "user", "content": [
+                {"type": "text", "text": AR_REWRITE_PROMPT},
+                {"type": "text", "text": "العنوان:\n" + str(ar_title)}
+            ]}
+        ],
+        "temperature": 0
+    }
+    try:
         resp = _retry(lambda: openai_client.chat.completions.create(**payload))
         raw = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
-            return _fallback_simple_title_url(img_url, max_chars)
-
-        try:
-            data = json.loads(m.group(0))
-        except Exception:
-            return _fallback_simple_title_url(img_url, max_chars)
-
-        obj = (data.get("object_type") or "").strip().lower()
-        prod = (data.get("product") or "").strip().lower()
-        invalid = {"ml","l","g","kg","pcs","tabs","caps"}
-        if (not obj and not prod) or (prod in invalid) or (("bag" in obj and "tea" in obj) or ("tea bag" in prod)):
-            return _fallback_simple_title_url(img_url, max_chars)
-
-        title = assemble_title_from_fields(data)
-        return tidy_title(title, max_chars) if title else _fallback_simple_title_url(img_url, max_chars)
-
-    except Exception as e:
-        debug_log("OpenAI Vision Exception", {
-            "sku": sku, "url": img_url, "error": str(e), "type": type(e).__name__, "trace": traceback.format_exc()
-        })
-        try:
-            st.session_state.audit_rows.append({
-                "sku": str(sku or ""),
-                "phase": "EN title",
-                "reason": f"openai_error:{type(e).__name__}",
-                "url": img_url
-            })
-        except Exception:
-            pass
-        return ""
-
-# ============== Translation (EN->AR) ==============
-def deepl_batch_en2ar(texts:List[str])->List[str]:
-    if not translator: return list(texts)
-    try:
-        res=translator.translate_text(texts, source_lang="EN", target_lang="AR")
-        return [r.text for r in (res if isinstance(res,list) else [res])]
+            return "", ""
+        data = json.loads(m.group(0))
+        ar_clean = (data.get("arabic") or "").strip()
+        en_clean = tidy_title((data.get("english") or "").strip(), 70)
+        return ar_clean, en_clean
     except Exception:
-        return texts
-
-def openai_translate_batch_en2ar(texts:List[str])->List[str]:
-    if not openai_active or not texts: return list(texts)
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
-            {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
-        ],
-        "temperature": 0
-    }
-    try:
-        debug_log("OpenAI Translate Payload", payload)
-        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
-        lines=(resp.choices[0].message.content or "").splitlines()
-        return [l.strip() for l in lines if l.strip()] or texts
-    except Exception as e:
-        debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
-        return texts
-
-def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int)->pd.Series:
-    texts=titles_en.fillna("").astype(str).tolist()
-    if engine=="DeepL" and deepl_active: return pd.Series(deepl_batch_en2ar(texts), index=titles_en.index)
-    if engine=="OpenAI":
-        out=[]
-        for s in range(0,len(texts),max(1,batch_size)):
-            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); time.sleep(0.1)
-        return pd.Series(out, index=titles_en.index)
-    return titles_en.copy()
-
-# ============== NEW: Rewrite Arabic -> clean Arabic -> English ==============
-AR_REWRITE_PROMPT = """
-أنت محرر عناوين تجارة إلكترونية ثنائي اللغة.
-أعد كتابة العنوان العربي بصيغة متجر احترافية مختصرة بالترتيب:
-العلامة التجارية، نوع المنتج، المتغيّر/الرائحة/الطعم، المادة، الحجم/العدد.
-ثم ترجم الناتج إلى الإنجليزية بصيغة تجارة إلكترونية مكافئة.
-أعد السطر بصيغة JSON على سطر واحد فقط بهذه المفاتيح:
-{"arabic": string, "english": string}
-من دون أي شرح إضافي.
-"""
-
-def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
-    """Returns (arabic_clean, english_title) or ("","") on failure."""
-    if not openai_active or not ar_title: return "",""
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role":"system","content":"You are a bilingual e-commerce content editor."},
-            {"role":"user","content":[
-                {"type":"text","text":AR_REWRITE_PROMPT.strip()},
-                {"type":"text","text":"العنوان:\n" + str(ar_title)}
-            ]}
-        ],
-        "temperature": 0
-    }
-    try:
-        debug_log("OpenAI AR Rewrite Payload", payload)
-        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
-        raw=(resp.choices[0].message.content or "").strip()
-        m=re.search(r"\{.*\}", raw, re.S)
-        if not m: return "",""
-        data=json.loads(m.group(0))
-        ar_clean=(data.get("arabic") or "").strip()
-        en_clean=(data.get("english") or "").strip()
-        return ar_clean, tidy_title(en_clean, 70)
-    except Exception as e:
-        debug_log("OpenAI AR Rewrite Exception", {"error": str(e), "type": type(e).__name__})
-        return "",""
+        return "", ""
 
 def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[int,int,int]:
-    """Process rows by indices: rewrite Arabic then English. Returns (updated, skipped, failed)."""
     updated=skipped=failed=0
     for s in range(0, len(idx), max(1,batch_cap)):
         chunk=idx[s:s+batch_cap]
@@ -376,8 +481,7 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
             sku=str(work.at[i,"merchant_sku"])
             ar_raw=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             if not ar_raw:
-                skipped+=1
-                continue
+                skipped+=1; continue
             ar_new, en_new = openai_rewrite_ar_to_en_one(ar_raw)
             if ar_new or en_new:
                 if ar_new: work.at[i,"name_ar"]=ar_new
@@ -385,7 +489,11 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
                 updated+=1
             else:
                 failed+=1
-                st.session_state.audit_rows.append({"sku":sku,"phase":"AR rewrite→EN","reason":"rewrite_failed","url":str(work.at[i].get("thumbnail","")) if isinstance(work, pd.DataFrame) else ""})
+                try:
+                    url = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+                except Exception:
+                    url = ""
+                st.session_state.audit_rows.append({"sku":sku,"phase":"AR rewrite→EN","reason":"rewrite_failed","url":url})
         time.sleep(0.05)
     return updated, skipped, failed
 
@@ -515,8 +623,8 @@ def sec_filter():
                         if f in df.columns: m|=df[f].astype(str).str.contains(pat, case=False, regex=True, na=False)
                 else:
                     m=pd.Series(False,index=df.index)
-                    for f in fields:
-                        if f in df.columns: m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                    for f in df.columns:
+                        if f in fields: m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
             for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
@@ -548,7 +656,7 @@ def sec_titles():
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
     with b3: ar_rewrite_batch=st.number_input("Batch (AR rewrite→EN)",10,300,100,10)
 
-    # Preview 24 images (browser fetch)
+    # Preview 24 images (no processing)
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base.head(24)
@@ -562,7 +670,7 @@ def sec_titles():
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Workers (URL-only to OpenAI) ----------
+    # ---------- Batched workers with persistent cache ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -572,7 +680,6 @@ def sec_titles():
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
         store = global_cache().setdefault(st.session_state.file_hash, {})
-
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
             for i in chunk:
@@ -580,7 +687,6 @@ def sec_titles():
                 cache_local = st.session_state.proc_cache.get(sku, {})
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
                 norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
-
                 if not force_over and store.get(sku, {}).get("en"):
                     work.at[i,"name"] = store[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=store[sku]["en"]; skipped+=1; continue
                 if not force_over and cache_local.get("name"):
@@ -590,7 +696,7 @@ def sec_titles():
                 if not is_valid_url(norm_url):
                     st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"url_invalid","url":norm_url}); failed+=1; continue
 
-                title = openai_title_from_url(norm_url, max_len, sku)
+                title = openai_title_from_image(norm_url, max_chars=max_len, sku=sku) if norm_url else ""
                 if title:
                     work.at[i,"name"] = title
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = title
@@ -611,22 +717,29 @@ def sec_titles():
             cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
+
             if not force_over and store.get(sku, {}).get("ar"):
-                work.at[i,"name_ar"]=store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=store[sku]["ar"]; continue
+                work.at[i,"name_ar"] = store[sku]["ar"]
+                st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = store[sku]["ar"]
+                continue
+
             if not force_over and cache_local.get("name_ar"):
                 work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
                 ids.append(i); texts.append(en)
 
         updated=failed=0
+        _glossary = _parse_glossary(GLOSSARY_CSV) if USE_GLOSSARY else {}
         for s in range(0, len(texts), trans_batch):
             chunk = texts[s:s+trans_batch]
-            outs = translate_en_titles(pd.Series(chunk), engine, trans_batch).tolist()
+            outs = translate_en_titles(pd.Series(chunk), engine, trans_batch, glossary=_glossary, context_hint=CONTEXT_HINT).tolist()
             for j, _ in enumerate(chunk):
-                i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
+                i = ids[s+j]
+                ar = outs[j] if j < len(outs) else ""
                 if ar:
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
@@ -686,7 +799,6 @@ def sec_titles():
                 st.info("No missing AR.")
     with cC:
         if st.button("Rewrite Arabic → Clean AR + English (manual)"):
-            # On ALL rows that have Arabic title
             ids = base[is_nonempty_series(base["name_ar"].fillna(""))].index.tolist()
             if not ids:
                 st.info("No Arabic titles to rewrite.")
@@ -797,6 +909,11 @@ def sec_sheet():
         st.dataframe(styler, use_container_width=True, height=440)
     else: st.info("No rows.")
     return page
+
+def to_excel_download(df, sheet_name="Products"):
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
+    buf.seek(0); return buf
 
 def sec_downloads(page_df):
     st.subheader("Downloads")
