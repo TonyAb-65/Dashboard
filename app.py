@@ -320,8 +320,26 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
     if not openai_active or not img_url:
         return ""
 
+    # Pre-convert to data URL for hosts that block fetchers
+    host = urlsplit(img_url).netloc.lower()
+    force_data = any(host.endswith(h) for h in [
+        "bashawat.com.sa",
+    ])
+    img_for_model = _to_data_url_from_http(img_url) if force_data else img_url
+    if force_data and not img_for_model:
+        debug_log("Vision Preconvert Failed", {"sku": sku, "url": img_url})
+        return ""
+
     def _vision(payload):
-        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
+        # keep logging lightweight to avoid dumping huge data URLs
+        try:
+            msg_meta=[]
+            for m in payload["messages"]:
+                kinds = [c.get("type") for c in m.get("content", [])] if isinstance(m.get("content"), list) else ["text"]
+                msg_meta.append({"role": m.get("role"), "kinds": kinds})
+            debug_log("OpenAI Vision MsgMeta", {"sku": sku, "meta": msg_meta})
+        except Exception:
+            pass
         return _retry(lambda: openai_client.chat.completions.create(**payload))
 
     payload = {
@@ -330,7 +348,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
             {"role": "system", "content": "Extract concise, accurate product fields from the image."},
             {"role": "user", "content": [
                 {"type": "text", "text": STRUCT_PROMPT_JSON},
-                {"type": "image_url", "image_url": {"url": img_url}}
+                {"type": "image_url", "image_url": {"url": img_for_model}}
             ]}
         ],
         "temperature": 0.1,
@@ -341,13 +359,17 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         resp = _vision(payload)
         raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        data_url = _to_data_url_from_http(img_url)
-        if not data_url:
-            debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
+        debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
+        # Retry once with data URL if not already forced
+        if not force_data:
+            data_url = _to_data_url_from_http(img_url)
+            if not data_url:
+                return ""
+            payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
+            resp = _vision(payload)
+            raw = (resp.choices[0].message.content or "").strip()
+        else:
             return ""
-        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
-        resp = _vision(payload)
-        raw = (resp.choices[0].message.content or "").strip()
 
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
