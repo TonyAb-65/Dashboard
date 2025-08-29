@@ -270,20 +270,23 @@ def safe_section(label, fn):
         return None
 
 # ===== Structured extraction prompt (Vision) =====
+# ===== Structured extraction prompt (Vision) =====
 STRUCT_PROMPT_JSON = """
-Look at the PHOTO and extract fields for an e-commerce title.
-Return EXACTLY ONE LINE of STRICT JSON with keys:
-{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
-"flavor_scent":string|null,"material":string|null,"size_value":string|null,
-"size_unit":string|null,"count":string|null,"feature":string|null}
+Look carefully at the PRODUCT PHOTO and extract the following fields in STRICT JSON:
+{"brand":string|null,"object_type":string,"product":string|null,"variant":string|null,
+"flavor_scent":string|null,"material":string|null,"size_value":string|null,"size_unit":string|null,
+"count":string|null,"feature":string|null}
 Rules:
-- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').
-- PRIORITIZE object_type over printed text when they disagree.
-- NEVER output 'tea bag' unless an actual bag/sachet is visible.
-- If brand not visible set brand=null. If product is unclear set product=null.
-- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
-- feature is a short visible attribute (e.g., 'heat-resistant').
-- Output JSON only.
+- brand = visible brand name (printed on pack). If none visible → null.
+- object_type = clear generic noun for the item (e.g. "dishwashing liquid", "shampoo bottle").
+- product = printed model/line (e.g. "Head & Shoulders Classic Clean").
+- variant/flavor_scent = subtype such as "lemon", "rose", "extra strength".
+- size_value = number only, size_unit ∈ {ml,L,g,kg,pcs,tabs,caps}.
+- count = multipack quantity (e.g. 3 for "3x500ml").
+- material = if clearly visible (e.g. "plastic", "glass").
+- feature = short visible property (e.g. "antibacterial", "sensitive skin").
+- Do NOT invent marketing text. Use only what is visible or obvious from the pack.
+- Always output valid compact JSON only, no comments, no explanation.
 """
 
 # ============== Sidebar NAV ==============
