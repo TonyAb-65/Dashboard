@@ -3,8 +3,9 @@
 # + Manual tool: Rewrite Arabic -> clean Arabic -> English
 # + Glossary-aware EN→AR
 # + Guards to prevent blank pages in Sheet/Grouping
+# + Persistent memory by SKU across re-uploads (JSON on disk)
 
-import io, re, time, math, hashlib, json, sys, traceback, base64
+import io, re, time, math, hashlib, json, sys, traceback, base64, os
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -63,11 +64,76 @@ try:
 except Exception:
     openai_client=None; openai_active=False
 
-# -------- Persistent cache across reruns --------
+# -------- Persistent cache across reruns + disk --------
+CACHE_PATH = "/mount/data/pmemory.json"
+
+def _load_disk_cache() -> dict:
+    try:
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+                if isinstance(obj, dict):
+                    return obj
+    except Exception:
+        pass
+    return {}
+
+def _save_disk_cache(obj: dict):
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+    except Exception:
+        pass
+
 @st.cache_resource
 def global_cache() -> dict:
-    # {file_hash: {sku: {"en": "...", "ar": "..."}}}
-    return {}
+    """
+    Structure:
+    {
+      "file_store": { file_hash: { sku: {"en": "...","ar":"..."} } },
+      "sku_store":  { sku: {"en":"...", "ar":"...", "ts": 1690000000} }
+    }
+    """
+    data = _load_disk_cache()
+    data.setdefault("file_store", {})
+    data.setdefault("sku_store", {})
+    return data
+
+def remember_titles(sku: str, en: Optional[str] = None, ar: Optional[str] = None, file_hash: Optional[str] = None):
+    sku = str(sku or "").strip()
+    if not sku:
+        return
+    cache = global_cache()
+    # by-file store
+    if file_hash:
+        fstore = cache["file_store"].setdefault(file_hash, {})
+        ent = fstore.setdefault(sku, {})
+        if en: ent["en"] = en
+        if ar: ent["ar"] = ar
+    # global by-sku store
+    sent = cache["sku_store"].setdefault(sku, {})
+    if en: sent["en"] = en
+    if ar: sent["ar"] = ar
+    sent["ts"] = int(time.time())
+    _save_disk_cache(cache)
+
+def recall_titles(sku: str, file_hash: Optional[str] = None) -> Dict[str, str]:
+    sku = str(sku or "").strip()
+    cache = global_cache()
+    best = {}
+    # prefer file_store first
+    if file_hash:
+        ent = cache["file_store"].get(file_hash, {}).get(sku, {})
+        if isinstance(ent, dict):
+            best.update({k:v for k,v in ent.items() if v})
+    # fallback to global sku_store
+    g = cache["sku_store"].get(sku, {})
+    if isinstance(g, dict):
+        for k in ("en","ar"):
+            if k not in best and g.get(k):
+                best[k] = g[k]
+    return best
 
 # ============== FILE IO ==============
 def read_any_table(uploaded_file):
@@ -494,6 +560,7 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
             if ar_new or en_new:
                 if ar_new: work.at[i,"name_ar"]=ar_new
                 if en_new: work.at[i,"name"]=en_new
+                remember_titles(sku, en_new if en_new else None, ar_new if ar_new else None, st.session_state.file_hash)
                 updated+=1
             else:
                 failed+=1
@@ -555,13 +622,21 @@ if st.session_state.file_hash != current_hash:
 work = st.session_state.get("work", pd.DataFrame())
 lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
-# Prefill from persistent cache if this file was seen before
+# Prefill from persistent caches
 _g = global_cache()
-file_store = _g.get(current_hash, {})
-if file_store is not None and isinstance(work, pd.DataFrame) and not work.empty:
+file_store = _g["file_store"].get(current_hash, {})
+sku_store  = _g["sku_store"]
+
+if isinstance(work, pd.DataFrame) and not work.empty:
     for i, row in work.iterrows():
         sku = str(row.get("merchant_sku",""))
-        entry = file_store.get(sku) if sku else None
+        if not sku:
+            continue
+        # prefer per-file store
+        entry = file_store.get(sku, {})
+        # fallback to global store by SKU
+        if not entry:
+            entry = sku_store.get(sku, {})
         if entry:
             if entry.get("en"): work.at[i, "name"] = entry["en"]
             if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
@@ -699,7 +774,7 @@ def sec_titles():
             for j, (i, row) in enumerate(view.iterrows()):
                 url = clean_url_for_vision(str(row.get("thumbnail", "")))
                 with cols[j % 6]:
-                    if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
+                    if is_valid_url(url): st.image(url, caption=f"Row {i}", width="stretch")
                     else: st.caption("Bad URL")
         else:
             st.info("No thumbnails found in current scope.")
@@ -713,7 +788,7 @@ def sec_titles():
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
-        store = global_cache().setdefault(st.session_state.file_hash, {})
+        fstore = global_cache()["file_store"].setdefault(st.session_state.file_hash, {})
 
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
@@ -723,8 +798,12 @@ def sec_titles():
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
                 norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
 
-                if not force_over and store.get(sku, {}).get("en"):
-                    work.at[i,"name"] = store[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=store[sku]["en"]; skipped+=1; continue
+                # recall memory
+                mem = recall_titles(sku, st.session_state.file_hash)
+                if not force_over and mem.get("en"):
+                    work.at[i,"name"] = mem["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=mem["en"]; skipped+=1; continue
+                if not force_over and fstore.get(sku, {}).get("en"):
+                    work.at[i,"name"] = fstore[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=fstore[sku]["en"]; skipped+=1; continue
                 if not force_over and cache_local.get("name"):
                     work.at[i,"name"] = cache_local["name"]; skipped+=1; continue
                 if only_empty and cur_en and not force_over:
@@ -736,8 +815,9 @@ def sec_titles():
                 if title:
                     work.at[i,"name"] = title
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = title
-                    store.setdefault(sku, {})["en"] = title
-                    _trim_store(store)
+                    fstore.setdefault(sku, {})["en"] = title
+                    remember_titles(sku, en=title, file_hash=st.session_state.file_hash)
+                    _trim_store(fstore)
                     updated += 1
                 else:
                     st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"vision_empty_or_invalid","url":norm_url})
@@ -746,18 +826,23 @@ def sec_titles():
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
         if engine not in ("DeepL","OpenAI"): return 0,0
-        store = global_cache().setdefault(st.session_state.file_hash, {})
+        fstore = global_cache()["file_store"].setdefault(st.session_state.file_hash, {})
         ids=[]; texts=[]
         for i in idx:
             sku=str(work.at[i,"merchant_sku"])
             cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
+
+            # recall memory
+            mem = recall_titles(sku, st.session_state.file_hash)
+
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
-            if not force_over and store.get(sku, {}).get("ar"):
-                work.at[i,"name_ar"]=store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=store[sku]["ar"]; continue
+            if not force_over and (mem.get("ar") or fstore.get(sku, {}).get("ar")):
+                arv = mem.get("ar") or fstore[sku]["ar"]
+                work.at[i,"name_ar"]=arv; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=arv; continue
             if not force_over and cache_local.get("name_ar"):
                 work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
@@ -775,7 +860,8 @@ def sec_titles():
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
                     st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
-                    store.setdefault(sku, {})["ar"] = ar
+                    fstore.setdefault(sku, {})["ar"] = ar
+                    remember_titles(sku, ar=ar, file_hash=st.session_state.file_hash)
                     updated += 1
                 else:
                     failed += 1
@@ -975,8 +1061,10 @@ def sec_settings():
     with c2:
         if st.button("Clear per-file cache & audit"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
-            store = global_cache()
-            if st.session_state.file_hash in store: del store[st.session_state.file_hash]
+            cache = global_cache()
+            # remove only this file's store
+            cache["file_store"].pop(st.session_state.file_hash, None)
+            _save_disk_cache(cache)
             st.success("Cleared.")
 
 # ============== Router (ID-based, robust) ==============
