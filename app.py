@@ -3,9 +3,8 @@
 # + Manual tool: Rewrite Arabic -> clean Arabic -> English
 # + Glossary-aware EN→AR
 # + Guards to prevent blank pages in Sheet/Grouping
-# + Persistent memory by SKU across re-uploads (JSON on disk)
 
-import io, re, time, math, hashlib, json, sys, traceback, base64, os
+import io, re, time, math, hashlib, json, sys, traceback, base64
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -64,76 +63,11 @@ try:
 except Exception:
     openai_client=None; openai_active=False
 
-# -------- Persistent cache across reruns + disk --------
-CACHE_PATH = "/mount/data/pmemory.json"
-
-def _load_disk_cache() -> dict:
-    try:
-        if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-                if isinstance(obj, dict):
-                    return obj
-    except Exception:
-        pass
-    return {}
-
-def _save_disk_cache(obj: dict):
-    try:
-        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
-    except Exception:
-        pass
-
+# -------- Persistent cache across reruns --------
 @st.cache_resource
 def global_cache() -> dict:
-    """
-    Structure:
-    {
-      "file_store": { file_hash: { sku: {"en": "...","ar":"..."} } },
-      "sku_store":  { sku: {"en":"...", "ar":"...", "ts": 1690000000} }
-    }
-    """
-    data = _load_disk_cache()
-    data.setdefault("file_store", {})
-    data.setdefault("sku_store", {})
-    return data
-
-def remember_titles(sku: str, en: Optional[str] = None, ar: Optional[str] = None, file_hash: Optional[str] = None):
-    sku = str(sku or "").strip()
-    if not sku:
-        return
-    cache = global_cache()
-    # by-file store
-    if file_hash:
-        fstore = cache["file_store"].setdefault(file_hash, {})
-        ent = fstore.setdefault(sku, {})
-        if en: ent["en"] = en
-        if ar: ent["ar"] = ar
-    # global by-sku store
-    sent = cache["sku_store"].setdefault(sku, {})
-    if en: sent["en"] = en
-    if ar: sent["ar"] = ar
-    sent["ts"] = int(time.time())
-    _save_disk_cache(cache)
-
-def recall_titles(sku: str, file_hash: Optional[str] = None) -> Dict[str, str]:
-    sku = str(sku or "").strip()
-    cache = global_cache()
-    best = {}
-    # prefer file_store first
-    if file_hash:
-        ent = cache["file_store"].get(file_hash, {}).get(sku, {})
-        if isinstance(ent, dict):
-            best.update({k:v for k,v in ent.items() if v})
-    # fallback to global sku_store
-    g = cache["sku_store"].get(sku, {})
-    if isinstance(g, dict):
-        for k in ("en","ar"):
-            if k not in best and g.get(k):
-                best[k] = g[k]
-    return best
+    # {file_hash: {sku: {"en": "...", "ar": "..."}}}
+    return {}
 
 # ============== FILE IO ==============
 def read_any_table(uploaded_file):
@@ -270,7 +204,6 @@ def safe_section(label, fn):
         return None
 
 # ===== Structured extraction prompt (Vision) =====
-# ===== Structured extraction prompt (Vision) =====
 STRUCT_PROMPT_JSON = """
 Look carefully at the PRODUCT PHOTO and extract the following fields in STRICT JSON:
 {"brand":string|null,"object_type":string,"product":string|null,"variant":string|null,
@@ -303,44 +236,24 @@ with st.sidebar:
 
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
-
-    NAV = [
-        ("📊 Overview", "overview"),
-        ("🔎 Filter", "filter"),
-        ("🖼️ Titles & Translate", "titles"),
-        ("🧩 Grouping", "grouping"),
-        ("📑 Sheet", "sheet"),
-        ("⬇️ Downloads", "downloads"),
-        ("⚙️ Settings", "settings"),
-    ]
-    st.session_state.setdefault("last_sheet_df", None)
-
     section = st.radio(
         "Navigate",
-        options=[k for _, k in NAV],
-        format_func=lambda k: next(lbl for lbl, kk in NAV if kk == k),
-        index=0,
-        key="nav_choice",
+        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
+        index=0
     )
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    def _s(v): return str(v).strip() if v is not None else ""
-    def _num(v):
-        s = _s(v)
-        m = re.search(r"\d+(?:\.\d+)?", s)
-        return m.group(0) if m else ""
-
-    brand = _s(d.get("brand"))
-    object_type = _s(d.get("object_type"))
-    product = _s(d.get("product"))
-    variant = _s(d.get("variant"))
-    flavor  = _s(d.get("flavor_scent"))
-    material= _s(d.get("material"))
-    feature = _s(d.get("feature"))
-    size_v  = _num(d.get("size_value"))
-    size_u  = _s(d.get("size_unit")).lower()
-    count   = _num(d.get("count"))
+    brand = (d.get("brand") or "").strip()
+    object_type = (d.get("object_type") or "").strip()
+    product = (d.get("product") or "").strip()
+    variant = (d.get("variant") or "").strip()
+    flavor  = (d.get("flavor_scent") or "").strip()
+    material= (d.get("material") or "").strip()
+    feature = (d.get("feature") or "").strip()
+    size_v  = str(d.get("size_value") or "").strip()
+    size_u  = (d.get("size_unit") or "").strip().lower()
+    count   = str(d.get("count") or "").strip()
 
     parts=[]
     if brand: parts.append(brand)
@@ -389,26 +302,8 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
     if not openai_active or not img_url:
         return ""
 
-    # Pre-convert to data URL for hosts that block fetchers
-    host = urlsplit(img_url).netloc.lower()
-    force_data = any(host.endswith(h) for h in [
-        "bashawat.com.sa",
-    ])
-    img_for_model = _to_data_url_from_http(img_url) if force_data else img_url
-    if force_data and not img_for_model:
-        debug_log("Vision Preconvert Failed", {"sku": sku, "url": img_url})
-        return ""
-
     def _vision(payload):
-        # keep logging lightweight to avoid dumping huge data URLs
-        try:
-            msg_meta=[]
-            for m in payload["messages"]:
-                kinds = [c.get("type") for c in m.get("content", [])] if isinstance(m.get("content"), list) else ["text"]
-                msg_meta.append({"role": m.get("role"), "kinds": kinds})
-            debug_log("OpenAI Vision MsgMeta", {"sku": sku, "meta": msg_meta})
-        except Exception:
-            pass
+        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
         return _retry(lambda: openai_client.chat.completions.create(**payload))
 
     payload = {
@@ -417,7 +312,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
             {"role": "system", "content": "Extract concise, accurate product fields from the image."},
             {"role": "user", "content": [
                 {"type": "text", "text": STRUCT_PROMPT_JSON},
-                {"type": "image_url", "image_url": {"url": img_for_model}}
+                {"type": "image_url", "image_url": {"url": img_url}}
             ]}
         ],
         "temperature": 0.1,
@@ -428,17 +323,13 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         resp = _vision(payload)
         raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
-        # Retry once with data URL if not already forced
-        if not force_data:
-            data_url = _to_data_url_from_http(img_url)
-            if not data_url:
-                return ""
-            payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
-            resp = _vision(payload)
-            raw = (resp.choices[0].message.content or "").strip()
-        else:
+        data_url = _to_data_url_from_http(img_url)
+        if not data_url:
+            debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
             return ""
+        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
+        resp = _vision(payload)
+        raw = (resp.choices[0].message.content or "").strip()
 
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
@@ -470,24 +361,46 @@ def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
     except Exception:
         return list(texts)
 
-def openai_translate_batch_en2ar(texts:List[str])->List[str]:
-    if not openai_active or not texts: return list(texts)
+# ---- PATCHED: enforce exact-length outputs from OpenAI translator
+def openai_translate_batch_en2ar(texts: List[str]) -> List[str]:
+    if not openai_active or not texts:
+        return list(texts)
+
+    n = len(texts)
+    prompt = (
+        "Translate each line to Arabic.\n"
+        f"Return EXACTLY {n} lines, one output per input, same order.\n"
+        "Do not merge lines. Do not add numbering or bullets.\n"
+        "If an input line is empty, output an empty line."
+    )
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
-            {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
+            {"role": "system", "content": "Translate e-commerce product titles into natural, concise Arabic."},
+            {"role": "user", "content": prompt + "\n\n" + "\n".join(texts)}
         ],
         "temperature": 0
     }
     try:
-        debug_log("OpenAI Translate Payload", payload)
-        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
-        lines=(resp.choices[0].message.content or "").splitlines()
-        return [l.strip() for l in lines if l.strip()] or texts
+        debug_log("OpenAI Translate Payload", {"n": n})
+        resp = _retry(lambda: openai_client.chat.completions.create(**payload))
+        raw = (resp.choices[0].message.content or "")
+        lines = [re.sub(r"^\s*[\-\*\d\.\)]\s*", "", l).rstrip() for l in raw.splitlines()]
+
+        # Force length match
+        if len(lines) < n:
+            lines += [""] * (n - len(lines))
+        elif len(lines) > n:
+            lines = lines[:n]
+
+        # Fallback fill with source where empty
+        for i in range(n):
+            if not lines[i].strip():
+                lines[i] = texts[i]
+        return lines
     except Exception as e:
         debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
-        return texts
+        return list(texts)
 
 def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_glossary=False, glossary_map:Optional[Dict[str,str]]=None, context_hint:str="")->pd.Series:
     texts=titles_en.fillna("").astype(str).tolist()
@@ -505,7 +418,9 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
     if engine=="OpenAI":
         out=[]
         for s in range(0,len(texts),max(1,batch_size)):
-            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); time.sleep(0.1)
+            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size]))
+            time.sleep(0.1)
+        out = _fix_len(out, len(texts))  # <-- enforce length to match index
         return pd.Series(out, index=titles_en.index)
     return pd.Series(texts, index=titles_en.index)
 
@@ -563,7 +478,6 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
             if ar_new or en_new:
                 if ar_new: work.at[i,"name_ar"]=ar_new
                 if en_new: work.at[i,"name"]=en_new
-                remember_titles(sku, en_new if en_new else None, ar_new if ar_new else None, st.session_state.file_hash)
                 updated+=1
             else:
                 failed+=1
@@ -625,21 +539,13 @@ if st.session_state.file_hash != current_hash:
 work = st.session_state.get("work", pd.DataFrame())
 lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
-# Prefill from persistent caches
+# Prefill from persistent cache if this file was seen before
 _g = global_cache()
-file_store = _g["file_store"].get(current_hash, {})
-sku_store  = _g["sku_store"]
-
-if isinstance(work, pd.DataFrame) and not work.empty:
+file_store = _g.get(current_hash, {})
+if file_store is not None and isinstance(work, pd.DataFrame) and not work.empty:
     for i, row in work.iterrows():
         sku = str(row.get("merchant_sku",""))
-        if not sku:
-            continue
-        # prefer per-file store
-        entry = file_store.get(sku, {})
-        # fallback to global store by SKU
-        if not entry:
-            entry = sku_store.get(sku, {})
+        entry = file_store.get(sku) if sku else None
         if entry:
             if entry.get("en"): work.at[i, "name"] = entry["en"]
             if entry.get("ar"): work.at[i, "name_ar"] = entry["ar"]
@@ -791,7 +697,7 @@ def sec_titles():
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
-        fstore = global_cache()["file_store"].setdefault(st.session_state.file_hash, {})
+        store = global_cache().setdefault(st.session_state.file_hash, {})
 
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
@@ -801,12 +707,8 @@ def sec_titles():
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
                 norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
 
-                # recall memory
-                mem = recall_titles(sku, st.session_state.file_hash)
-                if not force_over and mem.get("en"):
-                    work.at[i,"name"] = mem["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=mem["en"]; skipped+=1; continue
-                if not force_over and fstore.get(sku, {}).get("en"):
-                    work.at[i,"name"] = fstore[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=fstore[sku]["en"]; skipped+=1; continue
+                if not force_over and store.get(sku, {}).get("en"):
+                    work.at[i,"name"] = store[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=store[sku]["en"]; skipped+=1; continue
                 if not force_over and cache_local.get("name"):
                     work.at[i,"name"] = cache_local["name"]; skipped+=1; continue
                 if only_empty and cur_en and not force_over:
@@ -818,9 +720,8 @@ def sec_titles():
                 if title:
                     work.at[i,"name"] = title
                     st.session_state.proc_cache.setdefault(sku,{})["name"] = title
-                    fstore.setdefault(sku, {})["en"] = title
-                    remember_titles(sku, en=title, file_hash=st.session_state.file_hash)
-                    _trim_store(fstore)
+                    store.setdefault(sku, {})["en"] = title
+                    _trim_store(store)
                     updated += 1
                 else:
                     st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"vision_empty_or_invalid","url":norm_url})
@@ -829,23 +730,18 @@ def sec_titles():
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
         if engine not in ("DeepL","OpenAI"): return 0,0
-        fstore = global_cache()["file_store"].setdefault(st.session_state.file_hash, {})
+        store = global_cache().setdefault(st.session_state.file_hash, {})
         ids=[]; texts=[]
         for i in idx:
             sku=str(work.at[i,"merchant_sku"])
             cache_local = st.session_state.proc_cache.get(sku,{})
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
-
-            # recall memory
-            mem = recall_titles(sku, st.session_state.file_hash)
-
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
-            if not force_over and (mem.get("ar") or fstore.get(sku, {}).get("ar")):
-                arv = mem.get("ar") or fstore[sku]["ar"]
-                work.at[i,"name_ar"]=arv; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=arv; continue
+            if not force_over and store.get(sku, {}).get("ar"):
+                work.at[i,"name_ar"]=store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=store[sku]["ar"]; continue
             if not force_over and cache_local.get("name_ar"):
                 work.at[i,"name_ar"]=cache_local["name_ar"]; continue
             if force_over or not cur_ar:
@@ -863,8 +759,7 @@ def sec_titles():
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
                     st.session_state.proc_cache.setdefault(sku,{})["name_ar"] = ar
-                    fstore.setdefault(sku, {})["ar"] = ar
-                    remember_titles(sku, ar=ar, file_hash=st.session_state.file_hash)
+                    store.setdefault(sku, {})["ar"] = ar
                     updated += 1
                 else:
                     failed += 1
@@ -1064,37 +959,26 @@ def sec_settings():
     with c2:
         if st.button("Clear per-file cache & audit"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
-            cache = global_cache()
-            # remove only this file's store
-            cache["file_store"].pop(st.session_state.file_hash, None)
-            _save_disk_cache(cache)
+            store = global_cache()
+            if st.session_state.file_hash in store: del store[st.session_state.file_hash]
             st.success("Cleared.")
 
-# ============== Router (ID-based, robust) ==============
-if section == "overview":
+# ============== Router ==============
+if section=="📊 Overview":
     safe_section("Overview", sec_overview)
-
-elif section == "filter":
+elif section=="🔎 Filter":
     safe_section("Filter", sec_filter)
-
-elif section == "titles":
+elif section=="🖼️ Titles & Translate":
     safe_section("Titles & Translate", sec_titles)
-
-elif section == "grouping":
+elif section=="🧩 Grouping":
     safe_section("Grouping", sec_grouping)
-
-elif section == "sheet":
-    tmp = safe_section("Sheet", sec_sheet)
-    if isinstance(tmp, pd.DataFrame):
-        st.session_state["last_sheet_df"] = tmp
-    elif st.session_state.get("last_sheet_df") is None:
-        st.session_state["last_sheet_df"] = work.copy()
-
-elif section == "downloads":
-    page_df = st.session_state.get("last_sheet_df")
-    if not isinstance(page_df, pd.DataFrame):
+elif section=="📑 Sheet":
+    page_df = safe_section("Sheet", sec_sheet)
+    if page_df is None or isinstance(page_df, pd.DataFrame) and page_df.empty:
         page_df = work.copy()
+elif section=="⬇️ Downloads":
+    try: page_df
+    except NameError: page_df=work.copy()
     safe_section("Downloads", lambda: sec_downloads(page_df))
-
 else:
     safe_section("Settings", sec_settings)
