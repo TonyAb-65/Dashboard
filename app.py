@@ -3,8 +3,10 @@
 # + Manual tool: Rewrite Arabic -> clean Arabic -> English
 # + Glossary-aware EN→AR
 # + Guards to prevent blank pages in Sheet/Grouping
+# + Stable navigation across reruns (persisted section)
+# + OpenAI translation returns exact N lines
 
-import io, re, time, math, hashlib, json, sys, traceback, base64
+import io, re, time, math, hashlib, json, sys, traceback, base64, os
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -222,6 +224,26 @@ Rules:
 - Always output valid compact JSON only, no comments, no explanation.
 """
 
+# ============== NAV STATE (stable across reruns) ==============
+SECTIONS = [
+    ("overview","📊 Overview"),
+    ("filter","🔎 Filter"),
+    ("titles","🖼️ Titles & Translate"),
+    ("grouping","🧩 Grouping"),
+    ("sheet","📑 Sheet"),
+    ("downloads","⬇️ Downloads"),
+    ("settings","⚙️ Settings"),
+]
+SECTION_KEYS = [k for k,_ in SECTIONS]
+SECTION_LABELS = [l for _,l in SECTIONS]
+LABEL_TO_KEY = {l:k for k,l in SECTIONS}
+
+st.session_state.setdefault("section", "overview")
+
+def _on_nav_change():
+    sel_label = st.session_state.get("nav_radio", SECTION_LABELS[0])
+    st.session_state["section"] = LABEL_TO_KEY.get(sel_label, "overview")
+
 # ============== Sidebar NAV ==============
 with st.sidebar:
     st.markdown("### 🔑 API Keys")
@@ -236,24 +258,32 @@ with st.sidebar:
 
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
-    section = st.radio(
+
+    # persistent radio
+    current_key = st.session_state.get("section", "overview")
+    current_idx = SECTION_KEYS.index(current_key) if current_key in SECTION_KEYS else 0
+    st.radio(
         "Navigate",
-        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
-        index=0
+        options=SECTION_LABELS,
+        index=current_idx,
+        key="nav_radio",
+        on_change=_on_nav_change
     )
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    brand = (d.get("brand") or "").strip()
-    object_type = (d.get("object_type") or "").strip()
-    product = (d.get("product") or "").strip()
-    variant = (d.get("variant") or "").strip()
-    flavor  = (d.get("flavor_scent") or "").strip()
-    material= (d.get("material") or "").strip()
-    feature = (d.get("feature") or "").strip()
-    size_v  = str(d.get("size_value") or "").strip()
-    size_u  = (d.get("size_unit") or "").strip().lower()
-    count   = str(d.get("count") or "").strip()
+    # tolerant casting (avoids .strip on ints)
+    def _s(v): return str(v).strip() if v is not None else ""
+    brand = _s(d.get("brand"))
+    object_type = _s(d.get("object_type"))
+    product = _s(d.get("product"))
+    variant = _s(d.get("variant"))
+    flavor  = _s(d.get("flavor_scent"))
+    material= _s(d.get("material"))
+    feature = _s(d.get("feature"))
+    size_v  = _s(d.get("size_value"))
+    size_u  = _s(d.get("size_unit")).lower()
+    count   = _s(d.get("count"))
 
     parts=[]
     if brand: parts.append(brand)
@@ -420,7 +450,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
         for s in range(0,len(texts),max(1,batch_size)):
             out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size]))
             time.sleep(0.1)
-        out = _fix_len(out, len(texts))  # <-- enforce length to match index
+        out = _fix_len(out, len(texts))  # enforce length to match index
         return pd.Series(out, index=titles_en.index)
     return pd.Series(texts, index=titles_en.index)
 
@@ -768,6 +798,7 @@ def sec_titles():
 
     # === FULL AUTOMATIC BATCHED PIPELINE (image→EN, then EN→AR) ===
     if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
+        st.session_state["section"] = "titles"  # keep current tab after rerun
         idx_all = base_df.index.tolist()
         if not idx_all:
             st.info("No rows in scope.")
@@ -798,6 +829,7 @@ def sec_titles():
     cA,cB,cC=st.columns(3)
     with cA:
         if st.button("Run ONLY missing EN"):
+            st.session_state["section"] = "titles"
             ids=base_df[~is_nonempty_series(base_df["name"].fillna(""))].index.tolist()
             if ids:
                 u,k,f = run_titles(ids, fetch_batch, max_len, only_empty, force_over)
@@ -806,6 +838,7 @@ def sec_titles():
                 st.info("No missing EN.")
     with cB:
         if st.button("Run ONLY missing AR"):
+            st.session_state["section"] = "titles"
             ids=base_df[~is_nonempty_series(base_df["name_ar"].fillna(""))].index.tolist()
             if ids:
                 u2,f2 = run_trans(ids, trans_batch, engine, force_over)
@@ -814,6 +847,7 @@ def sec_titles():
                 st.info("No missing AR.")
     with cC:
         if st.button("Rewrite Arabic → Clean AR + English (manual)"):
+            st.session_state["section"] = "titles"
             ids = base_df[is_nonempty_series(base_df["name_ar"].fillna(""))].index.tolist()
             if not ids:
                 st.info("No Arabic titles to rewrite.")
@@ -843,6 +877,7 @@ def sec_grouping():
         st.markdown("**Keyword Library**")
         new_kws=st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndishwashing\nlemon")
         if st.button("➕ Add"):
+            st.session_state["section"] = "grouping"
             fresh=[k.strip() for k in new_kws.splitlines() if k.strip()]
             if fresh:
                 exist=set(st.session_state.keyword_library)
@@ -852,6 +887,7 @@ def sec_grouping():
             else: st.info("Nothing to add.")
         rm=st.multiselect("Remove", options=st.session_state.keyword_library)
         if st.button("🗑️ Remove selected"):
+            st.session_state["section"] = "grouping"
             s=set(rm); st.session_state.keyword_library=[k for k in st.session_state.keyword_library if k not in s]
             st.success(f"Removed {len(s)}")
     with right:
@@ -893,6 +929,7 @@ def sec_grouping():
             g_sub =c2.selectbox("Sub", [""]+lookups["main_to_subnames"].get(g_main,[]))
             g_ssub=c3.selectbox("Sub-Sub", [""]+lookups["pair_to_subsubnames"].get((g_main,g_sub),[]))
             if st.button("Apply mapping"):
+                st.session_state["section"] = "grouping"
                 if not chosen: st.info("No SKUs.")
                 elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
                 else:
@@ -937,12 +974,17 @@ def sec_sheet():
         except Exception:
             st.dataframe(page, width="stretch", height=440)
     else: st.info("No rows.")
+    # store last page for downloads
+    st.session_state["last_sheet_df"] = page.copy()
     return page
 
-def sec_downloads(page_df):
+def sec_downloads():
     st.subheader("Downloads")
+    view_df = st.session_state.get("last_sheet_df")
+    if view_df is None or not isinstance(view_df, pd.DataFrame) or view_df.empty:
+        view_df = work.copy()
     st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
-    st.download_button("⬇️ Current view Excel", to_excel_download(page_df), file_name="products_view.xlsx")
+    st.download_button("⬇️ Current view Excel", to_excel_download(view_df), file_name="products_view.xlsx")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
@@ -953,32 +995,33 @@ def sec_settings():
     c1,c2=st.columns(2)
     with c1:
         if st.button("Show 10 sanitized thumbnail URLs"):
+            st.session_state["section"] = "settings"
             sample=work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
             for u in sample:
                 norm=clean_url_for_vision(u); st.write({"raw":u,"sanitized":norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
+            st.session_state["section"] = "settings"
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
             store = global_cache()
             if st.session_state.file_hash in store: del store[st.session_state.file_hash]
             st.success("Cleared.")
 
 # ============== Router ==============
-if section=="📊 Overview":
+section_key = st.session_state.get("section","overview")
+if section_key=="overview":
     safe_section("Overview", sec_overview)
-elif section=="🔎 Filter":
+elif section_key=="filter":
     safe_section("Filter", sec_filter)
-elif section=="🖼️ Titles & Translate":
+elif section_key=="titles":
     safe_section("Titles & Translate", sec_titles)
-elif section=="🧩 Grouping":
+elif section_key=="grouping":
     safe_section("Grouping", sec_grouping)
-elif section=="📑 Sheet":
+elif section_key=="sheet":
     page_df = safe_section("Sheet", sec_sheet)
-    if page_df is None or isinstance(page_df, pd.DataFrame) and page_df.empty:
+    if page_df is None or (isinstance(page_df, pd.DataFrame) and page_df.empty):
         page_df = work.copy()
-elif section=="⬇️ Downloads":
-    try: page_df
-    except NameError: page_df=work.copy()
-    safe_section("Downloads", lambda: sec_downloads(page_df))
+elif section_key=="downloads":
+    safe_section("Downloads", sec_downloads)
 else:
     safe_section("Settings", sec_settings)
