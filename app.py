@@ -207,21 +207,19 @@ def safe_section(label, fn):
 
 # ===== Structured extraction prompt (Vision) =====
 STRUCT_PROMPT_JSON = """
-Look carefully at the PRODUCT PHOTO and extract the following fields in STRICT JSON:
-{"brand":string|null,"object_type":string,"product":string|null,"variant":string|null,
-"flavor_scent":string|null,"material":string|null,"size_value":string|null,"size_unit":string|null,
-"count":string|null,"feature":string|null}
+Look at the PHOTO and extract fields for an e-commerce title.
+Return EXACTLY ONE LINE of STRICT JSON with keys:
+{"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
+"flavor_scent":string|null,"material":string|null,"size_value":string|null,
+"size_unit":string|null,"count":string|null,"feature":string|null}
 Rules:
-- brand = visible brand name (printed on pack). If none visible → null.
-- object_type = clear generic noun for the item (e.g. "dishwashing liquid", "shampoo bottle").
-- product = printed model/line (e.g. "Head & Shoulders Classic Clean").
-- variant/flavor_scent = subtype such as "lemon", "rose", "extra strength".
-- size_value = number only, size_unit ∈ {ml,L,g,kg,pcs,tabs,caps}.
-- count = multipack quantity (e.g. 3 for "3x500ml").
-- material = if clearly visible (e.g. "plastic", "glass").
-- feature = short visible property (e.g. "antibacterial", "sensitive skin").
-- Do NOT invent marketing text. Use only what is visible or obvious from the pack.
-- Always output valid compact JSON only, no comments, no explanation.
+- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').
+- PRIORITIZE object_type over printed text when they disagree.
+- NEVER output 'tea bag' unless an actual bag/sachet is visible.
+- If brand not visible set brand=null. If product is unclear set product=null.
+- size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
+- feature is a short visible attribute (e.g., 'heat-resistant').
+- Output JSON only.
 """
 
 # ============== NAV STATE (stable across reruns) ==============
@@ -259,7 +257,6 @@ with st.sidebar:
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
 
-    # persistent radio
     current_key = st.session_state.get("section", "overview")
     current_idx = SECTION_KEYS.index(current_key) if current_key in SECTION_KEYS else 0
     st.radio(
@@ -272,7 +269,7 @@ with st.sidebar:
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    # tolerant casting (avoids .strip on ints)
+    # tolerant casting to avoid .strip on non-strings
     def _s(v): return str(v).strip() if v is not None else ""
     brand = _s(d.get("brand"))
     object_type = _s(d.get("object_type"))
@@ -370,8 +367,8 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
     except Exception:
         return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
 
-    obj = (data.get("object_type") or "").strip().lower()
-    prod = (data.get("product") or "").strip().lower()
+    obj = (str((data.get("object_type") or "")).strip().lower())
+    prod = (str((data.get("product") or "")).strip().lower())
     if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
         return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
 
@@ -391,46 +388,24 @@ def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
     except Exception:
         return list(texts)
 
-# ---- PATCHED: enforce exact-length outputs from OpenAI translator
-def openai_translate_batch_en2ar(texts: List[str]) -> List[str]:
-    if not openai_active or not texts:
-        return list(texts)
-
-    n = len(texts)
-    prompt = (
-        "Translate each line to Arabic.\n"
-        f"Return EXACTLY {n} lines, one output per input, same order.\n"
-        "Do not merge lines. Do not add numbering or bullets.\n"
-        "If an input line is empty, output an empty line."
-    )
+def openai_translate_batch_en2ar(texts:List[str])->List[str]:
+    if not openai_active or not texts: return list(texts)
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": "Translate e-commerce product titles into natural, concise Arabic."},
-            {"role": "user", "content": prompt + "\n\n" + "\n".join(texts)}
+            {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
+            {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
         ],
         "temperature": 0
     }
     try:
-        debug_log("OpenAI Translate Payload", {"n": n})
-        resp = _retry(lambda: openai_client.chat.completions.create(**payload))
-        raw = (resp.choices[0].message.content or "")
-        lines = [re.sub(r"^\s*[\-\*\d\.\)]\s*", "", l).rstrip() for l in raw.splitlines()]
-
-        # Force length match
-        if len(lines) < n:
-            lines += [""] * (n - len(lines))
-        elif len(lines) > n:
-            lines = lines[:n]
-
-        # Fallback fill with source where empty
-        for i in range(n):
-            if not lines[i].strip():
-                lines[i] = texts[i]
-        return lines
+        debug_log("OpenAI Translate Payload", payload)
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+        lines=(resp.choices[0].message.content or "").splitlines()
+        return [l.strip() for l in lines if l.strip()] or texts
     except Exception as e:
         debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
-        return list(texts)
+        return texts
 
 def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_glossary=False, glossary_map:Optional[Dict[str,str]]=None, context_hint:str="")->pd.Series:
     texts=titles_en.fillna("").astype(str).tolist()
@@ -444,12 +419,13 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
             mapped.append(t2)
         texts=mapped
     if engine=="DeepL" and deepl_active:
-        return pd.Series(deepl_batch_en2ar(texts, context_hint), index=titles_en.index)
+        outs = deepl_batch_en2ar(texts, context_hint)
+        outs = _fix_len(outs, len(texts))
+        return pd.Series(outs, index=titles_en.index)
     if engine=="OpenAI":
         out=[]
         for s in range(0,len(texts),max(1,batch_size)):
-            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size]))
-            time.sleep(0.1)
+            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); time.sleep(0.1)
         out = _fix_len(out, len(texts))  # enforce length to match index
         return pd.Series(out, index=titles_en.index)
     return pd.Series(texts, index=titles_en.index)
@@ -458,7 +434,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
 AR_REWRITE_PROMPT = """
 أنت محرر عناوين تجارة إلكترونية ثنائي اللغة.
 أعد كتابة العنوان العربي بصيغة متجر احترافية مختصرة بالترتيب:
-العلامة التجارية، نوع المنتج، المتغيّر/الرائحة/الطعم، المادة، الحجم/العدد.
+العلامة التجارية، نوع المنتج، المتغيّر/الرائحة/الطعم، المناسبة/المادة، الحجم/العدد.
 ثم ترجم الناتج إلى الإنجليزية بصيغة تجارة إلكترونية مكافئة.
 أعد السطر بصيغة JSON على سطر واحد فقط بهذه المفاتيح:
 {"arabic": string, "english": string}
@@ -558,9 +534,10 @@ st.session_state.setdefault("keyword_library", [])
 st.session_state.setdefault("page_size", 200)
 st.session_state.setdefault("page_num", 1)
 st.session_state.setdefault("search_q","")
+st.session_state.setdefault("last_sheet_df", None)
 
-current_hash = hash_uploaded_file(product_file)
-if st.session_state.file_hash != current_hash:
+current_hash = hash_uploaded_file(product_file) if product_file else None
+if st.session_state.file_hash != current_hash and prod_df is not None:
     st.session_state.work = prod_df.copy()
     st.session_state.proc_cache = {}
     st.session_state.audit_rows = []
@@ -571,7 +548,7 @@ lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_n
 
 # Prefill from persistent cache if this file was seen before
 _g = global_cache()
-file_store = _g.get(current_hash, {})
+file_store = _g.get(current_hash, {}) if current_hash else {}
 if file_store is not None and isinstance(work, pd.DataFrame) and not work.empty:
     for i, row in work.iterrows():
         sku = str(row.get("merchant_sku",""))
@@ -706,6 +683,7 @@ def sec_titles():
 
     # Preview 24 images (browser fetch)
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
+        st.session_state["section"] = "titles"
         gallery = st.container()
         view = base_df.head(24)
         if "thumbnail" in view.columns and len(view) > 0:
@@ -783,8 +761,11 @@ def sec_titles():
         for s in range(0, len(texts), trans_batch):
             chunk = texts[s:s+trans_batch]
             outs = translate_en_titles(pd.Series(chunk), engine, trans_batch, use_glossary=USE_GLOSSARY, glossary_map=glossary_map, context_hint=CONTEXT_HINT).tolist()
-            for j, _ in enumerate(chunk):
-                i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
+            # align outs to chunk size defensively
+            outs = _fix_len(outs, len(chunk))
+            for j in range(len(chunk)):
+                i = ids[s+j]
+                ar = outs[j]
                 if ar:
                     work.at[i,"name_ar"] = ar
                     sku = str(work.at[i,"merchant_sku"])
