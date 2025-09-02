@@ -954,10 +954,13 @@ elif section=="🖼️ Titles & Translate":
 elif section=="🧩 Grouping":
     safe_section("Grouping", sec_grouping)
 elif section=="📑 Sheet":
-    page_df = safe_section("Sheet", sec_sheet) or work.copy()
+    _tmp = safe_section("Sheet", sec_sheet)
+    page_df = _tmp if _tmp is not None else work.copy()
 elif section=="⬇️ Downloads":
-    try: page_df
-    except NameError: page_df=work.copy()
+    try:
+        page_df
+    except NameError:
+        page_df = work.copy()
     safe_section("Downloads", lambda: sec_downloads(page_df))
 else:
     safe_section("Settings", sec_settings)
