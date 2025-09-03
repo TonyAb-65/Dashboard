@@ -1,9 +1,3 @@
-# Product Mapping Dashboard — Master (full)
-# URL-only Vision + strict URL sanitization + DEBUG payload logging
-# + Manual tool: Rewrite Arabic -> clean Arabic -> English
-# + Glossary-aware EN→AR
-# + Guards to prevent blank pages in Sheet/Grouping
-
 import io, re, time, math, hashlib, json, sys, traceback, base64
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
@@ -209,14 +203,16 @@ Look at the PHOTO and extract fields for an e-commerce title.
 Return EXACTLY ONE LINE of STRICT JSON with keys:
 {"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
 "flavor_scent":string|null,"material":string|null,"size_value":string|null,
-"size_unit":string|null,"count":string|null,"feature":string|null}
+"size_unit":string|null,"count":string|null,"feature":string|null,"color":string|null,"descriptor":string|null}
 Rules:
-- object_type = visible item category (e.g., 'glass teapot', 'shampoo bottle').
-- PRIORITIZE object_type over printed text when they disagree.
-- NEVER output 'tea bag' unless an actual bag/sachet is visible.
-- If brand not visible set brand=null. If product is unclear set product=null.
+- object_type = visible item category in plain nouns (e.g., "deodorant", "chocolate bar", "soap holder").
+- PRIORITIZE what you SEE over printed text when they disagree. Ignore marketing taglines.
+- brand MUST be null if no brand is clearly visible on the pack/item.
 - size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
-- feature is a short visible attribute (e.g., 'heat-resistant').
+- Use flavor_scent for scents/flavors only (e.g., "Active", "Caramel").
+- material is short (e.g., "ceramic", "glass", "stainless steel").
+- color is a basic color if clearly visible (e.g., "green", "black"), else null.
+- descriptor is a short generic noun phrase when brand or size is missing (e.g., "oil dispenser", "soap holder").
 - Output JSON only.
 """
 
@@ -241,6 +237,16 @@ with st.sidebar:
     )
 
 # ============== Title helpers (Vision) ==============
+def _title_case_keep_units(s: str) -> str:
+    if not s: return s
+    words = s.split()
+    keep_lower = {"ml","l","g","kg","pcs","tabs","caps","&","of"}
+    out=[]
+    for w in words:
+        wl = w.lower()
+        out.append(w if wl in keep_lower else w[:1].upper()+w[1:])
+    return " ".join(out)
+
 def assemble_title_from_fields(d: dict) -> str:
     def _s(v):
         return str(v).strip() if v is not None else ""
@@ -256,29 +262,48 @@ def assemble_title_from_fields(d: dict) -> str:
     flavor  = _s(d.get("flavor_scent"))
     material= _s(d.get("material"))
     feature = _s(d.get("feature"))
+    color   = _s(d.get("color"))
+    descr   = _s(d.get("descriptor"))
     size_v  = _num(d.get("size_value"))
     size_u  = _s(d.get("size_unit")).lower()
     count   = _num(d.get("count"))
 
-    parts=[]
-    if brand: parts.append(brand)
-    noun = object_type or product
-    if noun: parts.append(noun)
-    qual = variant or flavor or material or feature
-    if qual: parts.append(qual)
-
+    # Normalize units
     unit=size_u
     if unit in ["milliliter","mls","ml."]: unit="ml"
     if unit in ["liter","litre","ltrs","ltr"]: unit="L"
     if unit in ["grams","gram","gr"]: unit="g"
     if unit in ["kilogram","kilo","kgs"]: unit="kg"
 
+    # Choose primary noun
+    noun = object_type or product or descr
+
+    # Qualifiers preference
+    qual = variant or flavor or material or feature
+
+    parts=[]
+    if brand: parts.append(brand)
+    if noun:
+        # color/material leading for unbranded household items
+        if not brand and (color or material) and noun not in {"deodorant","shampoo","chocolate","chocolate bar","soap","detergent"}:
+            cm = " ".join([x for x in [color, material] if x])
+            parts.append(f"{cm} {noun}".strip())
+        else:
+            parts.append(noun)
+    if qual and (not brand or qual.lower() not in brand.lower()):
+        parts.append(qual)
+
     size_str=""
     if size_v and unit: size_str=f"{size_v}{unit}"
     if count and not size_str: size_str=f"{count}pcs"
     elif count and size_str: size_str=f"{size_str} {count}pcs"
     if size_str: parts.append(size_str)
-    return tidy_title(" ".join(p for p in parts if p), 70)
+
+    title = " ".join(p for p in parts if p)
+    if not title.strip():
+        title = " ".join([x for x in [color, material, descr or noun] if x])
+
+    return tidy_title(_title_case_keep_units(title), 70)
 
 def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     if not openai_active or not img_url: return ""
@@ -287,11 +312,20 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
         "messages": [
             {"role":"system","content":"You are a precise e-commerce title writer."},
             {"role":"user","content":[
-                {"type":"text","text":"Write ONE clean English e-commerce title ≤70 chars. Order: Brand, Object/Product, Variant/Flavor/Scent, Material, Size/Count. No marketing words."},
+                {"type":"text","text":(
+                    "Write ONE clean English product title ≤70 chars.\n"
+                    "Order: Brand, Product type, Variant/Flavor/Scent, Material, Size/Count.\n"
+                    "If brand or size are NOT visible, write a sensible descriptive item name using color/material if clear.\n"
+                    "No marketing words. Examples:\n"
+                    "- Axe Deodorant Active 150 ml\n"
+                    "- Cadbury Milk Chocolate Caramel 90 g\n"
+                    "- Green Ceramic Soap Holder\n"
+                    "- Olive Oil Dispenser\n"
+                )},
                 {"type":"image_url","image_url":{"url":img_url}}
             ]}
         ],
-        "temperature": 0,
+        "temperature": 0.1,
         "max_tokens": 64
     }
     try:
