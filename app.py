@@ -1,12 +1,3 @@
-# Product Mapping Dashboard — Master (stable)
-# Fixes:
-# - Persist uploads across reruns (no blank Sheet/Downloads after processing)
-# - Router ambiguity fix when Sheet returns DataFrame
-# - Replace deprecated Styler.applymap with safe .apply variant
-# - Coerce mapping columns to string to avoid dtype warnings
-# - Vision title generation: gpt-4o, two-pass extractor, normalized titles
-# Everything else preserved.
-
 import io, re, time, math, hashlib, json, sys, traceback, base64
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
@@ -293,7 +284,6 @@ def assemble_title_from_fields(d: dict) -> str:
     parts=[]
     if brand: parts.append(brand)
     if noun:
-        # color/material leading for unbranded household items
         if not brand and (color or material) and noun not in {"deodorant","shampoo","chocolate","chocolate bar","soap","detergent"}:
             cm = " ".join([x for x in [color, material] if x])
             parts.append(f"{cm} {noun}".strip())
@@ -314,22 +304,10 @@ def assemble_title_from_fields(d: dict) -> str:
 
     return tidy_title(_title_case_keep_units(title), 70)
 
-def normalize_title_en(t: str) -> str:
-    if not t: return t
-    s = t.strip()
-    s = re.sub(r'(?i)\b(\d+)\s*(ml|l|g|kg)\b', lambda m: f"{m.group(1)} {m.group(2).lower()}", s)
-    s = re.sub(r'(?i)\bpcs\b', 'pcs', s)
-    fixes = {"caremal":"Caramel","caramel":"Caramel","deoderant":"Deodorant","chocalate":"Chocolate"}
-    for k,v in fixes.items():
-        s = re.sub(rf'(?i)\b{re.escape(k)}\b', v, s)
-    s = _title_case_keep_units(s)
-    s = re.sub(r'\s{2,}', ' ', s).strip()
-    return s
-
 def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     if not openai_active or not img_url: return ""
     payload = {
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",
         "messages": [
             {"role":"system","content":"You are a precise e-commerce title writer."},
             {"role":"user","content":[
@@ -351,92 +329,64 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
     }
     try:
         debug_log("OpenAI Fallback Payload", payload)
-        resp=_retry(lambda: openai_client.chat_completions.create(**payload)) if hasattr(openai_client,'chat_completions') else _retry(lambda: openai_client.chat.completions.create(**payload))
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         txt=(resp.choices[0].message.content or "").strip()
         return tidy_title(txt,max_chars) if txt else ""
     except Exception as e:
         debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
         return ""
 
-def vision_extract_fields(img_url: str, sku: Optional[str]=None) -> Optional[dict]:
+def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
     if not openai_active or not img_url:
-        return None
+        return ""
+
     def _vision(payload):
         debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
-        # support both client namespaces
-        return _retry(lambda: openai_client.chat_completions.create(**payload)) if hasattr(openai_client,'chat_completions') else _retry(lambda: openai_client.chat.completions.create(**payload))
-    base_msg = [
-        {"role": "system", "content": "Extract concise, accurate product fields from the image."},
-        {"role": "user", "content": [
-            {"type": "text", "text": STRUCT_PROMPT_JSON},
-            {"type": "image_url", "image_url": {"url": img_url}}
-        ]}
-    ]
-    payload = {"model": "gpt-4o", "messages": base_msg, "temperature": 0.1, "max_tokens": 220}
+        return _retry(lambda: openai_client.chat.completions.create(**payload))
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Extract concise, accurate product fields from the image."},
+            {"role": "user", "content": [
+                {"type": "text", "text": STRUCT_PROMPT_JSON},
+                {"type": "image_url", "image_url": {"url": img_url}}
+            ]}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 220,
+    }
+
     try:
-        raw = (_vision(payload).choices[0].message.content or "").strip()
+        resp = _vision(payload)
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         data_url = _to_data_url_from_http(img_url)
         if not data_url:
             debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
-            return None
-        base_msg[1]["content"][1]["image_url"]["url"] = data_url
-        raw = (_vision({"model":"gpt-4o","messages": base_msg, "temperature":0.1, "max_tokens":220}).choices[0].message.content or "").strip()
+            return ""
+        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
+        resp = _vision(payload)
+        raw = (resp.choices[0].message.content or "").strip()
+
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
-        return None
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+
     try:
         data = json.loads(m.group(0))
     except Exception:
-        return None
-    need_brand = not (data.get("brand") or "").strip()
-    need_size  = not (str(data.get("size_value") or "").strip() and str(data.get("size_unit") or "").strip())
-    if need_brand or need_size:
-        prompt2 = (
-            "Return EXACTLY ONE LINE of JSON with keys "
-            '{"brand":string|null,"object_type":string|null,"flavor_scent":string|null,'
-            '"size_value":string|null,"size_unit":string|null}\n'
-            "Rules:\n"
-            "- Read the largest logo/text on the pack as brand when clear; else null.\n"
-            "- If size is printed (e.g., 150 ml, 90 g), extract numeric value and unit.\n"
-            "- object_type: plain noun (deodorant, chocolate bar, soap holder).\n"
-            "- Output JSON only."
-        )
-        payload2 = {"model": "gpt-4o", "temperature": 0, "max_tokens": 160,
-            "messages":[
-                {"role":"system","content":"Targeted field recovery."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt2},
-                    {"type":"image_url","image_url":{"url": base_msg[1]['content'][1]['image_url']['url']}}
-                ]}
-            ]}
-        try:
-            raw2 = (_vision(payload2).choices[0].message.content or "").strip()
-            m2 = re.search(r"\{.*\}", raw2, re.S)
-            if m2:
-                fix = json.loads(m2.group(0))
-                for k in ["brand","object_type","flavor_scent","size_value","size_unit"]:
-                    if (not (data.get(k) or "") or str(data.get(k)).strip()=="") and k in fix and fix[k]:
-                        data[k] = fix[k]
-        except Exception as e:
-            debug_log("Vision second-pass error", {"sku": sku, "error": str(e)})
-    return data
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
 
-def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    if not openai_active or not img_url:
-        return ""
-    data = vision_extract_fields(img_url, sku)
-    if not data:
-        return _fallback_simple_title_url(img_url, max_chars)
     obj = (data.get("object_type") or "").strip().lower()
     prod = (data.get("product") or "").strip().lower()
-    if not (obj or prod) or prod in {"ml","l","g","kg","pcs","tabs","caps"}:
-        return _fallback_simple_title_url(img_url, max_chars)
+    if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
+        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+
     title = assemble_title_from_fields(data)
-    title = tidy_title(normalize_title_en(title), max_chars) if title else ""
-    if not title:
-        return _fallback_simple_title_url(img_url, max_chars)
-    return title
+    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(
+        payload["messages"][1]["content"][1]["image_url"]["url"], max_chars
+    )
 
 # ============== Translation (EN->AR) ==============
 def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
@@ -452,7 +402,7 @@ def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
 def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     if not openai_active or not texts: return list(texts)
     payload = {
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",
         "messages": [
             {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
             {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
@@ -461,7 +411,7 @@ def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     }
     try:
         debug_log("OpenAI Translate Payload", payload)
-        resp=_retry(lambda: openai_client.chat_completions.create(**payload)) if hasattr(openai_client,'chat_completions') else _retry(lambda: openai_client.chat.completions.create(**payload))
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         lines=(resp.choices[0].message.content or "").splitlines()
         return [l.strip() for l in lines if l.strip()] or texts
     except Exception as e:
@@ -503,7 +453,7 @@ def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
     """Returns (arabic_clean, english_title) or ("","") on failure."""
     if not openai_active or not ar_title: return "",""
     payload = {
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",
         "messages": [
             {"role":"system","content":"You are a bilingual e-commerce content editor."},
             {"role":"user","content":[
@@ -515,7 +465,7 @@ def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
     }
     try:
         debug_log("OpenAI AR Rewrite Payload", payload)
-        resp=_retry(lambda: openai_client.chat_completions.create(**payload)) if hasattr(openai_client,'chat_completions') else _retry(lambda: openai_client.chat.completions.create(**payload))
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         raw=(resp.choices[0].message.content or "").strip()
         m=re.search(r"\{.*\}", raw, re.S)
         if not m: return "",""
@@ -553,13 +503,25 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
     return updated, skipped, failed
 
 # ============== Mapping lookups ==============
+def _clean_code_str(x) -> str:
+    s = str(x).strip()
+    if s.lower() in {"nan","none",""}: return ""
+    # drop trailing .0
+    if re.match(r"^\d+\.0$", s): s = s[:-2]
+    return s
+
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
-    for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
+    # normalize display name columns
+    for c in ["category_id","sub_category_id","sub_sub_category_id"]:
         if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
+    # normalize numeric code columns (NO) as strings without .0
+    for c in ["sub_category_id NO","sub_sub_category_id NO"]:
+        if c in map_df.columns: map_df[c]=map_df[c].map(_clean_code_str).astype("string")
+
     main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
     pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
-    sub_no={(r["category_id"],r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
-    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r["sub_sub_category_id NO"] for _,r in map_df.iterrows()}
+    sub_no={(r["category_id"],r["sub_category_id"]): _clean_code_str(r["sub_category_id NO"]) for _,r in map_df.iterrows()}
+    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): _clean_code_str(r["sub_sub_category_id NO"]) for _,r in map_df.iterrows()}
     return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
             "main_to_subnames": main_to_sub,
             "pair_to_subsubnames": pair_to_subsub,
@@ -574,9 +536,25 @@ def to_excel_download(df, sheet_name="Products"):
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
     buf.seek(0); return buf
 
-# ============== Uploads with persistence across reruns ==============
-st.session_state.setdefault("prod_df_cache", None)
-st.session_state.setdefault("map_df_cache", None)
+# ============== Uploads ==============
+c1,c2=st.columns(2)
+with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
+with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
+prod_df = read_any_table(product_file) if product_file else None
+map_df  = read_any_table(mapping_file) if mapping_file else None
+if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"Product List")
+        and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
+    st.stop()
+
+# ---- Normalize dtypes early to avoid incompatible dtype warnings
+def _normalize_product_codes(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["category_id","sub_category_id","sub_sub_category_id"]:
+        if col in df.columns:
+            df[col] = df[col].map(_clean_code_str).astype("string")
+    return df
+prod_df = _normalize_product_codes(prod_df)
+
+# ============== Memory & State ==============
 st.session_state.setdefault("file_hash", None)
 st.session_state.setdefault("proc_cache", {})
 st.session_state.setdefault("audit_rows", [])
@@ -585,48 +563,24 @@ st.session_state.setdefault("page_size", 200)
 st.session_state.setdefault("page_num", 1)
 st.session_state.setdefault("search_q","")
 
-c1,c2=st.columns(2)
-with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
-with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
-
-# Update caches if new uploads arrive
-prod_df = read_any_table(product_file) if product_file else None
-if prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"Product List"):
-    st.session_state.prod_df_cache = prod_df
-    st.session_state.file_hash = hash_uploaded_file(product_file)
-    # Reset per-file state
+current_hash = hash_uploaded_file(product_file)
+if st.session_state.file_hash != current_hash:
+    st.session_state.work = prod_df.copy()
+    # ensure working dtypes remain strings for codes
+    for col in ["category_id","sub_category_id","sub_sub_category_id"]:
+        if col in st.session_state.work.columns:
+            st.session_state.work[col] = st.session_state.work[col].astype("string")
     st.session_state.proc_cache = {}
     st.session_state.audit_rows = []
-    st.session_state.work = prod_df.copy()
+    st.session_state.file_hash = current_hash
 
-map_df = read_any_table(mapping_file) if mapping_file else None
-if map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping"):
-    st.session_state.map_df_cache = map_df
-
-# Use cached data if uploaders are empty on reruns
-if st.session_state.get("work", None) is None and st.session_state.prod_df_cache is not None:
-    st.session_state.work = st.session_state.prod_df_cache.copy()
-
-work = st.session_state.get("work", None)
-map_df_cache = st.session_state.get("map_df_cache", None)
-
-# If nothing available, stop; otherwise continue
-if work is None or map_df_cache is None:
-    st.info("Upload Product List and Category Mapping to start.")
-    st.stop()
-
-# Ensure mapping columns in work are strings to avoid dtype issues
-for col in ["category_id","sub_category_id","sub_sub_category_id","category_id_ar"]:
-    if col in work.columns:
-        try: work[col] = work[col].astype(str)
-        except Exception: pass
-
-lookups = build_mapping_struct_fixed(map_df_cache)
+work = st.session_state.get("work", pd.DataFrame())
+lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
 # Prefill from persistent cache if this file was seen before
 _g = global_cache()
-file_store = _g.get(st.session_state.file_hash or "anon", {})
-if file_store and isinstance(work, pd.DataFrame) and not work.empty:
+file_store = _g.get(current_hash, {})
+if file_store is not None and isinstance(work, pd.DataFrame) and not work.empty:
     for i, row in work.iterrows():
         sku = str(row.get("merchant_sku",""))
         entry = file_store.get(sku) if sku else None
@@ -781,7 +735,7 @@ def sec_titles():
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
-        store = global_cache().setdefault(st.session_state.file_hash or "anon", {})
+        store = global_cache().setdefault(st.session_state.file_hash, {})
 
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
@@ -814,7 +768,7 @@ def sec_titles():
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
         if engine not in ("DeepL","OpenAI"): return 0,0
-        store = global_cache().setdefault(st.session_state.file_hash or "anon", {})
+        store = global_cache().setdefault(st.session_state.file_hash, {})
         ids=[]; texts=[]
         for i in idx:
             sku=str(work.at[i,"merchant_sku"])
@@ -981,14 +935,12 @@ def sec_grouping():
                 elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
                 else:
                     m=work["merchant_sku"].astype(str).isin(chosen)
-                    # ensure string dtypes
+                    # cast destination columns to string dtype to avoid dtype warnings
                     for col in ["category_id","sub_category_id","sub_sub_category_id"]:
-                        if col in work.columns:
-                            try: work[col]=work[col].astype(str)
-                            except Exception: pass
-                    work.loc[m,"category_id"]=g_main
-                    work.loc[m,"sub_category_id"]=get_sub_no(lookups,g_main,g_sub)
-                    work.loc[m,"sub_sub_category_id"]=get_ssub_no(lookups,g_main,g_sub,g_ssub)
+                        if col in work.columns: work[col] = work[col].astype("string")
+                    work.loc[m,"category_id"]=str(g_main)
+                    work.loc[m,"sub_category_id"]=str(get_sub_no(lookups,g_main,g_sub))
+                    work.loc[m,"sub_sub_category_id"]=str(get_ssub_no(lookups,g_main,g_sub,g_ssub))
                     st.success(f"Applied to {int(m.sum())} rows.")
         else:
             st.info("Pick at least one keyword/token.")
@@ -1008,19 +960,26 @@ def sec_sheet():
     st.caption(f"{total} rows total")
     start=(st.session_state.page_num-1)*st.session_state.page_size; end=start+st.session_state.page_size
     page=base.iloc[start:end].copy()
+
     def style_map(row):
         sub_ok=str(row.get("sub_category_id","") or "").strip()!=""
         ssub_ok=str(row.get("sub_sub_category_id","") or "").strip()!=""
         return [("background-color: rgba(16,185,129,0.10)" if (sub_ok and ssub_ok) else "background-color: rgba(234,179,8,0.18)") for _ in row]
+
     term=st.session_state.get("search_q","").strip().lower()
-    def hi_col(col):
-        try:
-            return ["background-color: rgba(59,130,246,0.15)" if term and term in str(v).lower() else "" for v in col]
-        except Exception:
-            return [""]*len(col)
+    def hi_map(series: pd.Series):
+        if not term: return ["" for _ in series]
+        out=[]
+        for v in series:
+            try:
+                out.append("background-color: rgba(59,130,246,0.15)" if term in str(v).lower() else "")
+            except Exception:
+                out.append("")
+        return out
+
     if len(page)>0:
         try:
-            styler=page.style.apply(style_map, axis=1).apply(hi_col, subset=["name","name_ar"], axis=0)
+            styler=page.style.apply(style_map, axis=1).map(hi_map, subset=["name","name_ar"])
             st.dataframe(styler, width="stretch", height=440)
         except Exception:
             st.dataframe(page, width="stretch", height=440)
@@ -1030,7 +989,7 @@ def sec_sheet():
 def sec_downloads(page_df):
     st.subheader("Downloads")
     st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
-    st.download_button("⬇️ Current view Excel", to_excel_download(page_df), file_name="products_view.xlsx")
+    st.download_button("⬇️ Current view Excel", to_excel_download(page_df if isinstance(page_df, pd.DataFrame) else work), file_name="products_view.xlsx")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
@@ -1048,8 +1007,7 @@ def sec_settings():
         if st.button("Clear per-file cache & audit"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
             store = global_cache()
-            key = st.session_state.file_hash or "anon"
-            if key in store: del store[key]
+            if st.session_state.file_hash in store: del store[st.session_state.file_hash]
             st.success("Cleared.")
 
 # ============== Router ==============
