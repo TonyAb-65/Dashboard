@@ -284,6 +284,7 @@ def assemble_title_from_fields(d: dict) -> str:
     parts=[]
     if brand: parts.append(brand)
     if noun:
+        # color/material leading for unbranded household items
         if not brand and (color or material) and noun not in {"deodorant","shampoo","chocolate","chocolate bar","soap","detergent"}:
             cm = " ".join([x for x in [color, material] if x])
             parts.append(f"{cm} {noun}".strip())
@@ -503,30 +504,41 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
     return updated, skipped, failed
 
 # ============== Mapping lookups ==============
-def _clean_code_str(x) -> str:
-    s = str(x).strip()
-    if s.lower() in {"nan","none",""}: return ""
-    # drop trailing .0
-    if re.match(r"^\d+\.0$", s): s = s[:-2]
-    return s
+
+def _normalize_code(v) -> str:
+    """
+    Always return a clean string code. If numeric-like, drop .0.
+    Examples: 222.0 -> "222", 220 -> "220", "239.0" -> "239"
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)): return ""
+    s = str(v).strip()
+    if s == "": return ""
+    try:
+        # treat ints or floats uniformly
+        f = float(s)
+        i = int(f)
+        if abs(f - i) < 1e-9:
+            return str(i)
+        return s
+    except Exception:
+        return s
 
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
-    # normalize display name columns
-    for c in ["category_id","sub_category_id","sub_sub_category_id"]:
-        if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
-    # normalize numeric code columns (NO) as strings without .0
-    for c in ["sub_category_id NO","sub_sub_category_id NO"]:
-        if c in map_df.columns: map_df[c]=map_df[c].map(_clean_code_str).astype("string")
+    # normalize all mapping name/number fields to string
+    for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
+        if c in map_df.columns:
+            map_df[c] = map_df[c].map(_normalize_code)
 
     main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
     pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
-    sub_no={(r["category_id"],r["sub_category_id"]): _clean_code_str(r["sub_category_id NO"]) for _,r in map_df.iterrows()}
-    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): _clean_code_str(r["sub_sub_category_id NO"]) for _,r in map_df.iterrows()}
+    sub_no={(r["category_id"],r["sub_category_id"]): _normalize_code(r["sub_category_id NO"]) for _,r in map_df.iterrows()}
+    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): _normalize_code(r["sub_sub_category_id NO"]) for _,r in map_df.iterrows()}
     return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
             "main_to_subnames": main_to_sub,
             "pair_to_subsubnames": pair_to_subsub,
             "sub_name_to_no_by_main": sub_no,
             "ssub_name_to_no_by_main_sub": ssub_no}
+
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
@@ -546,14 +558,6 @@ if not (prod_df is not None and validate_columns(prod_df,REQUIRED_PRODUCT_COLS,"
         and map_df is not None and validate_columns(map_df,["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],"Category Mapping")):
     st.stop()
 
-# ---- Normalize dtypes early to avoid incompatible dtype warnings
-def _normalize_product_codes(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["category_id","sub_category_id","sub_sub_category_id"]:
-        if col in df.columns:
-            df[col] = df[col].map(_clean_code_str).astype("string")
-    return df
-prod_df = _normalize_product_codes(prod_df)
-
 # ============== Memory & State ==============
 st.session_state.setdefault("file_hash", None)
 st.session_state.setdefault("proc_cache", {})
@@ -566,13 +570,14 @@ st.session_state.setdefault("search_q","")
 current_hash = hash_uploaded_file(product_file)
 if st.session_state.file_hash != current_hash:
     st.session_state.work = prod_df.copy()
-    # ensure working dtypes remain strings for codes
-    for col in ["category_id","sub_category_id","sub_sub_category_id"]:
-        if col in st.session_state.work.columns:
-            st.session_state.work[col] = st.session_state.work[col].astype("string")
     st.session_state.proc_cache = {}
     st.session_state.audit_rows = []
     st.session_state.file_hash = current_hash
+
+# enforce string dtypes for code columns early to avoid float coercion warnings
+for col in ("category_id","sub_category_id","sub_sub_category_id"):
+    if col in st.session_state.work.columns:
+        st.session_state.work[col] = st.session_state.work[col].map(_normalize_code)
 
 work = st.session_state.get("work", pd.DataFrame())
 lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
@@ -935,12 +940,9 @@ def sec_grouping():
                 elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
                 else:
                     m=work["merchant_sku"].astype(str).isin(chosen)
-                    # cast destination columns to string dtype to avoid dtype warnings
-                    for col in ["category_id","sub_category_id","sub_sub_category_id"]:
-                        if col in work.columns: work[col] = work[col].astype("string")
-                    work.loc[m,"category_id"]=str(g_main)
-                    work.loc[m,"sub_category_id"]=str(get_sub_no(lookups,g_main,g_sub))
-                    work.loc[m,"sub_sub_category_id"]=str(get_ssub_no(lookups,g_main,g_sub,g_ssub))
+                    work.loc[m,"category_id"]=_normalize_code(g_main)
+                    work.loc[m,"sub_category_id"]=_normalize_code(get_sub_no(lookups,g_main,g_sub))
+                    work.loc[m,"sub_sub_category_id"]=_normalize_code(get_ssub_no(lookups,g_main,g_sub,g_ssub))
                     st.success(f"Applied to {int(m.sum())} rows.")
         else:
             st.info("Pick at least one keyword/token.")
@@ -967,29 +969,28 @@ def sec_sheet():
         return [("background-color: rgba(16,185,129,0.10)" if (sub_ok and ssub_ok) else "background-color: rgba(234,179,8,0.18)") for _ in row]
 
     term=st.session_state.get("search_q","").strip().lower()
-    def hi_map(series: pd.Series):
-        if not term: return ["" for _ in series]
-        out=[]
-        for v in series:
-            try:
-                out.append("background-color: rgba(59,130,246,0.15)" if term in str(v).lower() else "")
-            except Exception:
-                out.append("")
-        return out
+    def hi(v):
+        if not term: return ""
+        try:
+            if term in str(v).lower(): return "background-color: rgba(59,130,246,0.15)"
+        except Exception: pass
+        return ""
 
     if len(page)>0:
         try:
-            styler=page.style.apply(style_map, axis=1).map(hi_map, subset=["name","name_ar"])
+            # replace deprecated applymap with map
+            styler = page.style.apply(style_map, axis=1).map(hi, subset=pd.IndexSlice[:, ["name","name_ar"]])
             st.dataframe(styler, width="stretch", height=440)
         except Exception:
             st.dataframe(page, width="stretch", height=440)
-    else: st.info("No rows.")
+    else:
+        st.info("No rows.")
     return page
 
 def sec_downloads(page_df):
     st.subheader("Downloads")
     st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
-    st.download_button("⬇️ Current view Excel", to_excel_download(page_df if isinstance(page_df, pd.DataFrame) else work), file_name="products_view.xlsx")
+    st.download_button("⬇️ Current view Excel", to_excel_download(page_df), file_name="products_view.xlsx")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
