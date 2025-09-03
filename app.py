@@ -141,29 +141,30 @@ def _fix_len(seq, n: int):
     seq = list(seq or [])
     return seq[:n] if len(seq) >= n else seq + [""] * (n - len(seq))
 
-def _to_data_url_from_http(url: str, timeout: int = 12, max_bytes: int = 8_000_000) -> str:
-    """Download image and return as base64 data URL so OpenAI Vision can read it when it can't fetch the site."""
+def _to_data_url_from_http(url: str, timeout: int = 15, max_bytes: int = 8_000_000) -> str:
+    """Download image and return as base64 data URL so OpenAI Vision reads it without fetching remote URLs."""
     try:
+        u = clean_url_for_vision(url)
+        if not u: return ""
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Referer": f"https://{urlsplit(url).netloc}",
+            "Referer": f"https://{urlsplit(u).netloc}",
+            "Cache-Control": "no-cache",
         }
-        r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        r = requests.get(u, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
         r.raise_for_status()
         data = r.content if r.content else r.raw.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            return ""
-        mime = r.headers.get("Content-Type", "").split(";")[0] or "image/jpeg"
-        if "/" not in mime:
-            mime = "image/jpeg"
+        if not data or len(data) > max_bytes: return ""
+        mime = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+        if not mime or "/" not in mime: mime = "image/jpeg"
         b64 = base64.b64encode(data).decode("ascii")
         return f"data:{mime};base64,{b64}"
     except Exception:
         return ""
 
 def clean_url_for_vision(raw: str) -> str:
-    """Sanitize before sending to OpenAI Vision."""
+    """Sanitize before downloading for Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
     u = re.sub(r"\s+", "", u)
     u = _normalize_url(u)
@@ -338,56 +339,49 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
         return ""
 
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
+    """Always upload image as data URL first to avoid invalid_image_url from remote hosts."""
     if not openai_active or not img_url:
         return ""
-
-    def _vision(payload):
-        debug_log("OpenAI Vision Payload", {"sku": sku, **payload})
-        return _retry(lambda: openai_client.chat.completions.create(**payload))
-
+    data_url = _to_data_url_from_http(img_url)
+    if not data_url:
+        debug_log("Vision download failed", {"sku": sku, "source_url": img_url})
+        return ""
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": "Extract concise, accurate product fields from the image."},
             {"role": "user", "content": [
                 {"type": "text", "text": STRUCT_PROMPT_JSON},
-                {"type": "image_url", "image_url": {"url": img_url}}
+                {"type": "image_url", "image_url": {"url": data_url}}
             ]}
         ],
         "temperature": 0.1,
         "max_tokens": 220,
     }
-
     try:
-        resp = _vision(payload)
-        raw = (resp.choices[0].message.content or "").strip()
+        debug_log("OpenAI Vision Payload (data-url)", {"sku": sku, "url_kind": "data"})
+        resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+        raw=(resp.choices[0].message.content or "").strip()
     except Exception as e:
-        data_url = _to_data_url_from_http(img_url)
-        if not data_url:
-            debug_log("OpenAI Vision Exception", {"sku": sku, "url": img_url, "error": str(e)})
-            return ""
-        payload["messages"][1]["content"][1]["image_url"]["url"] = data_url
-        resp = _vision(payload)
-        raw = (resp.choices[0].message.content or "").strip()
+        debug_log("OpenAI Vision Exception (data-url)", {"sku": sku, "error": str(e)})
+        return ""
 
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+        return _fallback_simple_title_url(data_url, max_chars)
 
     try:
         data = json.loads(m.group(0))
     except Exception:
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+        return _fallback_simple_title_url(data_url, max_chars)
 
     obj = (data.get("object_type") or "").strip().lower()
     prod = (data.get("product") or "").strip().lower()
     if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
-        return _fallback_simple_title_url(payload["messages"][1]["content"][1]["image_url"]["url"], max_chars)
+        return _fallback_simple_title_url(data_url, max_chars)
 
     title = assemble_title_from_fields(data)
-    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(
-        payload["messages"][1]["content"][1]["image_url"]["url"], max_chars
-    )
+    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(data_url, max_chars)
 
 # ============== Translation (EN->AR) ==============
 def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
@@ -504,41 +498,18 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
     return updated, skipped, failed
 
 # ============== Mapping lookups ==============
-
-def _normalize_code(v) -> str:
-    """
-    Always return a clean string code. If numeric-like, drop .0.
-    Examples: 222.0 -> "222", 220 -> "220", "239.0" -> "239"
-    """
-    if v is None or (isinstance(v, float) and pd.isna(v)): return ""
-    s = str(v).strip()
-    if s == "": return ""
-    try:
-        # treat ints or floats uniformly
-        f = float(s)
-        i = int(f)
-        if abs(f - i) < 1e-9:
-            return str(i)
-        return s
-    except Exception:
-        return s
-
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
-    # normalize all mapping name/number fields to string
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
-        if c in map_df.columns:
-            map_df[c] = map_df[c].map(_normalize_code)
-
+        if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
     main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
     pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
-    sub_no={(r["category_id"],r["sub_category_id"]): _normalize_code(r["sub_category_id NO"]) for _,r in map_df.iterrows()}
-    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): _normalize_code(r["sub_sub_category_id NO"]) for _,r in map_df.iterrows()}
+    sub_no={(r["category_id"],r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
+    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r["sub_sub_category_id NO"] for _,r in map_df.iterrows()}
     return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
             "main_to_subnames": main_to_sub,
             "pair_to_subsubnames": pair_to_subsub,
             "sub_name_to_no_by_main": sub_no,
             "ssub_name_to_no_by_main_sub": ssub_no}
-
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
@@ -573,11 +544,6 @@ if st.session_state.file_hash != current_hash:
     st.session_state.proc_cache = {}
     st.session_state.audit_rows = []
     st.session_state.file_hash = current_hash
-
-# enforce string dtypes for code columns early to avoid float coercion warnings
-for col in ("category_id","sub_category_id","sub_sub_category_id"):
-    if col in st.session_state.work.columns:
-        st.session_state.work[col] = st.session_state.work[col].map(_normalize_code)
 
 work = st.session_state.get("work", pd.DataFrame())
 lookups = build_mapping_struct_fixed(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
@@ -731,7 +697,7 @@ def sec_titles():
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Workers (URL-only to OpenAI) ----------
+    # ---------- Workers (URL→dataURL→OpenAI) ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -940,9 +906,9 @@ def sec_grouping():
                 elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
                 else:
                     m=work["merchant_sku"].astype(str).isin(chosen)
-                    work.loc[m,"category_id"]=_normalize_code(g_main)
-                    work.loc[m,"sub_category_id"]=_normalize_code(get_sub_no(lookups,g_main,g_sub))
-                    work.loc[m,"sub_sub_category_id"]=_normalize_code(get_ssub_no(lookups,g_main,g_sub,g_ssub))
+                    work.loc[m,"category_id"]=g_main
+                    work.loc[m,"sub_category_id"]=get_sub_no(lookups,g_main,g_sub)
+                    work.loc[m,"sub_sub_category_id"]=get_ssub_no(lookups,g_main,g_sub,g_ssub)
                     st.success(f"Applied to {int(m.sum())} rows.")
         else:
             st.info("Pick at least one keyword/token.")
@@ -962,12 +928,10 @@ def sec_sheet():
     st.caption(f"{total} rows total")
     start=(st.session_state.page_num-1)*st.session_state.page_size; end=start+st.session_state.page_size
     page=base.iloc[start:end].copy()
-
     def style_map(row):
         sub_ok=str(row.get("sub_category_id","") or "").strip()!=""
         ssub_ok=str(row.get("sub_sub_category_id","") or "").strip()!=""
         return [("background-color: rgba(16,185,129,0.10)" if (sub_ok and ssub_ok) else "background-color: rgba(234,179,8,0.18)") for _ in row]
-
     term=st.session_state.get("search_q","").strip().lower()
     def hi(v):
         if not term: return ""
@@ -975,22 +939,29 @@ def sec_sheet():
             if term in str(v).lower(): return "background-color: rgba(59,130,246,0.15)"
         except Exception: pass
         return ""
-
     if len(page)>0:
         try:
-            # replace deprecated applymap with map
-            styler = page.style.apply(style_map, axis=1).map(hi, subset=pd.IndexSlice[:, ["name","name_ar"]])
-            st.dataframe(styler, width="stretch", height=440)
+            # Use Styler only up to 3000 rows to avoid blank renders
+            if len(page) <= 3000:
+                styler=page.style.apply(style_map, axis=1).applymap(hi, subset=["name","name_ar"])
+                st.dataframe(styler, width="stretch", height=440)
+            else:
+                st.dataframe(page, width="stretch", height=440)
         except Exception:
             st.dataframe(page, width="stretch", height=440)
-    else:
-        st.info("No rows.")
+    else: st.info("No rows.")
     return page
 
 def sec_downloads(page_df):
     st.subheader("Downloads")
-    st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
-    st.download_button("⬇️ Current view Excel", to_excel_download(page_df), file_name="products_view.xlsx")
+    try:
+        st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
+    except Exception as e:
+        st.error(f"Full export failed: {e}")
+    try:
+        st.download_button("⬇️ Current view Excel", to_excel_download(page_df if isinstance(page_df, pd.DataFrame) else work), file_name="products_view.xlsx")
+    except Exception as e:
+        st.error(f"View export failed: {e}")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
@@ -1022,7 +993,7 @@ elif section=="🧩 Grouping":
     safe_section("Grouping", sec_grouping)
 elif section=="📑 Sheet":
     _tmp = safe_section("Sheet", sec_sheet)
-    page_df = _tmp if _tmp is not None else work.copy()
+    page_df = _tmp if isinstance(_tmp, pd.DataFrame) else work.copy()
 elif section=="⬇️ Downloads":
     try:
         page_df
