@@ -50,6 +50,18 @@ except Exception:
     translator=None; deepl_active=False
 
 openai_client=None; openai_active=False
+
+def ui_sleep(seconds: float):
+    """Sleep without breaking on older Streamlit versions."""
+    try:
+        import streamlit as _st
+        if hasattr(_st, "sleep"):
+            _st.sleep(seconds)
+        else:
+            time.sleep(seconds)
+    except Exception:
+        time.sleep(seconds)
+
 try:
     from openai import OpenAI
     OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
@@ -386,11 +398,9 @@ def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
             try:
                 return [translator.translate_text(t, source_lang="EN", target_lang="AR", context=context_hint).text for t in texts]
             except TypeError:
-                # Older deepl SDKs may not support `context`
                 return [translator.translate_text(t, source_lang="EN", target_lang="AR").text for t in texts]
         return [translator.translate_text(t, source_lang="EN", target_lang="AR").text for t in texts]
     except Exception:
-        # Fallback to OpenAI if available, else return original texts
         try:
             return openai_translate_batch_en2ar(texts) if openai_active else list(texts)
         except Exception:
@@ -431,7 +441,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
     if engine=="OpenAI":
         out=[]
         for s in range(0,len(texts),max(1,batch_size)):
-            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); st.sleep(0.1)
+            out.extend(openai_translate_batch_en2ar(texts[s:s+batch_size])); ui_sleep(0.1)
         return pd.Series(out, index=titles_en.index)
     return pd.Series(texts, index=titles_en.index)
 
@@ -496,17 +506,14 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
                     st.session_state.audit_rows.append({"sku":sku,"phase":"AR rewrite→EN","reason":"rewrite_failed","url":str(work.at[i,"thumbnail"])})
                 except Exception:
                     pass
-        st.sleep(0.05)
+        ui_sleep(0.05)
     return updated, skipped, failed
 
 # ============== Mapping lookups ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
-    # Normalize key columns as strings
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
         if c in map_df.columns:
-            map_df[c] = map_df[c].astype(str).str.strip()
-
-    # Warn on duplicates that would collide in lookups
+            map_df[c]=map_df[c].astype(str).str.strip()
     try:
         dup1 = map_df.duplicated(subset=["category_id","sub_category_id"], keep=False)
         d1_cnt = int(dup1.sum())
@@ -516,29 +523,18 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
         d2_cnt = int(dup2.sum())
         if d2_cnt:
             st.warning(f"Mapping sheet has {d2_cnt} duplicate rows for (category_id, sub_category_id, sub_sub_category_id). Keeping first occurrence.")
-        # Drop duplicates keeping first to ensure deterministic mappings
         map_df = map_df.drop_duplicates(subset=["category_id","sub_category_id","sub_sub_category_id"], keep="first")
     except Exception:
         pass
-
-    main_to_sub = {str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) 
-                   for mc, g in map_df.groupby("category_id", dropna=True)}
-    pair_to_subsub = {(str(mc), str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) 
-                      for (mc, sc), g in map_df.groupby(["category_id","sub_category_id"], dropna=True)}
-
-    sub_no = {}
-    ssub_no = {}
-    for _, r in map_df.iterrows():
-        sub_no[(r["category_id"], r["sub_category_id"])] = r.get("sub_category_id NO", "")
-        ssub_no[(r["category_id"], r["sub_category_id"], r["sub_sub_category_id"])] = r.get("sub_sub_category_id NO", "")
-
-    return {
-        "main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
-        "main_to_subnames": main_to_sub,
-        "pair_to_subsubnames": pair_to_subsub,
-        "sub_name_to_no_by_main": sub_no,
-        "ssub_name_to_no_by_main_sub": ssub_no,
-    }
+    main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
+    pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
+    sub_no={(r["category_id"],r["sub_category_id"]): r.get("sub_category_id NO","") for _,r in map_df.iterrows()}
+    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r.get("sub_sub_category_id NO","") for _,r in map_df.iterrows()}
+    return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
+            "main_to_subnames": main_to_sub,
+            "pair_to_subsubnames": pair_to_subsub,
+            "sub_name_to_no_by_main": sub_no,
+            "ssub_name_to_no_by_main_sub": ssub_no}
 def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
 def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
@@ -858,7 +854,7 @@ def sec_titles():
                 u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up+=u; en_skip+=k; en_fail+=f
                 u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up+=u2; ar_fail+=f2
                 done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,ar_up,ar_fail,bno,total_batches)
-                st.sleep(0.15)
+                ui_sleep(0.15)
             st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
     # === Optional targeted runners ===
