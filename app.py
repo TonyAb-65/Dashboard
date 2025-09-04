@@ -1,3 +1,5 @@
+# Write the fully patched Streamlit app to a file for download
+app_code = r'''
 import io, re, time, math, hashlib, json, sys, traceback, base64
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
@@ -25,6 +27,7 @@ st.markdown(f"""
 .block-container {{ padding-top:6px; }}
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 <div class="app-header">
   <div class="app-title">🧭 Product Mapping Dashboard</div>
@@ -34,7 +37,7 @@ st.markdown("""
 
 # ============== REQUIRED COLUMNS ==============
 REQUIRED_PRODUCT_COLS = [
-    "name","name_ar","merchant_sku","category_id","category_id_ar",
+    "name","name_ar","merchant_sku","category_id",
     "sub_category_id","sub_sub_category_id","thumbnail",
 ]
 
@@ -65,15 +68,24 @@ def global_cache() -> dict:
 
 # ============== FILE IO ==============
 def read_any_table(uploaded_file):
-    if uploaded_file is None: return None
+    if uploaded_file is None:
+        return None
     fn = uploaded_file.name.lower()
-    if fn.endswith((".xlsx",".xls")): return pd.read_excel(uploaded_file, engine="openpyxl")
-    if fn.endswith(".csv"): return pd.read_csv(uploaded_file)
+    if fn.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+    if fn.endswith(".xls"):
+        try:
+            return pd.read_excel(uploaded_file)  # requires an xls engine like xlrd<=1.2
+        except Exception as e:
+            raise RuntimeError(".xls support requires an engine like 'xlrd'. Save as .xlsx or install xlrd<=1.2.") from e
+    if fn.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
     raise ValueError("Please upload .xlsx, .xls, or .csv")
 
 def validate_columns(df, required_cols: Iterable[str], label: str) -> bool:
     missing=[c for c in required_cols if c not in df.columns]
-    if missing: st.error(f"{label}: missing columns: {missing}"); return False
+    if missing:
+        st.error(f"{label}: missing columns: {missing}"); return False
     return True
 
 def hash_uploaded_file(uploaded_file) -> str:
@@ -86,14 +98,16 @@ def hash_uploaded_file(uploaded_file) -> str:
 # ============== HELPERS ==============
 STOP={"the","and","for","with","of","to","in","on","by","a","an","&","-",
       "ml","g","kg","l","oz","pcs","pc","pack","pkt","ct","size","new","extra","x"}
+ARABIC_RANGE = r"\u0600-\u06FF"
 
 def tokenize(t:str)->List[str]:
-    return [x for x in re.split(r"[^A-Za-z0-9]+", str(t).lower())
-            if x and len(x)>2 and not x.isdigit() and x not in STOP]
+    s = str(t or "").lower()
+    parts = re.split(rf"[^\w{ARABIC_RANGE}]+", s, flags=re.UNICODE)
+    return [x for x in parts if x and len(x)>2 and not x.isdigit() and x not in STOP]
 
 def strip_markdown(s:str)->str:
     if not isinstance(s,str): return ""
-    s=re.sub(r"[*_`]+","",s); s=re.sub(r"\s+"," ",s).strip(); return s
+    s=re.sub(r"[*_]+","",s); s=re.sub(r"\s+"," ",s).strip(); return s
 
 def tidy_title(s:str,max_chars:int=70)->str:
     s=strip_markdown(s)
@@ -107,7 +121,8 @@ def is_valid_url(u:str)->bool:
     u=u.strip()
     try:
         p=urlsplit(u); return p.scheme in ("http","https") and bool(p.netloc)
-    except Exception: return False
+    except Exception:
+        return False
 
 def _normalize_url(u:str)->str:
     u=(u or "").strip().strip('"').strip("'")
@@ -122,64 +137,78 @@ def _normalize_url(u:str)->str:
             if not kv: continue
             if "=" in kv:
                 k,v=kv.split("=",1); parts.append(f"{quote(k,safe=':/@')}={quote(v,safe=':/@')}")
-            else: parts.append(quote(kv,safe=':/@'))
+            else:
+                parts.append(quote(kv,safe=':/@'))
         q="&".join(parts)
-    else: q=""
+    else:
+        q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
-def _to_data_url_from_http(url: str, timeout: int = 20, max_bytes: int = 12_000_000) -> str:
-    """Download image and return as base64 data URL so OpenAI Vision can read it when it can't fetch the site."""
-    try:
-        u = clean_url_for_vision(url)
-        if not u: return ""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en",
-            "Referer": f"https://{urlsplit(u).netloc}",
-            "Cache-Control": "no-cache",
-        }
-        for _ in range(5):
-            r = requests.get(u, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
-            try:
-                r.raise_for_status()
-                data = r.content if r.content else r.raw.read(max_bytes + 1)
-                if data and len(data) <= max_bytes:
-                    mime = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
-                    if not mime or "/" not in mime: mime = "image/jpeg"
-                    b64 = base64.b64encode(data).decode("ascii")
-                    return f"data:{mime};base64,{b64}"
-            finally:
-                try: r.close()
-                except Exception: pass
-        return ""
-    except Exception:
-        return ""
-
 def clean_url_for_vision(raw: str) -> str:
-    """Sanitize before sending to OpenAI Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
     u = re.sub(r"\s+", "", u)
     u = _normalize_url(u)
     return u if is_valid_url(u) else ""
 
+# ---------- robust downloader with rotating referers ----------
+_REFERERS = [
+    lambda host: f"https://{host}",
+    lambda host: "https://www.google.com/",
+    lambda host: "",
+]
+_MAX_BYTES = 12_000_000
+
+def _to_data_url_from_http(url: str, timeout: int = 20) -> str:
+    try:
+        u = clean_url_for_vision(url)
+        if not u: return ""
+        host = urlsplit(u).netloc
+        for make_ref in _REFERERS:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": make_ref(host),
+                "Cache-Control": "no-cache",
+                "Accept-Encoding": "identity",
+            }
+            try:
+                r = requests.get(u, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
+                try:
+                    r.raise_for_status()
+                    ctype = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+                    if not ctype.startswith("image/"):
+                        continue
+                    data = r.raw.read(_MAX_BYTES + 1)
+                    if not data or len(data) > _MAX_BYTES:
+                        continue
+                    mime = ctype if "/" in ctype else "image/jpeg"
+                    b64 = base64.b64encode(data).decode("ascii")
+                    return f"data:{mime};base64,{b64}"
+                finally:
+                    try: r.close()
+                    except Exception: pass
+            except Exception:
+                continue
+        return ""
+    except Exception:
+        return ""
+
 # ---------- retry wrapper ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
-        try: return fn()
+        try:
+            return fn()
         except Exception:
             if i == attempts - 1: raise
             time.sleep(base * (2 ** i))
 
 # ===== debug logger and safe section =====
-DEBUG = False  # will be set by sidebar
-
+DEBUG = False
 def debug_log(title: str, obj):
     if DEBUG:
-        try:
-            msg = json.dumps(obj, ensure_ascii=False, indent=2)
-        except Exception:
-            msg = str(obj)
+        try: msg = json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception: msg = str(obj)
         print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
 
 def safe_section(label, fn):
@@ -193,11 +222,10 @@ def safe_section(label, fn):
 
 # ===== Structured extraction prompt (Vision) =====
 STRUCT_PROMPT_JSON = """
-Look at the PHOTO and extract fields for an e-commerce title.
-Return EXACTLY ONE LINE of STRICT JSON with keys:
+Look at the PHOTO and extract fields for an e-commerce title. Return EXACTLY ONE LINE of STRICT JSON with keys:
 {"object_type":string,"brand":string|null,"product":string|null,"variant":string|null,
-"flavor_scent":string|null,"material":string|null,"size_value":string|null,
-"size_unit":string|null,"count":string|null,"feature":string|null,"color":string|null,"descriptor":string|null}
+ "flavor_scent":string|null,"material":string|null,"size_value":string|null,
+ "size_unit":string|null,"count":string|null,"feature":string|null,"color":string|null,"descriptor":string|null}
 Rules:
 - object_type = visible item category in plain nouns (e.g., "deodorant", "chocolate bar", "soap holder").
 - PRIORITIZE what you SEE over printed text when they disagree. Ignore marketing taglines.
@@ -215,13 +243,11 @@ with st.sidebar:
     st.markdown("### 🔑 API Keys")
     st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
     st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
-
     st.markdown("### 🧩 Translation options")
     USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
     GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
                                 placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
     CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
-
     st.markdown("---")
     DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
     section = st.radio(
@@ -242,25 +268,21 @@ def _title_case_keep_units(s: str) -> str:
     return " ".join(out)
 
 def assemble_title_from_fields(d: dict) -> str:
-    def _s(v):
-        return str(v).strip() if v is not None else ""
-    def _num(v):
-        s = _s(v)
-        m = re.search(r"\d+(?:\.\d+)?", s)
-        return m.group(0) if m else ""
+    def _s(v): return str(v).strip() if v is not None else ""
+    def _num(v): s=_s(v); m=re.search(r"\d+(?:\.\d+)?", s); return m.group(0) if m else ""
 
     brand = _s(d.get("brand"))
     object_type = _s(d.get("object_type"))
     product = _s(d.get("product"))
     variant = _s(d.get("variant"))
-    flavor  = _s(d.get("flavor_scent"))
+    flavor = _s(d.get("flavor_scent"))
     material= _s(d.get("material"))
     feature = _s(d.get("feature"))
-    color   = _s(d.get("color"))
-    descr   = _s(d.get("descriptor"))
-    size_v  = _num(d.get("size_value"))
-    size_u  = _s(d.get("size_unit")).lower()
-    count   = _num(d.get("count"))
+    color = _s(d.get("color"))
+    descr = _s(d.get("descriptor"))
+    size_v = _num(d.get("size_value"))
+    size_u = _s(d.get("size_unit")).lower()
+    count = _num(d.get("count"))
 
     # Normalize units
     unit=size_u
@@ -277,6 +299,7 @@ def assemble_title_from_fields(d: dict) -> str:
 
     parts=[]
     if brand: parts.append(brand)
+
     if noun:
         # color/material leading for unbranded household items
         if not brand and (color or material) and noun not in {"deodorant","shampoo","chocolate","chocolate bar","soap","detergent"}:
@@ -284,6 +307,7 @@ def assemble_title_from_fields(d: dict) -> str:
             parts.append(f"{cm} {noun}".strip())
         else:
             parts.append(noun)
+
     if qual and (not brand or qual.lower() not in brand.lower()):
         parts.append(qual)
 
@@ -296,7 +320,6 @@ def assemble_title_from_fields(d: dict) -> str:
     title = " ".join(p for p in parts if p)
     if not title.strip():
         title = " ".join([x for x in [color, material, descr or noun] if x])
-
     return tidy_title(_title_case_keep_units(title), 70)
 
 def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
@@ -319,26 +342,61 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
                 {"type":"image_url","image_url":{"url":img_url}}
             ]}
         ],
-        "temperature": 0.1,
-        "max_tokens": 64
+        "temperature": 0.1, "max_tokens": 64
     }
     try:
-        debug_log("OpenAI Fallback Payload", payload)
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         txt=(resp.choices[0].message.content or "").strip()
         return tidy_title(txt,max_chars) if txt else ""
-    except Exception as e:
-        debug_log("OpenAI Fallback Exception", {"error": str(e), "type": type(e).__name__})
+    except Exception:
         return ""
 
+# === Vision strategy: try direct URL first, then data-URL ===
+_HOTLINK_DOMAINS_PREFER_DIRECT = {"bashawat.com.sa"}
+
+def _try_openai_direct(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
+    if not openai_active or not img_url: return ""
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "Extract concise, accurate product fields from the image."},
+            {"role": "user", "content": [
+                {"type": "text", "text": STRUCT_PROMPT_JSON},
+                {"type": "image_url", "image_url": {"url": img_url}}
+            ]}
+        ],
+        "temperature": 0.1, "max_tokens": 220,
+    }
+    try:
+        resp = openai_client.chat.completions.create(**payload)
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m: return ""
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return ""
+    title = assemble_title_from_fields(data)
+    return tidy_title(title, max_chars) if title else ""
+
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    """Always upload image as data URL first to avoid invalid_image_url from remote hosts."""
-    if not openai_active or not img_url:
-        return ""
-    data_url = _to_data_url_from_http(img_url)
-    if not data_url:
-        debug_log("Vision download failed", {"sku": sku, "source_url": img_url})
-        return ""
+    u = clean_url_for_vision(img_url)
+    if not u: return ""
+    host = urlsplit(u).netloc.lower()
+
+    if host in _HOTLINK_DOMAINS_PREFER_DIRECT:
+        t = _try_openai_direct(u, max_chars, sku)
+        if t: return t
+
+    # Try everyone direct first
+    t = _try_openai_direct(u, max_chars, sku)
+    if t: return t
+
+    # Fallback: fetch bytes and send as data URL
+    data_url = _to_data_url_from_http(u)
+    if not data_url: return ""
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -348,38 +406,30 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
                 {"type": "image_url", "image_url": {"url": data_url}}
             ]}
         ],
-        "temperature": 0.1,
-        "max_tokens": 220,
+        "temperature": 0.1, "max_tokens": 220,
     }
     try:
-        debug_log("OpenAI Vision Payload (data-url)", {"sku": sku, "url_kind": "data"})
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         raw=(resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        debug_log("OpenAI Vision Exception (data-url)", {"sku": sku, "error": str(e)})
+    except Exception:
         return ""
-
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return _fallback_simple_title_url(data_url, max_chars)
-
     try:
         data = json.loads(m.group(0))
     except Exception:
         return _fallback_simple_title_url(data_url, max_chars)
-
     obj = (data.get("object_type") or "").strip().lower()
     prod = (data.get("product") or "").strip().lower()
     if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
         return _fallback_simple_title_url(data_url, max_chars)
-
     title = assemble_title_from_fields(data)
     return tidy_title(title, max_chars) if title else _fallback_simple_title_url(data_url, max_chars)
 
 # ============== Translation (EN->AR) ==============
 def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
-    if not translator:
-        return list(texts)
+    if not translator: return list(texts)
     try:
         if context_hint:
             return [translator.translate_text(t, source_lang="EN", target_lang="AR", context=context_hint).text for t in texts]
@@ -389,21 +439,23 @@ def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
 
 def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     if not openai_active or not texts: return list(texts)
+    prompt = (
+        "Return exactly N lines. No extra lines. Translate each numbered line to Arabic. Keep order.\n"
+        f"N={len(texts)}\n\n" + "\n".join(f"{i+1}. {t}" for i,t in enumerate(texts))
+    )
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role":"system","content":"Translate e-commerce product titles into natural, concise Arabic."},
-            {"role":"user","content":"Translate each of these lines to Arabic, one per line:\n\n" + "\n".join(texts)}
+            {"role":"user","content": prompt}
         ],
         "temperature": 0
     }
     try:
-        debug_log("OpenAI Translate Payload", payload)
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
-        lines=(resp.choices[0].message.content or "").splitlines()
-        return [l.strip() for l in lines if l.strip()] or texts
-    except Exception as e:
-        debug_log("OpenAI Translate Exception", {"error": str(e), "type": type(e).__name__})
+        lines=[re.sub(r"^\d+\.\s*","",l).strip() for l in (resp.choices[0].message.content or "").splitlines() if l.strip()]
+        return lines if len(lines)==len(texts) else texts
+    except Exception:
         return texts
 
 def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_glossary=False, glossary_map:Optional[Dict[str,str]]=None, context_hint:str="")->pd.Series:
@@ -428,17 +480,13 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
 
 # ============== NEW: Rewrite Arabic -> clean Arabic -> English ==============
 AR_REWRITE_PROMPT = """
-أنت محرر عناوين تجارة إلكترونية ثنائي اللغة.
-أعد كتابة العنوان العربي بصيغة متجر احترافية مختصرة بالترتيب:
+أنت محرر عناوين تجارة إلكترونية ثنائي اللغة. أعد كتابة العنوان العربي بصيغة متجر احترافية مختصرة بالترتيب:
 العلامة التجارية، نوع المنتج، المتغيّر/الرائحة/الطعم، المادة، الحجم/العدد.
 ثم ترجم الناتج إلى الإنجليزية بصيغة تجارة إلكترونية مكافئة.
-أعد السطر بصيغة JSON على سطر واحد فقط بهذه المفاتيح:
-{"arabic": string, "english": string}
-من دون أي شرح إضافي.
+أعد السطر بصيغة JSON على سطر واحد فقط بهذه المفاتيح: {"arabic": string, "english": string} من دون أي شرح إضافي.
 """
 
 def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
-    """Returns (arabic_clean, english_title) or ("","") on failure."""
     if not openai_active or not ar_title: return "",""
     payload = {
         "model": "gpt-4o-mini",
@@ -452,7 +500,6 @@ def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
         "temperature": 0
     }
     try:
-        debug_log("OpenAI AR Rewrite Payload", payload)
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         raw=(resp.choices[0].message.content or "").strip()
         m=re.search(r"\{.*\}", raw, re.S)
@@ -461,21 +508,17 @@ def openai_rewrite_ar_to_en_one(ar_title: str) -> Tuple[str, str]:
         ar_clean=(data.get("arabic") or "").strip()
         en_clean=(data.get("english") or "").strip()
         return ar_clean, tidy_title(en_clean, 70)
-    except Exception as e:
-        debug_log("OpenAI AR Rewrite Exception", {"error": str(e), "type": type(e).__name__})
+    except Exception:
         return "",""
 
 def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[int,int,int]:
-    """Process rows by indices: rewrite Arabic then English. Returns (updated, skipped, failed)."""
     updated=skipped=failed=0
     for s in range(0, len(idx), max(1,batch_cap)):
         chunk=idx[s:s+batch_cap]
         for i in chunk:
             sku=str(work.at[i,"merchant_sku"])
             ar_raw=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
-            if not ar_raw:
-                skipped+=1
-                continue
+            if not ar_raw: skipped+=1; continue
             ar_new, en_new = openai_rewrite_ar_to_en_one(ar_raw)
             if ar_new or en_new:
                 if ar_new: work.at[i,"name_ar"]=ar_new
@@ -487,13 +530,14 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
                     st.session_state.audit_rows.append({"sku":sku,"phase":"AR rewrite→EN","reason":"rewrite_failed","url":str(work.at[i,"thumbnail"])})
                 except Exception:
                     pass
-        time.sleep(0.05)
+            time.sleep(0.05)
     return updated, skipped, failed
 
 # ============== Mapping lookups ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
-        if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
+        if c in map_df.columns:
+            map_df[c]=map_df[c].astype(str).str.strip()
     main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
     pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
     sub_no={(r["category_id"],r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
@@ -503,36 +547,43 @@ def build_mapping_struct_fixed(map_df: pd.DataFrame):
             "pair_to_subsubnames": pair_to_subsub,
             "sub_name_to_no_by_main": sub_no,
             "ssub_name_to_no_by_main_sub": ssub_no}
-def get_sub_no(lookups, main, sub): return lookups["sub_name_to_no_by_main"].get((main,sub),"")
-def get_ssub_no(lookups, main, sub, ssub): return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
+
+def get_sub_no(lookups, main, sub):
+    return lookups["sub_name_to_no_by_main"].get((main,sub),"")
+
+def get_ssub_no(lookups, main, sub, ssub):
+    return lookups["ssub_name_to_no_by_main_sub"].get((main,sub,ssub),"")
 
 # ============== Downloads ==============
 def to_excel_download(df, sheet_name="Products"):
     buf=io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name=sheet_name)
     buf.seek(0); return buf
 
 # ============== Uploads ==============
 c1,c2=st.columns(2)
-with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
-with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
+with c1:
+    product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
+with c2:
+    mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
+
 prod_df = read_any_table(product_file) if product_file else None
-map_df  = read_any_table(mapping_file) if mapping_file else None
+map_df = read_any_table(mapping_file) if mapping_file else None
 
 # Persist once loaded to survive reruns
 if prod_df is not None:
     st.session_state["prod_df_cached"] = prod_df.copy()
 if map_df is not None:
     st.session_state["map_df_cached"] = map_df.copy()
+
 prod_df = prod_df if prod_df is not None else st.session_state.get("prod_df_cached")
-map_df  = map_df  if map_df  is not None else st.session_state.get("map_df_cached")
+map_df = map_df if map_df is not None else st.session_state.get("map_df_cached")
 
 # Validate; require both to proceed
 loaded_ok = (
-    isinstance(prod_df, pd.DataFrame) and
-    validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List") and
-    isinstance(map_df, pd.DataFrame) and
-    validate_columns(map_df, ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"], "Category Mapping")
+    isinstance(prod_df, pd.DataFrame) and validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List") and
+    isinstance(map_df, pd.DataFrame) and validate_columns(map_df, ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"], "Category Mapping")
 )
 if not loaded_ok:
     st.info("Upload both files to proceed.")
@@ -580,7 +631,7 @@ def mapped_mask_fn(df: pd.DataFrame) -> pd.Series:
 def unmapped_mask_fn(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty or "sub_category_id" not in df or "sub_sub_category_id" not in df:
         return pd.Series([], dtype=bool)
-    sub_ok  = is_nonempty_series(df["sub_category_id"].fillna(""))
+    sub_ok = is_nonempty_series(df["sub_category_id"].fillna(""))
     ssub_ok = is_nonempty_series(df["sub_sub_category_id"].fillna(""))
     return ~(sub_ok & ssub_ok)
 
@@ -600,6 +651,7 @@ def sec_overview():
     with k2: st.metric("Mapped", mapped, f"{round(mapped*100/total,1) if total else 0}%")
     with k3: st.metric("EN titled", en_ok, f"-{total-en_ok} missing")
     with k4: st.metric("AR titled", ar_ok, f"-{total-ar_ok} missing")
+
     cA,cB=st.columns(2)
     with cA:
         st.markdown("**Mapped vs Unmapped**")
@@ -613,16 +665,15 @@ def sec_overview():
             st.bar_chart(pd.DataFrame({"count":[total-en_ok, total-ar_ok]}, index=["Missing EN","Missing AR"]))
         else:
             st.info("No data loaded.")
+
     st.markdown("**Top tokens in Unmapped**")
     if total:
         unm=work[~mm].copy(); counts=Counter()
         for _,r in unm.iterrows():
             counts.update(tokenize(r.get("name",""))); counts.update(tokenize(r.get("name_ar","")))
         top=pd.DataFrame(counts.most_common(12), columns=["token","count"])
-        if len(top)>0:
-            st.dataframe(top, width="stretch", height=260)
-        else:
-            st.caption("No tokens.")
+        if len(top)>0: st.dataframe(top, width="stretch", height=260)
+        else: st.caption("No tokens.")
     else:
         st.caption("No tokens.")
 
@@ -631,35 +682,48 @@ def sec_filter():
     if work is None or work.empty:
         st.info("No data loaded. Upload your product file first.")
         return
-    q=st.text_input("Search", value=st.session_state["search_q"], placeholder="e.g., dishwashing / صابون / SKU123")
+    q = st.text_input("Search", value=st.session_state.get("search_q",""), placeholder="e.g., dishwashing / صابون / SKU123")
     st.session_state["search_q"]=q
     with st.expander("Advanced", expanded=False):
         f1,f2,f3=st.columns(3)
-        with f1: fields=st.multiselect("Fields", ["name","name_ar","merchant_sku","thumbnail"], default=["name","name_ar"])
-        with f2: mode=st.selectbox("Mode", ["OR","AND"])
-        with f3: whole=st.checkbox("Whole word", value=False)
+        with f1:
+            fields=st.multiselect("Fields", ["name","name_ar","merchant_sku","thumbnail"], default=["name","name_ar"])
+        with f2:
+            mode=st.selectbox("Mode", ["OR","AND"])
+        with f3:
+            whole=st.checkbox("Whole word", value=False)
     c1,c2=st.columns(2)
-    with c1: show_unmapped=st.checkbox("Unmapped only", value=False)
+    with c1:
+        show_unmapped=st.checkbox("Unmapped only", value=False)
     with c2:
-        if st.button("Clear"): st.session_state["search_q"]=""; show_unmapped=False
+        if st.button("Clear"):
+            st.session_state["search_q"]=""; show_unmapped=False
+
     def mask(df):
-        if not q.strip(): base=pd.Series(True,index=df.index)
+        if not q.strip():
+            base=pd.Series(True,index=df.index)
         else:
             terms=[t for t in re.split(r"\s+", q.strip()) if t]; parts=[]
             for t in terms:
                 if whole:
-                    pat=rf"(?:^|\\b){re.escape(t)}(?:\\b|$)"; m=pd.Series(False,index=df.index)
+                    pat=rf"(?:^|\\b){re.escape(t)}(?:\\b|$)"
+                    m=pd.Series(False,index=df.index)
                     for f in fields:
-                        if f in df.columns: m|=df[f].astype(str).str.contains(pat, case=False, regex=True, na=False)
+                        if f in df.columns:
+                            m|=df[f].astype(str).str.contains(pat, case=False, regex=True, na=False)
                 else:
                     m=pd.Series(False,index=df.index)
                     for f in fields:
-                        if f in df.columns: m|=df[f].astype(str).str.contains(t, case=False, na=False)
+                        if f in df.columns:
+                            m|=df[f].astype(str).str.contains(t, case=False, na=False)
                 parts.append(m)
             base=parts[0] if parts else pd.Series(True,index=df.index)
-            for p in parts[1:]: base=(base&p) if mode=="AND" else (base|p)
-        if show_unmapped: base=base & unmapped_mask_fn(df)
+            for p in parts[1:]:
+                base=(base&p) if mode=="AND" else (base|p)
+        if show_unmapped:
+            base=base & unmapped_mask_fn(df)
         return base
+
     filtered=work[mask(work)].copy()
     st.caption(f"{filtered.shape[0]} rows")
     st.dataframe(
@@ -669,7 +733,6 @@ def sec_filter():
 
 def sec_titles():
     st.subheader("Titles & Translate")
-
     if work is None or work.empty:
         st.info("No data loaded. Upload your product file first.")
         return
@@ -692,7 +755,7 @@ def sec_titles():
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
     with b3: ar_rewrite_batch=st.number_input("Batch (AR rewrite→EN)",10,300,100,10)
 
-    # Preview 24 images (browser fetch)
+    # Preview 24 images
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base_df.head(24)
@@ -706,7 +769,7 @@ def sec_titles():
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Workers (URL→dataURL→OpenAI) ----------
+    # ---------- Workers ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -716,7 +779,6 @@ def sec_titles():
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int]:
         updated=skipped=failed=0
         store = global_cache().setdefault(st.session_state.file_hash, {})
-
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
             for i in chunk:
@@ -753,11 +815,13 @@ def sec_titles():
         for i in idx:
             sku=str(work.at[i,"merchant_sku"])
             cache_local = st.session_state.proc_cache.get(sku,{})
+
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
+
             if not force_over and store.get(sku, {}).get("ar"):
                 work.at[i,"name_ar"]=store[sku]["ar"]; st.session_state.proc_cache.setdefault(sku,{})["name_ar"]=store[sku]["ar"]; continue
             if not force_over and cache_local.get("name_ar"):
@@ -775,7 +839,8 @@ def sec_titles():
         updated=failed=0
         for s in range(0, len(texts), trans_batch):
             chunk = texts[s:s+trans_batch]
-            outs = translate_en_titles(pd.Series(chunk), engine, trans_batch, use_glossary=USE_GLOSSARY, glossary_map=glossary_map, context_hint=CONTEXT_HINT).tolist()
+            outs = translate_en_titles(pd.Series(chunk), engine, trans_batch, use_glossary=USE_GLOSSARY,
+                                       glossary_map=glossary_map, context_hint=CONTEXT_HINT).tolist()
             for j, _ in enumerate(chunk):
                 i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
                 if ar:
@@ -803,18 +868,19 @@ def sec_titles():
             en_up=en_skip=en_fail=ar_up=ar_fail=0
             st.caption("Job panel"); c_total,c_done,c_en,c_ar,c_batch=st.columns(5)
             c_total.metric("Rows in scope", total); done_ph=c_done.empty(); en_ph=c_en.empty(); ar_ph=c_ar.empty(); batch_ph=c_batch.empty()
+
             def upd(done, enu, enk, enf, aru, arf, b, tb):
                 done_ph.metric("Rows processed", done)
                 en_ph.metric("EN titles", f"✔ {enu}", f"skip {enk} / fail {enf}")
                 ar_ph.metric("AR translated", f"✔ {aru}", f"fail {arf}")
                 batch_ph.metric("Batch", f"{b}/{tb}")
+
             total_batches=math.ceil(total/fetch_batch); bno=0
             for s in range(0,total,fetch_batch):
                 bno+=1; batch_idx=idx_all[s:s+fetch_batch]
                 u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up+=u; en_skip+=k; en_fail+=f
                 u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up+=u2; ar_fail+=f2
-                done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,ar_up,ar_fail,bno,total_batches)
-                time.sleep(0.15)
+                done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,ar_up,ar_fail,bno,total_batches); time.sleep(0.15)
             st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
     # === Optional targeted runners ===
@@ -847,20 +913,19 @@ def sec_titles():
                     chunk=ids[s:s+ar_rewrite_batch]
                     u,k,f = rewrite_ar_then_en_indices(chunk, ar_rewrite_batch)
                     up+=u; sk+=k; fl+=f
-                    done=s+len(chunk)
-                    bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows")
+                    done=s+len(chunk); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows")
                 st.success(f"Arabic rewrite → updated {up}, skipped {sk}, failed {fl}")
 
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
-        st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv")
+        st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"), file_name="audit_log.csv", mime="text/csv")
 
 def sec_grouping():
     st.subheader("Grouping")
     if work is None or work.empty:
         st.info("No data loaded. Upload your product file first.")
         return
+
     left,right=st.columns([1,2])
     with left:
         st.markdown("**Keyword Library**")
@@ -872,30 +937,34 @@ def sec_grouping():
                 st.session_state.keyword_library.extend([k for k in fresh if k not in exist])
                 st.session_state.keyword_library=list(dict.fromkeys(st.session_state.keyword_library))
                 st.success(f"Added {len(fresh)}")
-            else: st.info("Nothing to add.")
+            else:
+                st.info("Nothing to add.")
         rm=st.multiselect("Remove", options=st.session_state.keyword_library)
         if st.button("🗑️ Remove selected"):
             s=set(rm); st.session_state.keyword_library=[k for k in st.session_state.keyword_library if k not in s]
             st.success(f"Removed {len(s)}")
+
     with right:
         st.markdown("**Select keywords/tokens to map**")
         base_df=work[unmapped_mask_fn(work)]
         if base_df is None or base_df.empty:
-            st.info("No unmapped rows to group.")
-            return
+            st.info("No unmapped rows to group."); return
         tok=Counter()
         for _,r in base_df.iterrows():
             tok.update(tokenize(r.get("name",""))); tok.update(tokenize(r.get("name_ar","")))
         auto=[t for t,c in tok.most_common() if c>=3][:60]
+
         def hits(df,term):
             tl=term.lower()
             m=df["name"].astype(str).str.lower().str.contains(tl,na=False) | df["name_ar"].astype(str).str.lower().str.contains(tl,na=False)
             return int(m.sum())
+
         opts=[]; keymap={}
         for kw in st.session_state.keyword_library:
             disp=f"{kw} ({hits(base_df,kw)}) [Saved]"; opts.append(disp); keymap[disp]=kw
         for t in auto:
             disp=f"{t} ({hits(base_df,t)}) [Auto]"; opts.append(disp); keymap[disp]=t
+
         picked=st.multiselect("Pick", options=opts)
         if picked:
             mask=pd.Series(False,index=base_df.index)
@@ -909,15 +978,20 @@ def sec_grouping():
                 hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
                 width="stretch", height=260
             )
+
             skus=hits_df["merchant_sku"].astype(str).tolist()
             chosen=st.multiselect("Select SKUs", options=skus, default=skus)
+
             c1,c2,c3=st.columns(3)
             g_main=c1.selectbox("Main", [""]+lookups["main_names"])
             g_sub =c2.selectbox("Sub", [""]+lookups["main_to_subnames"].get(g_main,[]))
             g_ssub=c3.selectbox("Sub-Sub", [""]+lookups["pair_to_subsubnames"].get((g_main,g_sub),[]))
+
             if st.button("Apply mapping"):
-                if not chosen: st.info("No SKUs.")
-                elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
+                if not chosen:
+                    st.info("No SKUs.")
+                elif not (g_main and g_sub and g_ssub):
+                    st.warning("Pick all levels.")
                 else:
                     m=work["merchant_sku"].astype(str).isin(chosen)
                     work.loc[m,"category_id"]=g_main
@@ -932,20 +1006,25 @@ def sec_sheet():
     if work is None or work.empty:
         st.info("No data loaded. Upload your product file first.")
         return pd.DataFrame()
+
     view=st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True)
     base=work.copy(); mm=mapped_mask_fn(base)
     if view=="Mapped only": base=base[mm]
     elif view=="Unmapped only": base=base[~mm]
+
     st.session_state.page_size=st.number_input("Rows/page",50,5000,st.session_state.page_size,50)
     total=base.shape[0]; pages=max(1, math.ceil(total/st.session_state.page_size))
     st.session_state.page_num=st.number_input("Page",1,pages,min(st.session_state.page_num,pages),1)
     st.caption(f"{total} rows total")
+
     start=(st.session_state.page_num-1)*st.session_state.page_size; end=start+st.session_state.page_size
     page=base.iloc[start:end].copy()
+
     def style_map(row):
         sub_ok=str(row.get("sub_category_id","") or "").strip()!=""
         ssub_ok=str(row.get("sub_sub_category_id","") or "").strip()!=""
         return [("background-color: rgba(16,185,129,0.10)" if (sub_ok and ssub_ok) else "background-color: rgba(234,179,8,0.18)") for _ in row]
+
     term=st.session_state.get("search_q","").strip().lower()
     def hi(v):
         if not term: return ""
@@ -953,6 +1032,7 @@ def sec_sheet():
             if term in str(v).lower(): return "background-color: rgba(59,130,246,0.15)"
         except Exception: pass
         return ""
+
     if len(page)>0:
         try:
             if len(page) <= 3000:
@@ -962,7 +1042,8 @@ def sec_sheet():
                 st.dataframe(page, width="stretch", height=440)
         except Exception:
             st.dataframe(page, width="stretch", height=440)
-    else: st.info("No rows.")
+    else:
+        st.info("No rows.")
     return page
 
 def sec_downloads(page_df):
@@ -977,8 +1058,7 @@ def sec_downloads(page_df):
         st.error(f"View export failed: {e}")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
-        st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv")
+        st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"), file_name="audit_log.csv", mime="text/csv")
 
 def sec_settings():
     st.subheader("Settings & Diagnostics")
@@ -1005,13 +1085,22 @@ elif section=="🖼️ Titles & Translate":
 elif section=="🧩 Grouping":
     safe_section("Grouping", sec_grouping)
 elif section=="📑 Sheet":
-    _tmp = safe_section("Sheet", sec_sheet)
-    page_df = _tmp if isinstance(_tmp, pd.DataFrame) else work.copy()
+    _tmp = safe_section("Sheet", sec_sheet); page_df = _tmp if isinstance(_tmp, pd.DataFrame) else work.copy()
 elif section=="⬇️ Downloads":
-    try:
-        page_df
-    except NameError:
-        page_df = work.copy()
+    try: page_df
+    except NameError: page_df = work.copy()
     safe_section("Downloads", lambda: sec_downloads(page_df))
 else:
     safe_section("Settings", sec_settings)
+
+# ===== References (docs) =====
+# pandas Excel IO: https://pandas.pydata.org/pandas-docs/stable/user_guide/io.html#excel-files
+# Streamlit caching: https://docs.streamlit.io/develop/concepts/architecture/caching
+# OpenAI Chat Completions (image_url content): https://platform.openai.com/docs/api-reference/chat
+# DeepL API context parameter: https://developers.deepl.com/docs/resources/context
+# HTTP Referer header / hotlinking background: https://developer.mozilla.org/docs/Web/HTTP/Headers/Referer
+'''
+with open("/mnt/data/app_product_mapping_dashboard_fixed.py", "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+print("WROTE:/mnt/data/app_product_mapping_dashboard_fixed.py")
