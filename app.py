@@ -1,4 +1,4 @@
-import io, re, time, math, hashlib, json, sys, traceback, base64
+import io, re, time, math, hashlib, json, sys, traceback, base64, csv
 from typing import List, Iterable, Tuple, Optional, Dict
 from urllib.parse import urlsplit, urlunsplit, quote
 from collections import Counter
@@ -6,7 +6,6 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 import requests
-import csv
 
 # ================= PAGE =================
 st.set_page_config(page_title="Product Mapping Dashboard", page_icon="🧭", layout="wide")
@@ -50,18 +49,6 @@ except Exception:
     translator=None; deepl_active=False
 
 openai_client=None; openai_active=False
-
-def ui_sleep(seconds: float):
-    """Sleep without breaking on older Streamlit versions."""
-    try:
-        import streamlit as _st
-        if hasattr(_st, "sleep"):
-            _st.sleep(seconds)
-        else:
-            time.sleep(seconds)
-    except Exception:
-        time.sleep(seconds)
-
 try:
     from openai import OpenAI
     OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
@@ -75,6 +62,16 @@ except Exception:
 def global_cache() -> dict:
     # {file_hash: {sku: {"en": "...", "ar": "..."}}}
     return {}
+
+# ---------- sleep wrapper ----------
+def ui_sleep(seconds: float):
+    try:
+        if hasattr(st, "sleep"):
+            st.sleep(seconds)  # Streamlit >= 1.27
+        else:
+            time.sleep(seconds)
+    except Exception:
+        time.sleep(seconds)
 
 # ============== FILE IO ==============
 def read_any_table(uploaded_file):
@@ -140,35 +137,6 @@ def _normalize_url(u:str)->str:
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
 
-def _to_data_url_from_http(url: str, timeout: int = 20, max_bytes: int = 12_000_000) -> str:
-    """Download image and return as base64 data URL so OpenAI Vision can read it when it can't fetch the site."""
-    try:
-        u = clean_url_for_vision(url)
-        if not u: return ""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en",
-            "Referer": f"https://{urlsplit(u).netloc}",
-            "Cache-Control": "no-cache",
-        }
-        for _ in range(5):
-            r = requests.get(u, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
-            try:
-                r.raise_for_status()
-                data = r.content if r.content else r.raw.read(max_bytes + 1)
-                if data and len(data) <= max_bytes:
-                    mime = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
-                    if not mime or "/" not in mime: mime = "image/jpeg"
-                    b64 = base64.b64encode(data).decode("ascii")
-                    return f"data:{mime};base64,{b64}"
-            finally:
-                try: r.close()
-                except Exception: pass
-        return ""
-    except Exception:
-        return ""
-
 def clean_url_for_vision(raw: str) -> str:
     """Sanitize before sending to OpenAI Vision."""
     u = str(raw or "").strip().strip('"').strip("'")
@@ -176,13 +144,63 @@ def clean_url_for_vision(raw: str) -> str:
     u = _normalize_url(u)
     return u if is_valid_url(u) else ""
 
+def _http_fetch_image(url: str, timeout=(10, 20), max_bytes: int = 12_000_000):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://{urlsplit(url).netloc}",
+        "Cache-Control": "no-cache",
+    }
+    with requests.Session() as s:
+        s.headers.update(headers)
+        # HEAD first, tolerate failures
+        try:
+            h = s.head(url, timeout=timeout, allow_redirects=True)
+            clen = int(h.headers.get("Content-Length","0") or 0)
+            if clen > max_bytes: return None, None
+        except Exception:
+            pass
+        # GET
+        r = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        data = r.content if r.content else r.raw.read(max_bytes + 1)
+        if not data or len(data) > max_bytes:
+            return None, None
+        mime = (r.headers.get("Content-Type","") or "").split(";")[0].strip().lower()
+        if not mime or "/" not in mime or not mime.startswith("image/"):
+            # Guess from extension
+            path = urlsplit(r.url).path.lower()
+            if path.endswith(".jpg") or path.endswith(".jpeg"): mime="image/jpeg"
+            elif path.endswith(".png"): mime="image/png"
+            elif path.endswith(".webp"): mime="image/webp"
+            else: return None, None
+        return data, mime
+
+def _to_data_url_from_http(url: str, timeout: int = 20, max_bytes: int = 12_000_000) -> str:
+    """Download image and return as base64 data URL so OpenAI Vision can read it when host blocks cross-fetch."""
+    try:
+        u = clean_url_for_vision(url)
+        if not u: return ""
+        for _ in range(3):
+            try:
+                data, mime = _http_fetch_image(u, timeout=(timeout, timeout), max_bytes=max_bytes)
+                if data and mime:
+                    b64 = base64.b64encode(data).decode("ascii")
+                    return f"data:{mime};base64,{b64}"
+            except Exception:
+                pass
+        return ""
+    except Exception:
+        return ""
+
 # ---------- retry wrapper ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
         try: return fn()
         except Exception:
             if i == attempts - 1: raise
-            time.sleep(base * (2 ** i))
+            ui_sleep(base * (2 ** i))
 
 # ===== debug logger and safe section =====
 DEBUG = False  # will be set by sidebar
@@ -291,7 +309,6 @@ def assemble_title_from_fields(d: dict) -> str:
     parts=[]
     if brand: parts.append(brand)
     if noun:
-        # color/material leading for unbranded household items
         if not brand and (color or material) and noun not in {"deodorant","shampoo","chocolate","chocolate bar","soap","detergent"}:
             cm = " ".join([x for x in [color, material] if x])
             parts.append(f"{cm} {noun}".strip())
@@ -312,8 +329,8 @@ def assemble_title_from_fields(d: dict) -> str:
 
     return tidy_title(_title_case_keep_units(title), 70)
 
-def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
-    if not openai_active or not img_url: return ""
+def _fallback_simple_title_url(img_ref: str, max_chars: int) -> str:
+    if not openai_active or not img_ref: return ""
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -323,13 +340,9 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
                     "Write ONE clean English product title ≤70 chars.\n"
                     "Order: Brand, Product type, Variant/Flavor/Scent, Material, Size/Count.\n"
                     "If brand or size are NOT visible, write a sensible descriptive item name using color/material if clear.\n"
-                    "No marketing words. Examples:\n"
-                    "- Axe Deodorant Active 150 ml\n"
-                    "- Cadbury Milk Chocolate Caramel 90 g\n"
-                    "- Green Ceramic Soap Holder\n"
-                    "- Olive Oil Dispenser\n"
+                    "No marketing words."
                 )},
-                {"type":"image_url","image_url":{"url":img_url}}
+                {"type":"image_url","image_url":{"url":img_ref}}
             ]}
         ],
         "temperature": 0.1,
@@ -345,11 +358,13 @@ def _fallback_simple_title_url(img_url: str, max_chars: int) -> str:
         return ""
 
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    """Always upload image as data URL first to avoid invalid_image_url from remote hosts."""
+    """Prefer data URL. If download blocked, fall back to passing the original URL to the model."""
     if not openai_active or not img_url:
         return ""
-    data_url = _to_data_url_from_http(img_url)
-    if not data_url:
+    norm = clean_url_for_vision(img_url)
+    data_url = _to_data_url_from_http(norm)
+    use_ref = data_url or norm
+    if not use_ref:
         debug_log("Vision download failed", {"sku": sku, "source_url": img_url})
         return ""
     payload = {
@@ -358,36 +373,36 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
             {"role": "system", "content": "Extract concise, accurate product fields from the image."},
             {"role": "user", "content": [
                 {"type": "text", "text": STRUCT_PROMPT_JSON},
-                {"type": "image_url", "image_url": {"url": data_url}}
+                {"type": "image_url", "image_url": {"url": use_ref}}
             ]}
         ],
         "temperature": 0.1,
         "max_tokens": 220,
     }
     try:
-        debug_log("OpenAI Vision Payload (data-url)", {"sku": sku, "url_kind": "data"})
+        debug_log("OpenAI Vision Payload", {"sku": sku, "url_kind": "data" if use_ref.startswith("data:") else "http"})
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
         raw=(resp.choices[0].message.content or "").strip()
     except Exception as e:
-        debug_log("OpenAI Vision Exception (data-url)", {"sku": sku, "error": str(e)})
-        return ""
+        debug_log("OpenAI Vision Exception", {"sku": sku, "error": str(e)})
+        return _fallback_simple_title_url(use_ref, max_chars)
 
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
-        return _fallback_simple_title_url(data_url, max_chars)
+        return _fallback_simple_title_url(use_ref, max_chars)
 
     try:
         data = json.loads(m.group(0))
     except Exception:
-        return _fallback_simple_title_url(data_url, max_chars)
+        return _fallback_simple_title_url(use_ref, max_chars)
 
     obj = (data.get("object_type") or "").strip().lower()
     prod = (data.get("product") or "").strip().lower()
     if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
-        return _fallback_simple_title_url(data_url, max_chars)
+        return _fallback_simple_title_url(use_ref, max_chars)
 
     title = assemble_title_from_fields(data)
-    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(data_url, max_chars)
+    return tidy_title(title, max_chars) if title else _fallback_simple_title_url(use_ref, max_chars)
 
 # ============== Translation (EN->AR) ==============
 def deepl_batch_en2ar(texts: List[str], context_hint: str = "") -> List[str]:
@@ -512,24 +527,11 @@ def rewrite_ar_then_en_indices(idx: List[int], batch_cap: int = 100) -> Tuple[in
 # ============== Mapping lookups ==============
 def build_mapping_struct_fixed(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
-        if c in map_df.columns:
-            map_df[c]=map_df[c].astype(str).str.strip()
-    try:
-        dup1 = map_df.duplicated(subset=["category_id","sub_category_id"], keep=False)
-        d1_cnt = int(dup1.sum())
-        if d1_cnt:
-            st.warning(f"Mapping sheet has {d1_cnt} duplicate rows for (category_id, sub_category_id). Keeping first occurrence.")
-        dup2 = map_df.duplicated(subset=["category_id","sub_category_id","sub_sub_category_id"], keep=False)
-        d2_cnt = int(dup2.sum())
-        if d2_cnt:
-            st.warning(f"Mapping sheet has {d2_cnt} duplicate rows for (category_id, sub_category_id, sub_sub_category_id). Keeping first occurrence.")
-        map_df = map_df.drop_duplicates(subset=["category_id","sub_category_id","sub_sub_category_id"], keep="first")
-    except Exception:
-        pass
+        if c in map_df.columns: map_df[c]=map_df[c].astype(str).str.strip()
     main_to_sub={str(mc): sorted(g["sub_category_id"].dropna().unique().tolist()) for mc,g in map_df.groupby("category_id",dropna=True)}
     pair_to_subsub={(str(mc),str(sc)): sorted(g["sub_sub_category_id"].dropna().unique().tolist()) for (mc,sc),g in map_df.groupby(["category_id","sub_category_id"],dropna=True)}
-    sub_no={(r["category_id"],r["sub_category_id"]): r.get("sub_category_id NO","") for _,r in map_df.iterrows()}
-    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r.get("sub_sub_category_id NO","") for _,r in map_df.iterrows()}
+    sub_no={(r["category_id"],r["sub_category_id"]): r["sub_category_id NO"] for _,r in map_df.iterrows()}
+    ssub_no={(r["category_id"],r["sub_category_id"],r["sub_sub_category_id"]): r["sub_sub_category_id NO"] for _,r in map_df.iterrows()}
     return {"main_names": sorted(map_df["category_id"].dropna().unique().tolist()),
             "main_to_subnames": main_to_sub,
             "pair_to_subsubnames": pair_to_subsub,
@@ -797,20 +799,13 @@ def sec_titles():
             if force_over or not cur_ar:
                 ids.append(i); texts.append(en)
 
+        # robust glossary parse
         glossary_map = {}
-        raw_csv = (GLOSSARY_CSV or "")
-        try:
-            f = io.StringIO(raw_csv)
-            reader = csv.reader(f)
-            for row in reader:
-                if not row or len(row) < 2:
-                    continue
-                src = (row[0] or "").lstrip('\ufeff').strip()
-                tgt = (row[1] or "").strip()
-                if src and tgt:
-                    glossary_map[src] = tgt
-        except Exception:
-            pass
+        for row in csv.reader((GLOSSARY_CSV or "").splitlines()):
+            if not row: continue
+            src = (row[0] if len(row)>0 else "").strip()
+            tgt = (row[1] if len(row)>1 else "").strip()
+            if src and tgt: glossary_map[src]=tgt
 
         updated=failed=0
         for s in range(0, len(texts), trans_batch):
@@ -826,7 +821,8 @@ def sec_titles():
                     updated += 1
                 else:
                     failed += 1
-                    st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])})
+                    st.session_state.audit_rows.append({"sku":str(work.at[i,"merchant_sku"]),"phase":"AR translate","reason":"empty output","url":str(work.at[i,"thumbnail"])}
+                    )
         return updated, failed
 
     # === FULL AUTOMATIC BATCHED PIPELINE (image→EN, then EN→AR) ===
@@ -854,7 +850,7 @@ def sec_titles():
                 u,k,f = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up+=u; en_skip+=k; en_fail+=f
                 u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up+=u2; ar_fail+=f2
                 done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,ar_up,ar_fail,bno,total_batches)
-                ui_sleep(0.15)
+                ui_sleep(0.1)
             st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
     # === Optional targeted runners ===
@@ -894,7 +890,7 @@ def sec_titles():
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv")
+                           file_name="audit_log.csv", mime="text/csv", key="audit_download_titles_v3")
 
 def sec_grouping():
     st.subheader("Grouping")
@@ -1008,17 +1004,17 @@ def sec_sheet():
 def sec_downloads(page_df):
     st.subheader("Downloads")
     try:
-        st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx")
+        st.download_button("⬇️ Full Excel", to_excel_download(work), file_name="products_mapped.xlsx", key="dl_full_v3")
     except Exception as e:
         st.error(f"Full export failed: {e}")
     try:
-        st.download_button("⬇️ Current view Excel", to_excel_download(page_df if isinstance(page_df, pd.DataFrame) else work), file_name="products_view.xlsx")
+        st.download_button("⬇️ Current view Excel", to_excel_download(page_df if isinstance(page_df, pd.DataFrame) else work), file_name="products_view.xlsx", key="dl_view_v3")
     except Exception as e:
         st.error(f"View export failed: {e}")
     if st.session_state.audit_rows:
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv")
+                           file_name="audit_log.csv", mime="text/csv", key="dl_audit_v3")
 
 def sec_settings():
     st.subheader("Settings & Diagnostics")
