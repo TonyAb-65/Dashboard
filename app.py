@@ -18,7 +18,7 @@ st.set_option("client.showErrorDetails", True)
 EMERALD = "#10b981"; EMERALD_DARK = "#059669"; TEXT_LIGHT = "#f8fafc"
 st.markdown(f"""
 <style>
-.app-header {{{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
+.app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
 .app-title {{ font-size:22px; font-weight:800; color:#111827; }}
 .app-sub {{ color:#6b7280; font-size:12px; }}
 [data-testid="stSidebar"] > div:first-child {{ background:linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color:{TEXT_LIGHT}; }}
