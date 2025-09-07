@@ -1,5 +1,5 @@
-# app.py — Product Mapping Dashboard v3.2 (hardened)
-# Keeps your original UI. Fixes: image→dataURL pipeline, section isolation, stable downloads.
+# Product Mapping Dashboard — master (image-dataURL ready)
+# Uses `thumbnail_dataurl` when present so OpenAI Vision always sees images.
 
 import io, re, time, math, hashlib, json, sys, traceback, base64, random
 from typing import List, Iterable, Tuple, Optional, Dict
@@ -63,7 +63,6 @@ except Exception:
 # -------- Persistent cache across reruns --------
 @st.cache_resource
 def global_cache() -> dict:
-    # {file_hash: {sku: {"en": "...", "ar": "..."}}}
     return {}
 
 @st.cache_resource
@@ -152,7 +151,6 @@ def clean_url_for_vision(raw: str) -> str:
     return u if is_valid_url(u) else ""
 
 def _to_data_url_from_http(url: str, timeout: int = 20, max_bytes: int = 12_000_000) -> str:
-    """Download image and return as base64 data URL so OpenAI Vision can read it when it can't fetch the site."""
     try:
         u = clean_url_for_vision(url)
         if not u: return ""
@@ -175,7 +173,6 @@ def _to_data_url_from_http(url: str, timeout: int = 20, max_bytes: int = 12_000_
     except Exception:
         return ""
 
-# ---------- retry wrapper ----------
 def _retry(fn, attempts=4, base=0.5):
     for i in range(attempts):
         try: return fn()
@@ -183,15 +180,11 @@ def _retry(fn, attempts=4, base=0.5):
             if i == attempts - 1: raise
             ui_sleep(base * (2 ** i) + random.random()*0.2)
 
-# ===== debug logger and safe section =====
 DEBUG = False
-
 def debug_log(title: str, obj):
     if DEBUG:
-        try:
-            msg = json.dumps(obj, ensure_ascii=False, indent=2)
-        except Exception:
-            msg = str(obj)
+        try: msg = json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception: msg = str(obj)
         print(f"\n===== {title} =====\n{msg}\n", file=sys.stderr)
 
 def safe_section(label, fn):
@@ -203,7 +196,6 @@ def safe_section(label, fn):
         st.code(traceback.format_exc())
         return None
 
-# ===== Structured extraction prompt (Vision) =====
 STRUCT_PROMPT_JSON = """
 Look at the PHOTO and extract fields for an e-commerce title.
 Return EXACTLY ONE LINE of STRICT JSON with keys:
@@ -211,14 +203,10 @@ Return EXACTLY ONE LINE of STRICT JSON with keys:
 "flavor_scent":string|null,"material":string|null,"size_value":string|null,
 "size_unit":string|null,"count":string|null,"feature":string|null,"color":string|null,"descriptor":string|null}
 Rules:
-- object_type = visible item category in plain nouns (e.g., "deodorant", "chocolate bar", "soap holder").
-- PRIORITIZE what you SEE over printed text when they disagree. Ignore marketing taglines.
-- brand MUST be null if no brand is clearly visible on the pack/item.
+- object_type = visible item category in plain nouns.
+- PRIORITIZE what you SEE over printed text when they disagree.
+- brand MUST be null if no brand is clearly visible.
 - size_value numeric only; size_unit in ['ml','L','g','kg','pcs','tabs','caps'].
-- Use flavor_scent for scents/flavors only (e.g., "Active", "Caramel").
-- material is short (e.g., "ceramic", "glass", "stainless steel").
-- color is a basic color if clearly visible (e.g., "green", "black"), else null.
-- descriptor is a short generic noun phrase when brand or size is missing (e.g., "oil dispenser", "soap holder").
 - Output JSON only.
 """
 
@@ -249,7 +237,6 @@ with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=[
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-# Persist once loaded to survive reruns
 if prod_df is not None:
     st.session_state["prod_df_cached"] = prod_df.copy()
 if map_df is not None:
@@ -257,7 +244,6 @@ if map_df is not None:
 prod_df = prod_df if prod_df is not None else st.session_state.get("prod_df_cached")
 map_df  = map_df  if map_df  is not None else st.session_state.get("map_df_cached")
 
-# Validate; require both to proceed
 loaded_ok = (
     isinstance(prod_df, pd.DataFrame) and
     validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List") and
@@ -284,8 +270,7 @@ def mapped_mask_fn(df: pd.DataFrame) -> pd.Series:
     return df["sub_category_id"].fillna("").astype(str).str.strip().ne("") & df["sub_sub_category_id"].fillna("").astype(str).str.strip().ne("")
 
 def unmapped_mask_fn(df: pd.DataFrame) -> pd.Series:
-    mm = mapped_mask_fn(df)
-    return ~mm
+    return ~mapped_mask_fn(df)
 
 def build_lookups(map_df: pd.DataFrame):
     for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
@@ -350,18 +335,15 @@ def assemble_title_from_fields(d: dict) -> str:
         s = _s(v)
         m = re.search(r"\d+(?:\.\d+)?", s)
         return m.group(0) if m else ""
-
     brand=_s(d.get("brand")); object_type=_s(d.get("object_type")); product=_s(d.get("product"))
     variant=_s(d.get("variant")); flavor=_s(d.get("flavor_scent")); material=_s(d.get("material"))
     feature=_s(d.get("feature")); color=_s(d.get("color")); descr=_s(d.get("descriptor"))
     size_v=_num(d.get("size_value")); size_u=_s(d.get("size_unit")).lower(); count=_num(d.get("count"))
-
     unit=size_u
     if unit in ["milliliter","mls","ml."]: unit="ml"
     if unit in ["liter","litre","ltrs","ltr"]: unit="L"
     if unit in ["grams","gram","gr"]: unit="g"
     if unit in ["kilogram","kilo","kgs"]: unit="kg"
-
     noun = object_type or product or descr
     qual = variant or flavor or material or feature
     parts=[]
@@ -374,17 +356,14 @@ def assemble_title_from_fields(d: dict) -> str:
             parts.append(noun)
     if qual and (not brand or qual.lower() not in brand.lower()):
         parts.append(qual)
-
     size_str=""
     if size_v and unit: size_str=f"{size_v}{unit}"
     if count and not size_str: size_str=f"{count}pcs"
     elif count and size_str: size_str=f"{size_str} {count}pcs"
     if size_str: parts.append(size_str)
-
     title = " ".join(p for p in parts if p)
     if not title.strip():
         title = " ".join([x for x in [color, material, descr or noun] if x])
-
     return tidy_title(_title_case_keep_units(title), 70)
 
 def _fallback_simple_title_from_dataurl(data_url: str, max_chars: int) -> str:
@@ -394,12 +373,7 @@ def _fallback_simple_title_from_dataurl(data_url: str, max_chars: int) -> str:
         "messages": [
             {"role":"system","content":"You are a precise e-commerce title writer."},
             {"role":"user","content":[
-                {"type":"text","text":(
-                    "Write ONE clean English product title ≤70 chars.\n"
-                    "Order: Brand, Product type, Variant/Flavor/Scent, Material, Size/Count.\n"
-                    "If brand or size are NOT visible, write a sensible descriptive item name using color/material if clear.\n"
-                    "No marketing words."
-                )},
+                {"type":"text","text":"Write ONE clean English product title ≤70 chars. Order: Brand, Product type, Variant, Material, Size/Count. No marketing."},
                 {"type":"image_url","image_url":{"url":data_url}}
             ]}
         ],
@@ -414,12 +388,43 @@ def _fallback_simple_title_from_dataurl(data_url: str, max_chars: int) -> str:
         return ""
 
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
-    """Always upload image as data URL. Never pass remote URLs to OpenAI."""
     if not openai_active or not img_url: return ""
-    data_url = _to_data_url_from_http(img_url)
-    if not data_url:
-        st.session_state.audit_rows.append({"sku":sku or "", "phase":"EN title", "reason":"img_fetch_failed", "url":str(img_url)})
-        return ""
+    # Prefer data URL (already provided by Image Extractor). If not data URL, try to convert.
+    if img_url.startswith("data:"):
+        data_url = img_url
+    else:
+        # Try raw URL first, then fallback to data-URL
+        url = clean_url_for_vision(img_url)
+        def _call(image_url: str) -> str:
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "Extract concise, accurate product fields from the image."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": STRUCT_PROMPT_JSON},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 220,
+            }
+            resp=_retry(lambda: openai_client.chat.completions.create(**payload))
+            raw=(resp.choices[0].message.content or "").strip()
+            m = re.search(r"\{.*\}", raw, re.S)
+            if not m: return ""
+            data = json.loads(m.group(0))
+            title = assemble_title_from_fields(data)
+            return tidy_title(title, max_chars) if title else ""
+        if url:
+            try:
+                t=_call(url)
+                if t: return t
+            except Exception: pass
+        data_url = _to_data_url_from_http(url or img_url)
+        if not data_url:
+            st.session_state.audit_rows.append({"sku":sku or "", "phase":"EN title","reason":"no_fetchable_image","url": str(img_url)})
+            return ""
+    # Call with data URL
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -437,21 +442,17 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         raw=(resp.choices[0].message.content or "").strip()
     except Exception:
         return _fallback_simple_title_from_dataurl(data_url, max_chars)
-
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return _fallback_simple_title_from_dataurl(data_url, max_chars)
-
     try:
         data = json.loads(m.group(0))
     except Exception:
         return _fallback_simple_title_from_dataurl(data_url, max_chars)
-
     obj = (data.get("object_type") or "").strip().lower()
     prod = (data.get("product") or "").strip().lower()
-    if not (obj or prod) or prod in {"ml", "l", "g", "kg", "pcs", "tabs", "caps"}:
+    if not (obj or prod):
         return _fallback_simple_title_from_dataurl(data_url, max_chars)
-
     title = assemble_title_from_fields(data)
     return tidy_title(title, max_chars) if title else _fallback_simple_title_from_dataurl(data_url, max_chars)
 
@@ -489,7 +490,7 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
             t2=t
             for src,tgt in glossary_map.items():
                 if src and tgt:
-                    t2=re.sub(rf"(?i)\\b{re.escape(src)}\\b", tgt, t2)
+                    t2=re.sub(rf"(?i)\b{re.escape(src)}\b", tgt, t2)
             mapped.append(t2)
         texts=mapped
     if engine=="DeepL" and deepl_active:
@@ -502,14 +503,12 @@ def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_gl
         return pd.Series(out, index=titles_en.index)
     return pd.Series(texts, index=titles_en.index)
 
+# ===== Sections =====
 def sec_titles():
     st.subheader("Titles & Translate")
-
     if work is None or work.empty:
-        st.info("No data loaded. Upload your product file first.")
-        return
+        st.info("No data loaded."); return
 
-    # Controls
     c1,c2,c3,c4=st.columns(4)
     with c1: max_len=st.slider("Max EN length",50,90,70,5, key="mxlen")
     with c2: engine=st.selectbox("Arabic engine", ["DeepL","OpenAI","None"], key="areng")
@@ -522,24 +521,22 @@ def sec_titles():
     elif scope=="Missing EN": base_df=work[work["name"].fillna("").astype(str).str.strip().eq("")]
     else: base_df=work[work["name_ar"].fillna("").astype(str).str.strip().eq("")]
 
-    b1,b2,b3=st.columns(3)
+    b1,b2=st.columns(2)
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10, key="fetch_batch")
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10, key="trans_batch")
-    with b3: ar_rewrite_batch=st.number_input("Batch (AR rewrite→EN)",10,300,100,10, key="ar_rewrite_batch")
 
-    # Preview 24 images (browser fetch)
-    if st.button("Preview 24 images (no processing)", key="btn_preview_imgs_v32"):
+    if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base_df.head(24)
-        if "thumbnail" in view.columns and len(view) > 0:
+        if "thumbnail_dataurl" in view.columns:
             cols = gallery.columns(6)
             for j, (i, row) in enumerate(view.iterrows()):
-                url = clean_url_for_vision(str(row.get("thumbnail", "")))
+                src = str(row.get("thumbnail_dataurl", "")) or clean_url_for_vision(str(row.get("thumbnail","")))
                 with cols[j % 6]:
-                    if is_valid_url(url): st.image(url, caption=f"Row {i}", use_container_width=True)
-                    else: st.caption("Bad URL")
+                    if src.startswith("data:") or is_valid_url(src): st.image(src, caption=f"Row {i}", use_container_width=True)
+                    else: st.caption("Bad image")
         else:
-            st.info("No thumbnails found in current scope.")
+            st.info("No thumbnail_dataurl present in current scope.")
 
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
@@ -550,21 +547,24 @@ def sec_titles():
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int,int]:
         updated=skipped=failed=hard_fail_batches=0
         store = global_cache().setdefault(st.session_state.file_hash, {})
-        consecutive_bad=0
+        en_out = {}
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
-            en_out = {}
             for i in chunk:
                 sku = str(work.at[i,"merchant_sku"])
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
-                norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
+
+                # prefer data URL, else sanitized URL
+                raw_thumb = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+                data_col  = str(work.at[i,"thumbnail_dataurl"]) if "thumbnail_dataurl" in work.columns else ""
+                norm_url  = data_col if data_col.startswith("data:") else clean_url_for_vision(raw_thumb)
 
                 if not force_over and store.get(sku, {}).get("en"):
                     en_out[i] = store[sku]["en"]; skipped+=1; continue
                 if only_empty and cur_en and not force_over:
                     en_out[i] = cur_en; skipped+=1; continue
-                if not is_valid_url(norm_url):
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"url_invalid","url":norm_url}); failed+=1; continue
+                if not (data_col.startswith("data:") or is_valid_url(norm_url)):
+                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"no_image_source","url":raw_thumb}); failed+=1; continue
 
                 title = openai_title_from_url(norm_url, max_len, sku)
                 if title:
@@ -574,21 +574,9 @@ def sec_titles():
                     updated += 1
                 else:
                     failed += 1
-
-            if failed and updated == 0:
-                consecutive_bad += 1
-            else:
-                consecutive_bad = 0
-            if consecutive_bad >= 2:
-                hard_fail_batches += 1
-                st.warning("Halting EN title run due to repeated image fetch failures.")
-                break
-
-            # Apply batch results
             if en_out:
-                idxs=list(en_out.keys()); vals=[en_out[i] for i in idxs]
+                idxs=list(en_out.keys()); vals=[en_out[j] for j in idxs]
                 work.loc[idxs, "name"] = vals
-
             ui_sleep(0.1)
         return updated, skipped, failed, hard_fail_batches
 
@@ -631,70 +619,59 @@ def sec_titles():
             ui_sleep(0.05)
         return updated, failed
 
-    if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline_v32"):
+    if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
         idx_all = base_df.index.tolist()
         if not idx_all:
             st.info("No rows in scope.")
         else:
-            st.info(
-                f"Scope: {scope} • Batch(image→EN)={fetch_batch} • Batch(EN→AR)={trans_batch} • "
-                f"Only empty EN={'Yes' if only_empty else 'No'} • Force overwrite={'Yes' if force_over else 'No'}"
-            )
             total=len(idx_all); bar=st.progress(0.0, text="Starting…")
             en_up=en_skip=en_fail=en_halt=ar_up=ar_fail=0
-            st.caption("Job panel"); c_total,c_done,c_en,c_ar,c_batch=st.columns(5)
-            c_total.metric("Rows in scope", total); done_ph=c_done.empty(); en_ph=c_en.empty(); ar_ph=c_ar.empty(); batch_ph=c_batch.empty()
-            def upd(done, enu, enk, enf, enh, aru, arf, b, tb):
-                done_ph.metric("Rows processed", done)
-                en_ph.metric("EN titles", f"✔ {enu}", f"skip {enk} / fail {enf} / halt {enh}")
-                ar_ph.metric("AR translated", f"✔ {aru}", f"fail {arf}")
-                batch_ph.metric("Batch", f"{b}/{tb}")
             total_batches=math.ceil(total/fetch_batch); bno=0
             for s in range(0,total,fetch_batch):
                 bno+=1; batch_idx=idx_all[s:s+fetch_batch]
                 u,k,f,h = run_titles(batch_idx, fetch_batch, max_len, only_empty, force_over); en_up+=u; en_skip+=k; en_fail+=f; en_halt+=h
                 u2,f2 = run_trans(batch_idx, trans_batch, engine, force_over); ar_up+=u2; ar_fail+=f2
-                done=s+len(batch_idx); bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows"); upd(done,en_up,en_skip,en_fail,en_halt,ar_up,ar_fail,bno,total_batches)
-                if en_halt: break
+                done=s+len(batch_idx)
+                bar.progress(min(done/total,1.0), text=f"Processed {done}/{total} rows • Batch {bno}/{total_batches}")
                 ui_sleep(0.15)
-            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail}, halted {en_halt} | AR updated {ar_up}, failed {ar_fail}")
+            st.success(f"Done. EN updated {en_up}, skipped {en_skip}, failed {en_fail} | AR updated {ar_up}, failed {ar_fail}")
 
-    cA,cB,cC=st.columns(3)
+    cA,cB=st.columns(2)
     with cA:
-        if st.button("Run ONLY missing EN", key="btn_only_en_v32"):
+        if st.button("Run ONLY missing EN", key="btn_only_en"):
             ids=base_df[base_df["name"].fillna("").astype(str).str.strip().eq("")].index.tolist()
             if ids:
                 u,k,f,h = run_titles(ids, fetch_batch, max_len, only_empty, force_over)
-                st.success(f"EN → updated {u}, skipped {k}, failed {f}, halted {h}")
+                st.success(f"EN → updated {u}, skipped {k}, failed {f}")
             else:
                 st.info("No missing EN.")
     with cB:
-        if st.button("Run ONLY missing AR", key="btn_only_ar_v32"):
+        if st.button("Run ONLY missing AR", key="btn_only_ar"):
             ids=base_df[base_df["name_ar"].fillna("").astype(str).str.strip().eq("")].index.tolist()
             if ids:
                 u2,f2 = run_trans(ids, trans_batch, engine, force_over)
                 st.success(f"AR → updated {u2}, failed {f2}")
             else:
                 st.info("No missing AR.")
-    with cC:
-        st.info("AR rewrite → EN disabled in v3.2 to simplify failure surface.")
 
-    if st.session_state.audit_rows:
-        audit_df=pd.DataFrame(st.session_state.audit_rows)
-        st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv", key="audit_dl_v32")
+    # Data URL sanity check
+    if st.button("🔎 Check first 3 data URLs"):
+        rows = work.head(3)
+        for idx, r in rows.iterrows():
+            du = str(r.get("thumbnail_dataurl",""))
+            st.write({"row": int(idx), "has_dataurl": du.startswith("data:"), "len": len(du)})
+            if du.startswith("data:"):
+                st.image(du, caption=f"Row {idx}", use_container_width=True)
 
-# ===== Grouping =====
 def sec_grouping():
     st.subheader("Grouping")
     if work is None or work.empty:
-        st.info("No data loaded. Upload your product file first.")
-        return
+        st.info("No data loaded."); return
     left,right=st.columns([1,2])
     with left:
         st.markdown("**Keyword Library**")
-        new_kws=st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndishwashing\nlemon", key="kw_add_v32")
-        if st.button("➕ Add", key="kw_add_btn_v32"):
+        new_kws=st.text_area("Add keywords (one per line)", placeholder="soap\nshampoo\ndishwashing\nlemon", key="kw_add")
+        if st.button("➕ Add", key="kw_add_btn"):
             fresh=[k.strip() for k in new_kws.splitlines() if k.strip()]
             if fresh:
                 exist=set(st.session_state.keyword_library)
@@ -702,16 +679,15 @@ def sec_grouping():
                 st.session_state.keyword_library=list(dict.fromkeys(st.session_state.keyword_library))
                 st.success(f"Added {len(fresh)}")
             else: st.info("Nothing to add.")
-        rm=st.multiselect("Remove", options=st.session_state.keyword_library, key="kw_rm_sel_v32")
-        if st.button("🗑️ Remove selected", key="kw_rm_btn_v32"):
+        rm=st.multiselect("Remove", options=st.session_state.keyword_library, key="kw_rm_sel")
+        if st.button("🗑️ Remove selected", key="kw_rm_btn"):
             s=set(rm); st.session_state.keyword_library=[k for k in st.session_state.keyword_library if k not in s]
             st.success(f"Removed {len(s)}")
     with right:
         st.markdown("**Select keywords/tokens to map**")
         base_df=work[unmapped_mask_fn(work)]
         if base_df is None or base_df.empty:
-            st.info("No unmapped rows to group.")
-            return
+            st.info("No unmapped rows to group."); return
         tok=Counter()
         for _,r in base_df.iterrows():
             tok.update(tokenize(r.get("name",""))); tok.update(tokenize(r.get("name_ar","")))
@@ -725,7 +701,7 @@ def sec_grouping():
             disp=f"{kw} ({hits(base_df,kw)}) [Saved]"; opts.append(disp); keymap[disp]=kw
         for t in auto:
             disp=f"{t} ({hits(base_df,t)}) [Auto]"; opts.append(disp); keymap[disp]=t
-        picked=st.multiselect("Pick", options=opts, key="kw_pick_v32")
+        picked=st.multiselect("Pick", options=opts, key="kw_pick")
         if picked:
             mask=pd.Series(False,index=base_df.index)
             for d in picked:
@@ -739,12 +715,12 @@ def sec_grouping():
                 use_container_width=True, height=260
             )
             skus=hits_df["merchant_sku"].astype(str).tolist()
-            chosen=st.multiselect("Select SKUs", options=skus, default=skus, key="kw_skus_v32")
+            chosen=st.multiselect("Select SKUs", options=skus, default=skus, key="kw_skus")
             c1,c2,c3=st.columns(3)
-            g_main=c1.selectbox("Main", [""]+lookups["main_names"], key="g_main_v32")
-            g_sub =c2.selectbox("Sub", [""]+lookups["main_to_subnames"].get(g_main,[]), key="g_sub_v32")
-            g_ssub=c3.selectbox("Sub-Sub", [""]+lookups["pair_to_subsubnames"].get((g_main,g_sub),[]), key="g_ssub_v32")
-            if st.button("Apply mapping", key="apply_map_btn_v32"):
+            g_main=c1.selectbox("Main", [""]+lookups["main_names"], key="g_main")
+            g_sub =c2.selectbox("Sub", [""]+lookups["main_to_subnames"].get(g_main,[]), key="g_sub")
+            g_ssub=c3.selectbox("Sub-Sub", [""]+lookups["pair_to_subsubnames"].get((g_main,g_sub),[]), key="g_ssub")
+            if st.button("Apply mapping", key="apply_map_btn"):
                 if not chosen: st.info("No SKUs.")
                 elif not (g_main and g_sub and g_ssub): st.warning("Pick all levels.")
                 else:
@@ -756,19 +732,17 @@ def sec_grouping():
         else:
             st.info("Pick at least one keyword/token.")
 
-# ===== Sheet =====
 def sec_sheet():
     st.subheader("Sheet")
     if work is None or work.empty:
-        st.info("No data loaded. Upload your product file first.")
-        return pd.DataFrame()
-    view=st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True, key="sheet_filter_v32")
+        st.info("No data loaded."); return pd.DataFrame()
+    view=st.radio("Quick filter", ["All","Mapped only","Unmapped only"], horizontal=True, key="sheet_filter")
     base=work.copy(); mm=mapped_mask_fn(base)
     if view=="Mapped only": base=base[mm]
     elif view=="Unmapped only": base=base[~mm]
-    st.session_state.page_size=st.number_input("Rows/page",50,5000,st.session_state.page_size,50, key="rows_page_v32")
+    st.session_state.page_size=st.number_input("Rows/page",50,5000,st.session_state.page_size,50, key="rows_page")
     total=base.shape[0]; pages=max(1, math.ceil(total/st.session_state.page_size))
-    st.session_state.page_num=st.number_input("Page",1,pages,min(st.session_state.page_num,pages),1, key="page_no_v32")
+    st.session_state.page_num=st.number_input("Page",1,pages,min(st.session_state.page_num,pages),1, key="page_no")
     st.caption(f"{total} rows total")
     start=(st.session_state.page_num-1)*st.session_state.page_size; end=start+st.session_state.page_size
     page=base.iloc[start:end].copy()
@@ -776,7 +750,6 @@ def sec_sheet():
     st.session_state["page_df"] = page
     return page
 
-# ===== Downloads =====
 def to_excel_download(df, sheet_name="Products"):
     buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w: df.to_excel(w, index=False, sheet_name=sheet_name)
@@ -787,17 +760,17 @@ def sec_downloads():
     df_full = st.session_state.get("work", pd.DataFrame())
     df_view = st.session_state.get("page_df", df_full)
     try:
-        st.download_button("⬇️ Full Excel", to_excel_download(df_full), file_name="products_mapped.xlsx", key="dl_full_v32")
+        st.download_button("⬇️ Full Excel", to_excel_download(df_full), file_name="products_mapped.xlsx", key="dl_full")
     except Exception as e:
         st.error(f"Full export failed: {e}")
     try:
-        st.download_button("⬇️ Current view Excel", to_excel_download(df_view), file_name="products_view.xlsx", key="dl_view_v32")
+        st.download_button("⬇️ Current view Excel", to_excel_download(df_view), file_name="products_view.xlsx", key="dl_view")
     except Exception as e:
         st.error(f"View export failed: {e}")
     if st.session_state.get("audit_rows"):
         audit_df=pd.DataFrame(st.session_state.audit_rows)
         st.download_button("⬇️ Audit log (CSV)", data=audit_df.to_csv(index=False).encode("utf-8"),
-                           file_name="audit_log.csv", mime="text/csv", key="dl_audit_v32")
+                           file_name="audit_log.csv", mime="text/csv", key="dl_audit")
     else:
         st.caption("No audit rows yet.")
 
@@ -805,8 +778,7 @@ def sec_downloads():
 if section=="📊 Overview":
     safe_section("Overview", sec_overview)
 elif section=="🔎 Filter":
-    # reuse grouping list view for quick search with safe guards
-    safe_section("Filter", sec_grouping)
+    safe_section("Grouping (quick view)", sec_grouping)
 elif section=="🖼️ Titles & Translate":
     safe_section("Titles & Translate", sec_titles)
 elif section=="🧩 Grouping":
@@ -821,12 +793,12 @@ else:
     st.subheader("Settings & Diagnostics")
     c1,c2=st.columns(2)
     with c1:
-        if st.button("Show 10 sanitized thumbnail URLs", key="diag_urls_v32"):
+        if st.button("Show 10 sanitized thumbnail URLs", key="diag_urls"):
             sample=work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
             for u in sample:
                 norm=clean_url_for_vision(u); st.write({"raw":u,"sanitized":norm,"valid":is_valid_url(norm)})
     with c2:
-        if st.button("Clear per-file cache & audit", key="diag_clear_v32"):
+        if st.button("Clear per-file cache & audit", key="diag_clear"):
             st.session_state.proc_cache={}; st.session_state.audit_rows=[]
             store = global_cache()
             if st.session_state.file_hash in store: del store[st.session_state.file_hash]
