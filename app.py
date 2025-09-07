@@ -18,14 +18,14 @@ st.set_option("client.showErrorDetails", True)
 EMERALD = "#10b981"; EMERALD_DARK = "#059669"; TEXT_LIGHT = "#f8fafc"
 st.markdown(f"""
 <style>
-.app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
-.app-title {{ font-size:22px; font-weight:800; color:#111827; }}
-.app-sub {{ color:#6b7280; font-size:12px; }}
-[data-testid="stSidebar"] > div:first-child {{ background:linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color:{TEXT_LIGHT}; }}
-[data-testid="stSidebar"] .stMarkdown p,[data-testid="stSidebar"] label,[data-testid="stSidebar"] span {{ color:{TEXT_LIGHT} !important; }}
-[data-testid="stSidebar"] .stRadio > div > label {{ margin-bottom:6px; padding:6px 10px; border-radius:8px; background:rgba(255,255,255,0.08); }}
-.stButton>button {{ border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }}
-.block-container {{ padding-top:6px; }}
+.app-header { padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }
+.app-title { font-size:22px; font-weight:800; color:#111827; }
+.app-sub { color:#6b7280; font-size:12px; }
+[data-testid="stSidebar"] > div:first-child { background:linear-gradient(180deg, {EMERALD} 0%, {EMERALD_DARK} 100%); color:{TEXT_LIGHT}; }
+[data-testid="stSidebar"] .stMarkdown p,[data-testid="stSidebar"] label,[data-testid="stSidebar"] span { color:{TEXT_LIGHT} !important; }
+[data-testid="stSidebar"] .stRadio > div > label { margin-bottom:6px; padding:6px 10px; border-radius:8px; background:rgba(255,255,255,0.08); }
+.stButton>button { border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }
+.block-container { padding-top:6px; }
 </style>
 """, unsafe_allow_html=True)
 st.markdown("""
@@ -293,6 +293,16 @@ if st.session_state.get("file_hash") != current_hash and isinstance(prod_df, pd.
     st.session_state.file_hash = current_hash
 
 work = st.session_state.get("work", pd.DataFrame())
+# enforce string dtype for title columns
+for _c in ["name","name_ar"]:
+    if _c not in work.columns:
+        work[_c] = pd.Series("", index=work.index, dtype="string")
+    else:
+        try:
+            work[_c] = work[_c].astype("string")
+        except Exception:
+            work[_c] = work[_c].astype(str)
+
 lookups = build_lookups(map_df) if map_df is not None else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
 # ===== Overview =====
@@ -525,6 +535,8 @@ def sec_titles():
     with b1: fetch_batch=st.number_input("Batch (image→EN)",10,300,100,10, key="fetch_batch")
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10, key="trans_batch")
 
+    ignore_cache = st.checkbox("Ignore cache this run", value=False, key="ign_cache")
+
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         gallery = st.container()
         view = base_df.head(24)
@@ -533,7 +545,7 @@ def sec_titles():
             for j, (i, row) in enumerate(view.iterrows()):
                 src = str(row.get("thumbnail_dataurl", "")) or clean_url_for_vision(str(row.get("thumbnail","")))
                 with cols[j % 6]:
-                    if src.startswith("data:") or is_valid_url(src): st.image(src, caption=f"Row {i}", use_container_width=True)
+                    if src.startswith("data:") or is_valid_url(src): st.image(src, caption=f"Row {i}", width="stretch")
                     else: st.caption("Bad image")
         else:
             st.info("No thumbnail_dataurl present in current scope.")
@@ -543,6 +555,16 @@ def sec_titles():
         if len(store) <= MAX_CACHE_PER_FILE: return
         for k in list(store.keys())[: len(store)//2]:
             store.pop(k, None)
+
+    def _image_cache_key(i: int) -> str:
+        raw_thumb = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+        data_col  = str(work.at[i,"thumbnail_dataurl"]) if "thumbnail_dataurl" in work.columns else ""
+        if data_col.startswith("data:"):
+            basis = data_col[:256]
+        else:
+            basis = clean_url_for_vision(raw_thumb)
+        import hashlib as _hl
+        return _hl.sha1(basis.encode()).hexdigest()[:12] if basis else f"row-{i}"
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int,int]:
         updated=skipped=failed=hard_fail_batches=0
@@ -559,24 +581,26 @@ def sec_titles():
                 data_col  = str(work.at[i,"thumbnail_dataurl"]) if "thumbnail_dataurl" in work.columns else ""
                 norm_url  = data_col if data_col.startswith("data:") else clean_url_for_vision(raw_thumb)
 
-                if not force_over and store.get(sku, {}).get("en"):
-                    en_out[i] = store[sku]["en"]; skipped+=1; continue
+                cache_key = _image_cache_key(i)
+                if not ignore_cache and not force_over and store.get(cache_key, {}).get("en"):
+                    en_out[i] = store[cache_key]["en"]; skipped+=1; continue
                 if only_empty and cur_en and not force_over:
-                    en_out[i] = cur_en; skipped+=1; continue
+                    if not ignore_cache and store.get(cache_key, {}).get("en"):
+                        en_out[i] = store[cache_key]["en"]; skipped+=1; continue
                 if not (data_col.startswith("data:") or is_valid_url(norm_url)):
                     st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"no_image_source","url":raw_thumb}); failed+=1; continue
 
                 title = openai_title_from_url(norm_url, max_len, sku)
                 if title:
                     en_out[i] = title
-                    store.setdefault(sku, {})["en"] = title
+                    store.setdefault(cache_key, {})["en"] = title
                     _trim_store(store)
                     updated += 1
                 else:
                     failed += 1
             if en_out:
                 idxs=list(en_out.keys()); vals=[en_out[j] for j in idxs]
-                work.loc[idxs, "name"] = vals
+                work.loc[idxs, "name"] = pd.Series(vals, index=idxs, dtype="string")
             ui_sleep(0.1)
         return updated, skipped, failed, hard_fail_batches
 
@@ -591,8 +615,9 @@ def sec_titles():
             if not en:
                 st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
                 continue
-            if not force_over and store.get(sku, {}).get("ar"):
-                work.at[i,"name_ar"]=store[sku]["ar"]; continue
+            cache_key = _image_cache_key(i)
+            if not ignore_cache and not force_over and store.get(cache_key, {}).get("ar"):
+                work.at[i,"name_ar"]=store[cache_key]["ar"]; continue
             if force_over or not cur_ar:
                 ids.append(i); texts.append(en)
 
@@ -610,9 +635,9 @@ def sec_titles():
             for j, _ in enumerate(chunk):
                 i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
                 if ar:
-                    work.at[i,"name_ar"] = ar
-                    sku = str(work.at[i,"merchant_sku"])
-                    store.setdefault(sku, {})["ar"] = ar
+                    work.at[i,"name_ar"] = str(ar)
+                    cache_key = _image_cache_key(i)
+                    store.setdefault(cache_key, {})["ar"] = str(ar)
                     updated += 1
                 else:
                     failed += 1
@@ -661,7 +686,7 @@ def sec_titles():
             du = str(r.get("thumbnail_dataurl",""))
             st.write({"row": int(idx), "has_dataurl": du.startswith("data:"), "len": len(du)})
             if du.startswith("data:"):
-                st.image(du, caption=f"Row {idx}", use_container_width=True)
+                st.image(du, caption=f"Row {idx}", width="stretch")
 
 def sec_grouping():
     st.subheader("Grouping")
@@ -712,7 +737,7 @@ def sec_grouping():
             st.write(f"Matches: {hits_df.shape[0]}")
             st.dataframe(
                 hits_df[["merchant_sku","name","name_ar","category_id","sub_category_id","sub_sub_category_id"]],
-                use_container_width=True, height=260
+                width="stretch", height=260
             )
             skus=hits_df["merchant_sku"].astype(str).tolist()
             chosen=st.multiselect("Select SKUs", options=skus, default=skus, key="kw_skus")
@@ -746,7 +771,7 @@ def sec_sheet():
     st.caption(f"{total} rows total")
     start=(st.session_state.page_num-1)*st.session_state.page_size; end=start+st.session_state.page_size
     page=base.iloc[start:end].copy()
-    st.dataframe(page, use_container_width=True, height=440)
+    st.dataframe(page, width="stretch", height=440)
     st.session_state["page_df"] = page
     return page
 
