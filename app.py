@@ -1,4 +1,4 @@
-# Product Mapping Dashboard — master (corrected, mapping optional)
+# Product Mapping Dashboard — master (image-dataURL ready)
 # Uses `thumbnail_dataurl` when present so OpenAI Vision always sees images.
 
 import io, re, time, math, hashlib, json, sys, traceback, base64, random
@@ -16,8 +16,7 @@ st.set_option("client.showErrorDetails", True)
 
 # ===== UI THEME & HEADER =====
 EMERALD = "#10b981"; EMERALD_DARK = "#059669"; TEXT_LIGHT = "#f8fafc"
-st.markdown(
-    f"""
+st.markdown(f"""
 <style>
 .app-header {{ padding: 8px 0; border-bottom: 1px solid #e5e7eb; background:#fff; position:sticky; top:0; z-index:5; }}
 .app-title {{ font-size:22px; font-weight:800; color:#111827; }}
@@ -28,18 +27,13 @@ st.markdown(
 .stButton>button {{ border-radius:8px; border:1px solid #e5e7eb; padding:.45rem .9rem; }}
 .block-container {{ padding-top:6px; }}
 </style>
-""",
-    unsafe_allow_html=True,
-)
-st.markdown(
-    """
+""", unsafe_allow_html=True)
+st.markdown("""
 <div class="app-header">
   <div class="app-title">🧭 Product Mapping Dashboard</div>
   <div class="app-sub">Images → English Title → Arabic → Categorization → Export</div>
 </div>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 # ============== REQUIRED COLUMNS ==============
 REQUIRED_PRODUCT_COLS = [
@@ -216,70 +210,52 @@ Rules:
 - Output JSON only.
 """
 
+# ============== Sidebar NAV ==============
+with st.sidebar:
+    st.markdown("### 🔑 API Keys")
+    st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
+    st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
+
+    st.markdown("### 🧩 Translation options")
+    USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
+    GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
+                                placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
+    CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
+
+    st.markdown("---")
+    DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
+    section = st.radio(
+        "Navigate",
+        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
+        index=0
+    )
+
 # ============== Uploads ==============
 c1,c2=st.columns(2)
-with c1:
-    product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')",
-                                    type=["xlsx","xls","csv"], key="u1")
-with c2:
-    mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)",
-                                    type=["xlsx","xls","csv"], key="u2")
-
+with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"], key="u1")
+with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"], key="u2")
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
 
-# ---- normalize mapping headers so existing sheet works unchanged ----
-def _normalize_map_headers(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    def norm(s: str) -> str:
-        s = re.sub(r"\s+", " ", str(s)).strip().lower().replace("_", " ")
-        return s
-    target = {
-        "category id": "category_id",
-        "sub category id": "sub_category_id",
-        "sub_category id": "sub_category_id",
-        "sub category id no": "sub_category_id NO",
-        "sub_category id no": "sub_category_id NO",
-        "sub sub category id": "sub_sub_category_id",
-        "sub_sub category id": "sub_sub_category_id",
-        "sub sub category id no": "sub_sub_category_id NO",
-        "sub_sub category id no": "sub_sub_category_id NO",
-    }
-    rename_map = {}
-    for c in df.columns:
-        key = norm(c)
-        rename_map[c] = target.get(key, c)
-    df = df.rename(columns=rename_map)
-    for c in ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
-    return df
-
-if map_df is not None:
-    map_df = _normalize_map_headers(map_df)
-
+# persist uploads across reruns
 if prod_df is not None:
     st.session_state["prod_df_cached"] = prod_df.copy()
 if map_df is not None:
     st.session_state["map_df_cached"] = map_df.copy()
-
 prod_df = prod_df if prod_df is not None else st.session_state.get("prod_df_cached")
 map_df  = map_df  if map_df  is not None else st.session_state.get("map_df_cached")
 
-# Require ONLY product file to proceed. Mapping is optional.
-have_products = isinstance(prod_df, pd.DataFrame) and validate_columns(
-    prod_df, REQUIRED_PRODUCT_COLS, "Product List"
+loaded_ok = (
+    isinstance(prod_df, pd.DataFrame) and
+    validate_columns(prod_df, REQUIRED_PRODUCT_COLS, "Product List") and
+    isinstance(map_df, pd.DataFrame) and
+    validate_columns(map_df, ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"], "Category Mapping")
 )
-
-have_mapping = isinstance(map_df, pd.DataFrame) and validate_columns(
-    map_df,
-    ["category_id","sub_category_id","sub_category_id NO","sub_sub_category_id","sub_sub_category_id NO"],
-    "Category Mapping"
-) if map_df is not None else False
-
-if not have_products:
-    st.info("Upload the Product List to proceed. Category Mapping is optional.")
-    st.stop()
+if not loaded_ok:
+    st.info("Upload both files to proceed.")
+    # do NOT st.stop() so navigating tabs doesn't wipe UI
+    prod_df = prod_df if isinstance(prod_df, pd.DataFrame) else pd.DataFrame()
+    map_df = map_df if isinstance(map_df, pd.DataFrame) else pd.DataFrame()
 
 # ============== Memory & State ==============
 st.session_state.setdefault("file_hash", None)
@@ -313,7 +289,7 @@ def build_lookups(map_df: pd.DataFrame):
             "ssub_name_to_no_by_main_sub": ssub_no}
 
 current_hash = hash_uploaded_file(product_file) if product_file else st.session_state.get("file_hash")
-if st.session_state.get("file_hash") != current_hash and isinstance(prod_df, pd.DataFrame):
+if st.session_state.get("file_hash") != current_hash and isinstance(prod_df, pd.DataFrame) and not prod_df.empty:
     st.session_state.work = prod_df.copy()
     st.session_state.proc_cache = {}
     st.session_state.audit_rows = []
@@ -330,8 +306,7 @@ for _c in ["name","name_ar"]:
         except Exception:
             work[_c] = work[_c].astype(str)
 
-lookups = build_lookups(map_df) if have_mapping else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
-GROUPING_ENABLED = have_mapping
+lookups = build_lookups(map_df) if isinstance(map_df, pd.DataFrame) and not map_df.empty else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
 # ===== Overview =====
 def sec_overview():
@@ -427,9 +402,11 @@ def _fallback_simple_title_from_dataurl(data_url: str, max_chars: int) -> str:
 
 def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = None) -> str:
     if not openai_active or not img_url: return ""
+    # Prefer data URL (already provided by Image Extractor). If not data URL, try to convert.
     if img_url.startswith("data:"):
         data_url = img_url
     else:
+        # Try raw URL first, then fallback to data-URL
         url = clean_url_for_vision(img_url)
         def _call(image_url: str) -> str:
             payload = {
@@ -460,6 +437,7 @@ def openai_title_from_url(img_url: str, max_chars: int, sku: Optional[str] = Non
         if not data_url:
             st.session_state.audit_rows.append({"sku":sku or "", "phase":"EN title","reason":"no_fetchable_image","url": str(img_url)})
             return ""
+    # Call with data URL
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
@@ -512,55 +490,48 @@ def openai_translate_batch_en2ar(texts:List[str])->List[str]:
     }
     try:
         resp=_retry(lambda: openai_client.chat.completions.create(**payload))
-        lines=(resp.choices[0].message.content or "").splitlines()
-        return [l.strip() for l in lines if l.strip()] or texts
+        # normalize: keep non-empty lines only
+        lines=[l.strip() for l in (resp.choices[0].message.content or "").splitlines()]
+        lines=[l for l in lines if l != ""]
+        return lines
     except Exception:
-        return texts
+        return list(texts)
 
-# --- patched translate_en_titles to avoid length mismatch ---
-def translate_en_titles(
-    titles_en: pd.Series,
-    engine: str,
-    batch_size: int,
-    use_glossary: bool = False,
-    glossary_map: Optional[Dict[str, str]] = None,
-    context_hint: str = ""
-) -> pd.Series:
-    idx = titles_en.index
-    n = len(idx)
-    texts = titles_en.fillna("").astype(str).tolist()
-
+def translate_en_titles(titles_en: pd.Series, engine:str, batch_size:int, use_glossary=False, glossary_map:Optional[Dict[str,str]]=None, context_hint:str="")->pd.Series:
+    texts=titles_en.fillna("").astype(str).tolist()
     if use_glossary and glossary_map:
-        mapped = []
+        mapped=[]
         for t in texts:
-            t2 = t
-            for src, tgt in glossary_map.items():
+            t2=t
+            for src,tgt in glossary_map.items():
                 if src and tgt:
-                    t2 = re.sub(rf"(?i)\b{re.escape(src)}\b", tgt, t2)
+                    t2=re.sub(rf"(?i)\b{re.escape(src)}\b", tgt, t2)
             mapped.append(t2)
-        texts = mapped
+        texts=mapped
 
-    if engine == "DeepL" and deepl_active:
+    if engine=="DeepL" and deepl_active:
         outs = deepl_batch_en2ar(texts, context_hint)
-    elif engine == "OpenAI":
-        outs = []
-        for s in range(0, len(texts), max(1, batch_size)):
-            chunk = texts[s:s + batch_size]
-            block = openai_translate_batch_en2ar(chunk)
-            if not isinstance(block, list):
-                block = list(block) if block is not None else []
-            outs.extend(block)
+    elif engine=="OpenAI":
+        outs=[]
+        for s in range(0,len(texts),max(1,batch_size)):
+            chunk_out=openai_translate_batch_en2ar(texts[s:s+batch_size])
+            # fix length mismatches (over/under)
+            need=len(texts[s:s+batch_size])
+            if len(chunk_out) > need:
+                chunk_out = chunk_out[:need]
+            elif len(chunk_out) < need:
+                # pad using original English (safe fallback)
+                chunk_out = chunk_out + texts[s:s+batch_size][len(chunk_out):]
+            outs.extend(chunk_out)
             ui_sleep(0.1)
     else:
         outs = list(texts)
 
-    if len(outs) > n:
-        outs = outs[:n]
-    elif len(outs) < n:
-        outs.extend([""] * (n - len(outs)))
-
-    outs = [("" if v is None else str(v)) for v in outs]
-    return pd.Series(outs, index=idx, dtype="string")
+    # final safety: enforce exact length
+    if len(outs) != len(texts):
+        if len(outs) > len(texts): outs = outs[:len(texts)]
+        else: outs = outs + texts[len(outs):]
+    return pd.Series(outs, index=titles_en.index, dtype="string")
 def sec_titles():
     st.subheader("Titles & Translate")
     if work is None or work.empty:
@@ -615,14 +586,14 @@ def sec_titles():
 
     def run_titles(idx, fetch_batch, max_len, only_empty, force_over) -> Tuple[int,int,int,int]:
         updated=skipped=failed=hard_fail_batches=0
-        store = global_cache().setdefault(st.session_state.file_hash, {})
+        store = global_cache().setdefault(st.session_state.file_hash or "no-file", {})
         en_out = {}
         for s in range(0, len(idx), fetch_batch):
             chunk = idx[s:s+fetch_batch]
             for i in chunk:
-                sku = str(work.at[i,"merchant_sku"])
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
 
+                # prefer data URL, else sanitized URL
                 raw_thumb = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
                 data_col  = str(work.at[i,"thumbnail_dataurl"]) if "thumbnail_dataurl" in work.columns else ""
                 norm_url  = data_col if data_col.startswith("data:") else clean_url_for_vision(raw_thumb)
@@ -634,9 +605,9 @@ def sec_titles():
                     if not ignore_cache and store.get(cache_key, {}).get("en"):
                         en_out[i] = store[cache_key]["en"]; skipped+=1; continue
                 if not (data_col.startswith("data:") or is_valid_url(norm_url)):
-                    st.session_state.audit_rows.append({"sku":sku,"phase":"EN title","reason":"no_image_source","url":raw_thumb}); failed+=1; continue
+                    st.session_state.audit_rows.append({"row":int(i),"phase":"EN title","reason":"no_image_source","url":raw_thumb}); failed+=1; continue
 
-                title = openai_title_from_url(norm_url, max_len, sku)
+                title = openai_title_from_url(norm_url, max_len)
                 if title:
                     en_out[i] = title
                     store.setdefault(cache_key, {})["en"] = title
@@ -652,14 +623,13 @@ def sec_titles():
 
     def run_trans(idx, trans_batch, engine, force_over) -> Tuple[int,int]:
         if engine not in ("DeepL","OpenAI"): return 0,0
-        store = global_cache().setdefault(st.session_state.file_hash, {})
+        store = global_cache().setdefault(st.session_state.file_hash or "no-file", {})
         ids=[]; texts=[]
         for i in idx:
-            sku=str(work.at[i,"merchant_sku"])
             cur_ar=(str(work.at[i,"name_ar"]) if pd.notna(work.at[i,"name_ar"]) else "").strip()
             en=(str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
             if not en:
-                st.session_state.audit_rows.append({"sku":sku,"phase":"AR translate","reason":"missing EN","url":str(work.at[i,"thumbnail"])})
+                st.session_state.audit_rows.append({"row":int(i),"phase":"AR translate","reason":"missing EN","url":str(work.at[i].get("thumbnail",""))})
                 continue
             cache_key = _image_cache_key(i)
             if not ignore_cache and not force_over and store.get(cache_key, {}).get("ar"):
@@ -667,6 +637,7 @@ def sec_titles():
             if force_over or not cur_ar:
                 ids.append(i); texts.append(en)
 
+        # glossary
         glossary_map = {}
         for line in (GLOSSARY_CSV or "").splitlines():
             if "," in line:
@@ -680,8 +651,11 @@ def sec_titles():
             outs = translate_en_titles(pd.Series(chunk), engine, trans_batch,
                                        use_glossary=USE_GLOSSARY, glossary_map=glossary_map,
                                        context_hint=CONTEXT_HINT).tolist()
-            for j, _ in enumerate(chunk):
-                i = ids[s+j]; ar = outs[j] if j < len(outs) else ""
+            need=len(chunk)
+            if len(outs) > need: outs = outs[:need]
+            if len(outs) < need: outs = outs + chunk[len(outs):]
+            for j in range(need):
+                i = ids[s+j]; ar = outs[j]
                 if ar:
                     work.at[i,"name_ar"] = str(ar)
                     cache_key = _image_cache_key(i)
@@ -727,19 +701,17 @@ def sec_titles():
             else:
                 st.info("No missing AR.")
 
+    # Data URL sanity check
     if st.button("🔎 Check first 3 data URLs"):
         rows = work.head(3)
-        for idxr, r in rows.iterrows():
+        for idx, r in rows.iterrows():
             du = str(r.get("thumbnail_dataurl",""))
-            st.write({"row": int(idxr), "has_dataurl": du.startswith("data:"), "len": len(du)})
+            st.write({"row": int(idx), "has_dataurl": du.startswith("data:"), "len": len(du)})
             if du.startswith("data:"):
-                st.image(du, caption=f"Row {idxr}", use_container_width=True)
+                st.image(du, caption=f"Row {idx}", use_container_width=True)
 
 def sec_grouping():
     st.subheader("Grouping")
-    if not GROUPING_ENABLED:
-        st.warning("Upload a valid Category Mapping to use Grouping.")
-        return
     if work is None or work.empty:
         st.info("No data loaded."); return
     left,right=st.columns([1,2])
@@ -849,24 +821,6 @@ def sec_downloads():
     else:
         st.caption("No audit rows yet.")
 
-# ============== Sidebar NAV (ensure after functions so `section` is in scope) ==============
-with st.sidebar:
-    st.markdown("### 🔑 API Keys")
-    st.write("DeepL:", "✅ Active" if deepl_active else "❌ Missing/Invalid")
-    st.write("OpenAI:", "✅ Active" if openai_active else "❌ Missing/Invalid")
-    st.markdown("### 🧩 Translation options")
-    USE_GLOSSARY = st.checkbox("Use glossary for EN→AR", value=True)
-    GLOSSARY_CSV = st.text_area("Glossary CSV (source,target) one per line", height=120,
-                                placeholder="Head & Shoulders,هيد اند شولدرز\nFairy,فيري")
-    CONTEXT_HINT = st.text_input("Optional translation context", value="E-commerce product titles for a marketplace.")
-    st.markdown("---")
-    DEBUG = st.checkbox("🪲 Debug mode (log payloads)", value=False)
-    section = st.radio(
-        "Navigate",
-        ["📊 Overview","🔎 Filter","🖼️ Titles & Translate","🧩 Grouping","📑 Sheet","⬇️ Downloads","⚙️ Settings"],
-        index=0
-    )
-
 # ============== Router ==============
 if section=="📊 Overview":
     safe_section("Overview", sec_overview)
@@ -875,10 +829,7 @@ elif section=="🔎 Filter":
 elif section=="🖼️ Titles & Translate":
     safe_section("Titles & Translate", sec_titles)
 elif section=="🧩 Grouping":
-    if GROUPING_ENABLED:
-        safe_section("Grouping", sec_grouping)
-    else:
-        st.warning("Upload a valid Category Mapping to use Grouping.")
+    safe_section("Grouping", sec_grouping)
 elif section=="📑 Sheet":
     _tmp = safe_section("Sheet", sec_sheet)
     if isinstance(_tmp, pd.DataFrame):
