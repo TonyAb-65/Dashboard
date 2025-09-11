@@ -1,10 +1,11 @@
-# Product Mapping Dashboard — Master (full)
-# URL-only Vision + strict URL sanitization + DEBUG payload logging
+# Product Mapping Dashboard — Master (full) — DATA-URL READY
+# URL-only Vision + strict URL sanitization (+ data: URLs) + DEBUG payload logging
 # + Manual tool: Rewrite Arabic -> clean Arabic -> English
 # + Glossary-aware EN→AR
 # + Guards to prevent blank pages in Sheet/Grouping
 # + Stable navigation across reruns (persisted section)
 # + OpenAI translation returns exact N lines
+# + Prefers `thumbnail_dataurl` over `thumbnail` for Vision
 
 import io, re, time, math, hashlib, json, sys, traceback, base64, os
 from typing import List, Iterable, Tuple, Optional, Dict
@@ -113,9 +114,13 @@ def tidy_title(s:str,max_chars:int=70)->str:
 def is_valid_url(u:str)->bool:
     if not isinstance(u,str): return False
     u=u.strip()
+    # accept base64 data URLs directly
+    if u.startswith("data:"):
+        return True
     try:
         p=urlsplit(u); return p.scheme in ("http","https") and bool(p.netloc)
-    except Exception: return False
+    except Exception:
+        return False
 
 def _normalize_url(u:str)->str:
     u=(u or "").strip().strip('"').strip("'")
@@ -134,6 +139,15 @@ def _normalize_url(u:str)->str:
         q="&".join(parts)
     else: q=""
     return urlunsplit((p.scheme,p.netloc,path,q,p.fragment))
+
+def clean_url_for_vision(raw: str) -> str:
+    """Sanitize before sending to OpenAI Vision. Keep data: URLs as-is."""
+    u = str(raw or "").strip().strip('"').strip("'")
+    u = re.sub(r"\s+", "", u)
+    if u.startswith("data:"):
+        return u
+    u = _normalize_url(u)
+    return u if is_valid_url(u) else ""
 
 def _parse_glossary(txt: str) -> dict:
     g = {}
@@ -169,13 +183,6 @@ def _to_data_url_from_http(url: str, timeout: int = 12, max_bytes: int = 8_000_0
         return f"data:{mime};base64,{b64}"
     except Exception:
         return ""
-
-def clean_url_for_vision(raw: str) -> str:
-    """Sanitize before sending to OpenAI Vision."""
-    u = str(raw or "").strip().strip('"').strip("'")
-    u = re.sub(r"\s+", "", u)
-    u = _normalize_url(u)
-    return u if is_valid_url(u) else ""
 
 # ---------- retry wrapper ----------
 def _retry(fn, attempts=4, base=0.5):
@@ -269,7 +276,6 @@ with st.sidebar:
 
 # ============== Title helpers (Vision) ==============
 def assemble_title_from_fields(d: dict) -> str:
-    # tolerant casting to avoid .strip on non-strings
     def _s(v): return str(v).strip() if v is not None else ""
     brand = _s(d.get("brand"))
     object_type = _s(d.get("object_type"))
@@ -518,7 +524,7 @@ def to_excel_download(df, sheet_name="Products"):
 
 # ============== Uploads ==============
 c1,c2=st.columns(2)
-with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail')", type=["xlsx","xls","csv"])
+with c1: product_file = st.file_uploader("Product List (.xlsx/.csv, includes 'thumbnail' or 'thumbnail_dataurl')", type=["xlsx","xls","csv"])
 with c2: mapping_file = st.file_uploader("Category Mapping (.xlsx/.csv)", type=["xlsx","xls","csv"])
 prod_df = read_any_table(product_file) if product_file else None
 map_df  = read_any_table(mapping_file) if mapping_file else None
@@ -580,6 +586,13 @@ def mapping_stats(df: pd.DataFrame):
     ar_ok=int(is_nonempty_series(df.get("name_ar", pd.Series(dtype=str))).sum())
     return total,mapped,unmapped,en_ok,ar_ok,mm
 
+# Helper: prefer data URL over http(s)
+def _pick_thumb(row: pd.Series) -> str:
+    raw_data = str(row.get("thumbnail_dataurl","") or "")
+    if raw_data.startswith("data:"):
+        return raw_data
+    return str(row.get("thumbnail","") or "")
+
 # ============== Sections ==============
 def sec_overview():
     total,mapped,unmapped,en_ok,ar_ok,mm = mapping_stats(work)
@@ -624,7 +637,7 @@ def sec_filter():
     st.session_state["search_q"]=q
     with st.expander("Advanced", expanded=False):
         f1,f2,f3=st.columns(3)
-        with f1: fields=st.multiselect("Fields", ["name","name_ar","merchant_sku","thumbnail"], default=["name","name_ar"])
+        with f1: fields=st.multiselect("Fields", ["name","name_ar","merchant_sku","thumbnail","thumbnail_dataurl"], default=["name","name_ar"])
         with f2: mode=st.selectbox("Mode", ["OR","AND"])
         with f3: whole=st.checkbox("Whole word", value=False)
     c1,c2=st.columns(2)
@@ -681,22 +694,23 @@ def sec_titles():
     with b2: trans_batch=st.number_input("Batch (EN→AR)",10,300,150,10)
     with b3: ar_rewrite_batch=st.number_input("Batch (AR rewrite→EN)",10,300,100,10)
 
-    # Preview 24 images (browser fetch)
+    # Preview 24 images (browser fetch) — prefer data URL
     if st.button("Preview 24 images (no processing)", key="btn_preview_imgs"):
         st.session_state["section"] = "titles"
         gallery = st.container()
         view = base_df.head(24)
-        if "thumbnail" in view.columns and len(view) > 0:
+        if len(view) > 0:
             cols = gallery.columns(6)
             for j, (i, row) in enumerate(view.iterrows()):
-                url = clean_url_for_vision(str(row.get("thumbnail", "")))
+                src = _pick_thumb(row)
+                url = clean_url_for_vision(src)
                 with cols[j % 6]:
                     if is_valid_url(url): st.image(url, caption=f"Row {i}", width="stretch")
                     else: st.caption("Bad URL")
         else:
             st.info("No thumbnails found in current scope.")
 
-    # ---------- Workers (URL-only to OpenAI) ----------
+    # ---------- Workers (prefer data URL) ----------
     MAX_CACHE_PER_FILE = 20000
     def _trim_store(store: dict):
         if len(store) <= MAX_CACHE_PER_FILE: return
@@ -713,7 +727,12 @@ def sec_titles():
                 sku = str(work.at[i,"merchant_sku"])
                 cache_local = st.session_state.proc_cache.get(sku, {})
                 cur_en = (str(work.at[i,"name"]) if pd.notna(work.at[i,"name"]) else "").strip()
-                norm_url = clean_url_for_vision(str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else "")
+
+                # prefer data URL from thumbnail_dataurl
+                raw_data = str(work.at[i,"thumbnail_dataurl"]) if "thumbnail_dataurl" in work.columns else ""
+                raw_http = str(work.at[i,"thumbnail"]) if "thumbnail" in work.columns else ""
+                src = raw_data if raw_data.startswith("data:") else raw_http
+                norm_url = clean_url_for_vision(src)
 
                 if not force_over and store.get(sku, {}).get("en"):
                     work.at[i,"name"] = store[sku]["en"]; st.session_state.proc_cache.setdefault(sku,{})["name"]=store[sku]["en"]; skipped+=1; continue
@@ -761,7 +780,6 @@ def sec_titles():
         for s in range(0, len(texts), trans_batch):
             chunk = texts[s:s+trans_batch]
             outs = translate_en_titles(pd.Series(chunk), engine, trans_batch, use_glossary=USE_GLOSSARY, glossary_map=glossary_map, context_hint=CONTEXT_HINT).tolist()
-            # align outs to chunk size defensively
             outs = _fix_len(outs, len(chunk))
             for j in range(len(chunk)):
                 i = ids[s+j]
@@ -779,7 +797,7 @@ def sec_titles():
 
     # === FULL AUTOMATIC BATCHED PIPELINE (image→EN, then EN→AR) ===
     if st.button("Run FULL pipeline on ENTIRE scope (auto-batched)", key="btn_full_pipeline"):
-        st.session_state["section"] = "titles"  # keep current tab after rerun
+        st.session_state["section"] = "titles"
         idx_all = base_df.index.tolist()
         if not idx_all:
             st.info("No rows in scope.")
@@ -955,7 +973,6 @@ def sec_sheet():
         except Exception:
             st.dataframe(page, width="stretch", height=440)
     else: st.info("No rows.")
-    # store last page for downloads
     st.session_state["last_sheet_df"] = page.copy()
     return page
 
@@ -977,9 +994,13 @@ def sec_settings():
     with c1:
         if st.button("Show 10 sanitized thumbnail URLs"):
             st.session_state["section"] = "settings"
-            sample=work["thumbnail"].astype(str).head(10).tolist() if "thumbnail" in work.columns else []
-            for u in sample:
-                norm=clean_url_for_vision(u); st.write({"raw":u,"sanitized":norm,"valid":is_valid_url(norm)})
+            samples=[]
+            if "thumbnail_dataurl" in work.columns:
+                samples += [str(x) for x in work["thumbnail_dataurl"].head(10).tolist()]
+            if "thumbnail" in work.columns and len(samples)<10:
+                samples += [str(x) for x in work["thumbnail"].head(10-len(samples)).tolist()]
+            for u in samples:
+                norm=clean_url_for_vision(u); st.write({"raw":(u[:60]+"…") if len(u)>60 else u,"sanitized":(norm[:60]+"…") if len(norm)>60 else norm,"valid":is_valid_url(norm)})
     with c2:
         if st.button("Clear per-file cache & audit"):
             st.session_state["section"] = "settings"
