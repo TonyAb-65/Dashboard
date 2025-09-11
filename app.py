@@ -217,6 +217,74 @@ for _c in ["name","name_ar"]:
     else:
         try: work[_c] = work[_c].astype("string")
         except Exception: work[_c] = work[_c].astype(str)
+def build_lookups(map_df: pd.DataFrame) -> Dict[str, dict]:
+    # required columns
+    req = [
+        "category_id",
+        "sub_category_id",
+        "sub_category_id NO",
+        "sub_sub_category_id",
+        "sub_sub_category_id NO",
+    ]
+    for c in req:
+        if c not in map_df.columns:
+            raise ValueError(f"Category Mapping missing column: {c}")
+
+    # normalize
+    df = map_df.copy()
+    for c in req:
+        df[c] = df[c].astype(str).fillna("").str.strip()
+
+    main_names = sorted(x for x in df["category_id"].unique() if x)
+
+    main_to_subnames: Dict[str, List[str]] = {}
+    pair_to_subsubnames: Dict[Tuple[str, str], List[str]] = {}
+    sub_name_to_no_by_main: Dict[str, Dict[str, str]] = {}
+    ssub_name_to_no_by_main_sub: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+    # build
+    for main in main_names:
+        sub_df = df[df["category_id"] == main]
+        subs = sorted(
+            y for y in sub_df["sub_category_id"].dropna().unique().tolist() if y
+        )
+        main_to_subnames[main] = subs
+
+        # map sub name -> sub NO within this main
+        sub_no_map = (
+            sub_df[["sub_category_id", "sub_category_id NO"]]
+            .dropna()
+            .drop_duplicates()
+            .set_index("sub_category_id")["sub_category_id NO"]
+            .to_dict()
+        )
+        sub_name_to_no_by_main[main] = sub_no_map
+
+        for sub in subs:
+            pair = (main, sub)
+            ssub_df = sub_df[sub_df["sub_category_id"] == sub]
+            ssubs = sorted(
+                z for z in ssub_df["sub_sub_category_id"].dropna().unique().tolist() if z
+            )
+            pair_to_subsubnames[pair] = ssubs
+
+            # map sub-sub name -> sub-sub NO within this (main, sub)
+            ssub_no_map = (
+                ssub_df[["sub_sub_category_id", "sub_sub_category_id NO"]]
+                .dropna()
+                .drop_duplicates()
+                .set_index("sub_sub_category_id")["sub_sub_category_id NO"]
+                .to_dict()
+            )
+            ssub_name_to_no_by_main_sub[pair] = ssub_no_map
+
+    return {
+        "main_names": main_names,
+        "main_to_subnames": main_to_subnames,
+        "pair_to_subsubnames": pair_to_subsubnames,
+        "sub_name_to_no_by_main": sub_name_to_no_by_main,
+        "ssub_name_to_no_by_main_sub": ssub_name_to_no_by_main_sub,
+    }
 
 lookups = build_lookups(map_df) if loaded_mapping_ok else {"main_names":[], "main_to_subnames":{}, "pair_to_subsubnames":{}, "sub_name_to_no_by_main":{}, "ssub_name_to_no_by_main_sub":{}}
 
